@@ -147,7 +147,9 @@ cython_debug/
 .DS_Store
 
 # Project specific
-docs/paper.md
-docs/phase1_plan.md
-docs/arch_design.md
+docs/
 TileKernels/
+.gitignore
+weights/
+weights
+artifacts/

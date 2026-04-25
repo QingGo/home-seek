@@ -14,7 +14,18 @@ dependencies = [
     "einops",
     "matplotlib",
     "torch==2.8.0",
+    "httpx>=0.28.1",
+    "socksio>=1.0.0",
+    "tilelang>=0.1.9",
 ]
 
 [project.scripts]
 home-seek-infer = "home_seek.inference_engine:main"
+
+[tool.setuptools.packages.find]
+include = ["home_seek*", "tile_reference*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
