@@ -298,6 +298,140 @@ class TestQuantization:
             assert cos >= 0.99, f"{name}: {cos:.6f}"
 
 
+class TestCSAIndexer:
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_compute_indexer_shapes(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState, CompressedKVCache
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        config = DeepSeekV4FlashConfig()
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = config
+        eng._deq_cache = {}
+        eng.verbose = False
+
+        B, T, q_rank = 1, 8, config.q_lora_rank
+        q_latent = torch.randn(B, T, q_rank, device="cuda", dtype=torch.bfloat16)
+
+        num_compressed = 600
+        idx_dim = config.index_head_dim
+        state = LayerState(device="cuda")
+        state.compressed_kv = CompressedKVCache(4, config.kv_lora_rank, "cuda", idx_dim=idx_dim)
+        state.compressed_kv.append(
+            torch.randn(num_compressed, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16),
+            torch.randn(num_compressed, idx_dim, device="cuda", dtype=torch.bfloat16)
+        )
+
+        lw = {
+            "attn.indexer.wq_b.weight": torch.randn(
+                config.index_n_heads * config.index_head_dim, q_rank,
+                device="cuda", dtype=torch.bfloat16),
+        }
+
+        result = eng._compute_indexer(q_latent, lw, state, 0)
+        assert result is not None
+        assert result.dim() == 4, f"Expected 4D, got {result.dim()}D"
+        B_r, n_kv_r, seq_r, hd_r = result.shape
+        assert n_kv_r == 1, f"Expected 1 KV head, got {n_kv_r}"
+        assert hd_r == config.head_dim, f"Expected head_dim={config.head_dim}, got {hd_r}"
+        assert seq_r == config.index_topk, f"Expected {config.index_topk} selected, got {seq_r}"
+
+    def test_compute_indexer_no_weights_fallback(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState, CompressedKVCache
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        config = DeepSeekV4FlashConfig()
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = config
+        eng._deq_cache = {}
+        eng.verbose = False
+
+        B, T, q_rank = 1, 4, config.q_lora_rank
+        q_latent = torch.randn(B, T, q_rank, device="cuda", dtype=torch.bfloat16)
+
+        state = LayerState(device="cuda")
+        state.compressed_kv = CompressedKVCache(4, config.kv_lora_rank, "cuda")
+        state.compressed_kv.append(torch.randn(2, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16))
+
+        result = eng._compute_indexer(q_latent, {}, state, 0)
+        assert result is None, "Should return None when no indexer weights"
+
+    def test_csa_attn_dispatch(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        config = DeepSeekV4FlashConfig()
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = config
+        eng.layer_states = {}
+        eng._deq_cache = {}
+        eng.device = torch.device("cuda")
+        eng.verbose = False
+        eng._prefetch_worker = None
+        eng._prefetch_enabled = False
+        eng._cpu_fallback_enabled = False
+        eng._cpu_fallback_layers = set()
+        eng.expert_cache = type('obj', (object,), {'cache': {}})()
+
+        for layer_idx in range(config.num_hidden_layers):
+            cr = config.get_compress_ratio(layer_idx)
+            if cr == 0:
+                continue
+            state = LayerState(device="cuda")
+            eng.layer_states[layer_idx] = state
+
+        for layer_idx in [2, 4, 6]:
+            cr = config.get_compress_ratio(layer_idx)
+            assert cr == 4, f"Layer {layer_idx} should be CSA (ratio=4), got {cr}"
+
+        for layer_idx in [3, 5, 7]:
+            cr = config.get_compress_ratio(layer_idx)
+            assert cr == 128, f"Layer {layer_idx} should be HCA (ratio=128), got {cr}"
+
+        for layer_idx in [0, 1, config.num_hidden_layers - 1]:
+            cr = config.get_compress_ratio(layer_idx)
+            assert cr == 0, f"Layer {layer_idx} should be SWA (ratio=0), got {cr}"
+
+
+class TestRoutingFix:
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_routing_with_scaling_factor(self):
+        from home_seek.router import compute_expert_affinity
+        torch.manual_seed(42)
+        hidden = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
+        indices, weights = compute_expert_affinity(hidden, gate, top_k=4, routed_scaling_factor=1.5)
+        assert indices.shape == (2, 4)
+        assert weights.shape == (2, 4)
+        assert torch.all(weights > 0), "All weights should be positive"
+        routed_factors = weights.sum(dim=-1)
+        assert torch.allclose(routed_factors, torch.full_like(routed_factors, 1.5), atol=1e-5), \
+            f"Routed sum should equal scaling_factor=1.5, got {routed_factors}"
+
+    def test_routing_without_scaling_default(self):
+        from home_seek.router import compute_expert_affinity
+        hidden = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
+        indices, weights = compute_expert_affinity(hidden, gate, top_k=4)
+        routed_factors = weights.sum(dim=-1)
+        assert torch.allclose(routed_factors, torch.full_like(routed_factors, 1.5), atol=1e-5), \
+            f"Default routed sum should be 1.5, got {routed_factors}"
+
+    def test_routing_deterministic_with_factor(self):
+        from home_seek.router import compute_expert_affinity
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        hidden = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
+        r1, w1 = compute_expert_affinity(hidden, gate, top_k=2, routed_scaling_factor=2.0)
+        r2, w2 = compute_expert_affinity(hidden, gate, top_k=2, routed_scaling_factor=2.0)
+        assert torch.equal(r1, r2) and torch.equal(w1, w2)
+        assert torch.allclose(w1.sum(dim=-1), torch.full((4,), 2.0, device=w1.device), atol=1e-5)
+
+
 class TestExpertCache:
     def setup_method(self):
         if not torch.cuda.is_available():

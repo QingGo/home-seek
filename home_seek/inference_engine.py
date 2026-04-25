@@ -12,6 +12,7 @@ from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import PrefetchWorker
 from tile_reference import cast_back, unpack_from_e2m1fn_x2, swiglu_forward
+import tile_kernels
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _encoding_dir = os.path.join(_current_dir, '../weights/encoding')
@@ -73,13 +74,8 @@ def load_fp8_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     if data.dtype == torch.bfloat16 or data.dtype == torch.float32:
         return data.to(torch.bfloat16)
     if data.dtype == torch.float8_e4m3fn:
-        data_f32 = data.to(torch.float32)
-        scale_f32 = _ue8m0_to_f32(scale)
-        if scale_f32.shape != data_f32.shape:
-            bh = data_f32.shape[0] // scale_f32.shape[0]
-            bw = data_f32.shape[1] // scale_f32.shape[1]
-            scale_f32 = scale_f32.repeat_interleave(bh, dim=0).repeat_interleave(bw, dim=1)
-        return (data_f32 * scale_f32).to(torch.bfloat16)
+        sf = (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32) if scale.element_size() == 1 else scale
+        return tile_kernels.quant.cast_back((data, sf), 'bf16', (128, 128))
     return data.to(torch.bfloat16)
 
 
@@ -122,11 +118,27 @@ class ExpertWeightCache:
             self.pinned.add(key)
 
 
+class FileHandleCache:
+    def __init__(self):
+        self._handles = {}
+
+    def get_handle(self, fpath, device):
+        dev_str = device if isinstance(device, str) else str(device)
+        key = (fpath, dev_str)
+        if key not in self._handles:
+            self._handles[key] = safe_open(fpath, framework="pt", device=dev_str)
+        return self._handles[key]
+
+    def close_all(self):
+        self._handles.clear()
+
+
 class WeightLoader:
     def __init__(self, weight_dir: str, device: str = "cuda"):
         self.weight_dir = weight_dir
         self.device = torch.device(device)
         self.weight_map = {}
+        self._file_handles = FileHandleCache()
         self._build_index()
 
     def _build_index(self):
@@ -158,8 +170,8 @@ class WeightLoader:
         if not os.path.exists(fpath):
             return None
         try:
-            with safe_open(fpath, framework="pt", device=str(self.device)) as f:
-                return f.get_tensor(key)
+            f = self._file_handles.get_handle(fpath, str(self.device))
+            return f.get_tensor(key)
         except Exception:
             return None
 
@@ -175,12 +187,15 @@ class WeightLoader:
             if not os.path.exists(fpath):
                 continue
             try:
-                with safe_open(fpath, framework="pt", device=str(self.device)) as f:
-                    for k in ks:
-                        results[k] = f.get_tensor(k)
+                f = self._file_handles.get_handle(fpath, str(self.device))
+                for k in ks:
+                    results[k] = f.get_tensor(k)
             except Exception:
                 pass
         return results
+
+    def close_handles(self):
+        self._file_handles.close_all()
 
     def get_layer_weight(self, layer: int, weight_type: str):
         return self.get_weight(f"layers.{layer}.{weight_type}")
@@ -239,20 +254,28 @@ class LayerState:
 
 
 class CompressedKVCache:
-    def __init__(self, compress_ratio: int, dim: int, device: str):
+    def __init__(self, compress_ratio: int, dim: int, device: str, idx_dim: int = 0):
         self.compress_ratio = compress_ratio
         self.dim = dim
         self.device = torch.device(device)
         self.cache = torch.zeros(0, dim, device=self.device, dtype=torch.bfloat16)
+        self.indexer_keys = torch.zeros(0, idx_dim, device=self.device, dtype=torch.bfloat16) if idx_dim > 0 else None
 
-    def append(self, compressed: torch.Tensor):
+    def append(self, compressed: torch.Tensor, idx_keys: torch.Tensor = None):
         self.cache = torch.cat([self.cache, compressed], dim=0)
+        if idx_keys is not None and self.indexer_keys is not None:
+            self.indexer_keys = torch.cat([self.indexer_keys, idx_keys], dim=0)
 
     def get(self):
         return self.cache
 
+    def get_indexer_keys(self):
+        return self.indexer_keys
+
     def clear(self):
         self.cache = torch.zeros(0, self.dim, device=self.device, dtype=torch.bfloat16)
+        if self.indexer_keys is not None:
+            self.indexer_keys = torch.zeros(0, self.indexer_keys.shape[-1], device=self.device, dtype=torch.bfloat16)
 
 
 class HomeSeekInferenceEngine:
@@ -267,9 +290,9 @@ class HomeSeekInferenceEngine:
         self.expert_cache = ExpertWeightCache(max_experts=128)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
-        self._load_global_weights()
-        self._prefetch_enabled = False
+        self._prefetch_enabled = True
         self._prefetch_worker = PrefetchWorker(self.loader, device)
+        self._load_global_weights()
         self._prefetch_a = {}
         self._prefetch_b = {}
         self._prefetch_buffer = 'a'
@@ -278,6 +301,7 @@ class HomeSeekInferenceEngine:
         self._hot_expert_ids = []
         self._hash_expert_ids = []
         self._preload_hot_experts(hot_experts_path)
+        self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _log(self, msg):
         if getattr(self, 'verbose', False):
@@ -332,48 +356,39 @@ class HomeSeekInferenceEngine:
 
     def _get_layer_weights(self, layer_idx: int):
         lw = {}
-        weight_types = [
-            "attn_norm.weight", "ffn_norm.weight",
-            "attn.wq_a.weight", "attn.wq_a.scale",
-            "attn.wq_b.weight", "attn.wq_b.scale",
-            "attn.wkv.weight", "attn.wkv.scale",
-            "attn.wo_a.weight", "attn.wo_a.scale",
-            "attn.wo_b.weight", "attn.wo_b.scale",
-            "attn.q_norm.weight", "attn.kv_norm.weight",
-            "attn.attn_sink",
-            "ffn.gate.weight", "ffn.gate.scale",
-            "hc_attn_base", "hc_attn_fn", "hc_attn_scale",
-            "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale",
+        keys_needed = [
+            f"layers.{layer_idx}.{t}" for t in [
+                "attn_norm.weight", "ffn_norm.weight",
+                "attn.wq_a.weight", "attn.wq_a.scale",
+                "attn.wq_b.weight", "attn.wq_b.scale",
+                "attn.wkv.weight", "attn.wkv.scale",
+                "attn.wo_a.weight", "attn.wo_a.scale",
+                "attn.wo_b.weight", "attn.wo_b.scale",
+                "attn.q_norm.weight", "attn.kv_norm.weight",
+                "attn.attn_sink",
+                "ffn.gate.weight", "ffn.gate.scale",
+                "ffn.gate.bias",
+                "ffn.gate.tid2eid",
+                "hc_attn_base", "hc_attn_fn", "hc_attn_scale",
+                "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale",
+                "attn.compressor.wkv.weight",
+                "attn.compressor.wgate.weight",
+                "attn.compressor.norm.weight",
+                "attn.compressor.ape",
+                "attn.indexer.wq_b.weight", "attn.indexer.wq_b.scale",
+                "attn.indexer.weights_proj.weight",
+                "attn.indexer.compressor.wkv.weight",
+                "attn.indexer.compressor.wgate.weight",
+                "attn.indexer.compressor.norm.weight",
+                "attn.indexer.compressor.ape",
+            ]
         ]
-        for t in weight_types:
-            key = f"layers.{layer_idx}.{t}"
-            lw[t] = self.loader.get_weight(key)
 
-        ffn_has_bias = self.loader.get_weight(f"layers.{layer_idx}.ffn.gate.bias")
-        if ffn_has_bias is not None:
-            lw["ffn.gate.bias"] = ffn_has_bias
-
-        tid2eid = self.loader.get_weight(f"layers.{layer_idx}.ffn.gate.tid2eid")
-        if tid2eid is not None:
-            lw["ffn.gate.tid2eid"] = tid2eid
-
-        c_wkv = self.loader.get_weight(f"layers.{layer_idx}.attn.compressor.wkv.weight")
-        if c_wkv is not None:
-            lw["attn.compressor.wkv.weight"] = c_wkv
-            lw["attn.compressor.wgate.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.compressor.wgate.weight")
-            lw["attn.compressor.norm.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.compressor.norm.weight")
-            lw["attn.compressor.ape"] = self.loader.get_weight(f"layers.{layer_idx}.attn.compressor.ape")
-
-            idx_wq_b = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.wq_b.weight")
-            if idx_wq_b is not None:
-                lw["attn.indexer.wq_b.weight"] = idx_wq_b
-                lw["attn.indexer.wq_b.scale"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.wq_b.scale")
-                lw["attn.indexer.weights_proj.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.weights_proj.weight")
-                lw["attn.indexer.compressor.wkv.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.compressor.wkv.weight")
-                lw["attn.indexer.compressor.wgate.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.compressor.wgate.weight")
-                lw["attn.indexer.compressor.norm.weight"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.compressor.norm.weight")
-                lw["attn.indexer.compressor.ape"] = self.loader.get_weight(f"layers.{layer_idx}.attn.indexer.compressor.ape")
-
+        present = self.loader.get_weights(*keys_needed)
+        for full_key in keys_needed:
+            short_key = full_key.replace(f"layers.{layer_idx}.", "")
+            if full_key in present and present[full_key] is not None:
+                lw[short_key] = present[full_key]
         return lw
 
     def _deq(self, name, data, scale, layer_idx=None):
@@ -422,7 +437,9 @@ class HomeSeekInferenceEngine:
 
         if c_hidden.shape[1] >= compress_ratio:
             c_hidden = c_hidden[:, :c_hidden.shape[1] // compress_ratio * compress_ratio, :]
-            c_hidden = c_hidden.view(B, -1, compress_ratio, c_dim).mean(dim=2)
+            c_grouped = c_hidden.view(B, -1, compress_ratio, c_dim)
+            c_attn = torch.softmax(c_grouped.float() * (c_dim ** -0.5), dim=2)
+            c_hidden = (c_attn * c_grouped.float()).sum(dim=2).to(c_hidden.dtype)
         else:
             c_hidden = torch.zeros(B, 0, c_dim, device=c_hidden.device, dtype=c_hidden.dtype)
 
@@ -441,10 +458,78 @@ class HomeSeekInferenceEngine:
         if c_norm is not None and c_hidden.shape[1] > 0:
             c_hidden = rms_norm(c_hidden, c_norm.to(torch.bfloat16))
 
+        attn_type = "csa" if compress_ratio == 4 else "hca"
+        idx_keys = None
+        if attn_type == "csa":
+            idx_c_wkv = lw.get("attn.indexer.compressor.wkv.weight")
+            idx_c_wgate = lw.get("attn.indexer.compressor.wgate.weight")
+            idx_c_norm = lw.get("attn.indexer.compressor.norm.weight")
+            idx_c_ape = lw.get("attn.indexer.compressor.ape")
+            idx_dim_out = idx_c_norm.shape[-1] if idx_c_norm is not None else 128
+            if idx_c_wkv is not None:
+                ik = torch.matmul(hidden.to(idx_c_wkv.dtype), idx_c_wkv.t())
+                if idx_c_wgate is not None:
+                    g = torch.matmul(hidden.to(idx_c_wgate.dtype), idx_c_wgate.t())
+                    g = torch.sigmoid(g.float()).to(ik.dtype)
+                    ik = ik * g
+                if ik.shape[1] >= compress_ratio:
+                    ik_tmp = ik[:, :ik.shape[1] // compress_ratio * compress_ratio, :]
+                    ik_tmp = ik_tmp.view(B, -1, compress_ratio, ik.shape[-1]).mean(dim=2)
+                    if idx_c_ape is not None and ik_tmp.shape[1] > 0:
+                        ap = min(idx_c_ape.shape[0], ik_tmp.shape[1])
+                        ik_tmp[:, :ap, :] = ik_tmp[:, :ap, :] + idx_c_ape[:ap, :].to(ik_tmp.dtype)
+                    if ik_tmp.shape[-1] != idx_dim_out:
+                        ik_tmp = ik_tmp.view(B, -1, ik_tmp.shape[-1] // idx_dim_out, idx_dim_out).mean(dim=2)
+                    if idx_c_norm is not None and ik_tmp.shape[1] > 0:
+                        ik_tmp = rms_norm(ik_tmp, idx_c_norm.to(torch.bfloat16))
+                    idx_keys = ik_tmp.squeeze(0)
+
         if state.compressed_kv is None:
-            state.compressed_kv = CompressedKVCache(compress_ratio, c_dim, str(self.device))
-        state.compressed_kv.append(c_hidden.squeeze(0))
+            idx_dim = idx_keys.shape[-1] if idx_keys is not None else 0
+            state.compressed_kv = CompressedKVCache(compress_ratio, c_dim, str(self.device), idx_dim=idx_dim)
+        state.compressed_kv.append(c_hidden.squeeze(0), idx_keys)
         return state
+
+    def _compute_indexer(self, q_latent: torch.Tensor, lw: dict, state: LayerState, layer_idx: int):
+        compressed_kv = state.compressed_kv.get() if state.compressed_kv is not None else None
+        if compressed_kv is None or compressed_kv.shape[0] == 0:
+            return None
+
+        idx_wq_b = self._deq("attn.indexer.wq_b.weight",
+                              lw.get("attn.indexer.wq_b.weight"),
+                              lw.get("attn.indexer.wq_b.scale"), layer_idx)
+        if idx_wq_b is None:
+            return None
+
+        n_compressed, c_dim = compressed_kv.shape
+
+        idx_q = torch.matmul(q_latent.to(idx_wq_b.dtype), idx_wq_b.t())
+        idx_q = idx_q.view(q_latent.shape[0], -1, self.config.index_n_heads, self.config.index_head_dim)
+        idx_q = idx_q.transpose(1, 2)
+
+        idx_k = state.compressed_kv.get_indexer_keys()
+        if idx_k is None or idx_k.shape[0] == 0:
+            return self._get_compressed_attention_kv(state, lw)
+
+        idx_k = idx_k.unsqueeze(0).unsqueeze(0)
+        scores = torch.matmul(idx_q.float() * (self.config.index_head_dim ** -0.5), idx_k.float().transpose(-2, -1))
+        scores_pooled = scores[:, :, -1:, :].mean(dim=1).squeeze(1)  # [B, 1, nc] -> [B, nc]
+
+        k = min(self.config.index_topk, n_compressed)
+        _, topk_indices = torch.topk(scores_pooled, k, dim=-1)
+        selected_indices = topk_indices if topk_indices.dim() == 2 else topk_indices.squeeze(0)
+
+        selected_kv = compressed_kv[selected_indices[0]]
+
+        h_dim = self.config.head_dim
+        if c_dim != h_dim:
+            if c_dim > h_dim:
+                selected_kv = selected_kv.view(-1, c_dim // h_dim, h_dim).mean(dim=1)
+            else:
+                pad = torch.zeros(k, h_dim - c_dim, device=selected_kv.device, dtype=selected_kv.dtype)
+                selected_kv = torch.cat([selected_kv, pad], dim=-1)
+
+        return selected_kv.unsqueeze(0).unsqueeze(1).contiguous()
 
     def _get_compressed_attention_kv(self, state: LayerState, lw: dict):
         compressed_kv = state.compressed_kv.get() if state.compressed_kv is not None else None
@@ -459,7 +544,7 @@ class HomeSeekInferenceEngine:
                 pad = torch.zeros(compressed_kv.shape[0], h_dim - c_dim,
                                   device=compressed_kv.device, dtype=compressed_kv.dtype)
                 compressed_kv = torch.cat([compressed_kv, pad], dim=-1)
-        compressed_kv = compressed_kv.unsqueeze(0).unsqueeze(2).contiguous()
+        compressed_kv = compressed_kv.unsqueeze(0).unsqueeze(1).contiguous()
         return compressed_kv  # [B=1, n_kv_head=1, seq, head_dim]
 
     def _expand_kv(self, kv_latent):
@@ -476,19 +561,32 @@ class HomeSeekInferenceEngine:
             self._log(f"mHC skip: hc_fn needs {fn_in_features}-d input, hidden is {D}-d "
                       f"(expected expanded to {expected_in})")
             return hidden_4d.sum(dim=2), None, None
-        hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
-        rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-        mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
-        pre, post, comb = mhc_split_sinkhorn(
-            mixes, hc_scale.to(torch.float32), hc_base.to(torch.float32),
-            hc_mult=hc_mult, sinkhorn_iters=self.config.hc_sinkhorn_iters, eps=self.config.hc_eps,
-        )
-        if apply_pre:
-            scaled = hidden_4d * pre.unsqueeze(-1)
-            hidden = scaled.sum(dim=2)
-        else:
-            hidden = hidden_4d.sum(dim=2)
-        return hidden, post, comb
+        try:
+            post_mix, comb_mix, layer_input = tile_kernels.modeling.mhc.ops.mhc_pre_big_fuse(
+                hidden_4d, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
+                self.config.rms_norm_eps, self.config.hc_eps, self.config.hc_eps,
+                2.0, self.config.hc_sinkhorn_iters, 16)
+            if apply_pre:
+                hidden = layer_input.to(hidden_4d.dtype)
+            else:
+                hidden = hidden_4d.sum(dim=2)
+            post = post_mix.squeeze(-1)
+            comb = comb_mix
+            return hidden, post, comb
+        except Exception:
+            hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
+            rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+            mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
+            pre, post, comb = mhc_split_sinkhorn(
+                mixes, hc_scale.to(torch.float32), hc_base.to(torch.float32),
+                hc_mult=hc_mult, sinkhorn_iters=self.config.hc_sinkhorn_iters, eps=self.config.hc_eps,
+            )
+            if apply_pre:
+                scaled = hidden_4d * pre.unsqueeze(-1)
+                hidden = scaled.sum(dim=2)
+            else:
+                hidden = hidden_4d.sum(dim=2)
+            return hidden, post, comb
 
     def _forward_attn(self, hidden_states, lw, layer_idx):
         B, T, D = hidden_states.shape
@@ -544,14 +642,28 @@ class HomeSeekInferenceEngine:
         state.append_kv(kv_latent)
         all_kv_latent = state.all_kv()
 
-        state = self._compress_kv(hidden_states, lw, layer_idx, state)
+        attn_type = "csa" if compress_ratio == 4 else ("hca" if compress_ratio > 0 else "swa")
+
+        if attn_type in ("csa", "hca"):
+            state = self._compress_kv(hidden_states, lw, layer_idx, state)
 
         T_kv = all_kv_latent.shape[1]
         sw = min(self.config.sliding_window, T_kv)
         kv_sw = all_kv_latent[:, -sw:, :]
         k_sw, v_sw = self._expand_kv(kv_sw)
 
-        compressed_kv = self._get_compressed_attention_kv(state, lw)
+        if attn_type == "csa":
+            indexed_kv = self._compute_indexer(q_latent, lw, state, layer_idx)
+            if indexed_kv is None:
+                compressed_kv = self._get_compressed_attention_kv(state, lw)
+            else:
+                compressed_kv = indexed_kv
+        elif attn_type == "hca":
+            compressed_kv = self._get_compressed_attention_kv(state, lw)
+        else:
+            compressed_kv = None
+            state.compressed_kv = None
+
         if compressed_kv is not None:
             if compressed_kv.dim() < k_sw.dim():
                 compressed_kv = compressed_kv.unsqueeze(1).expand(-1, k_sw.shape[1], -1, -1)
@@ -559,7 +671,6 @@ class HomeSeekInferenceEngine:
                 compressed_kv = compressed_kv.expand(-1, k_sw.shape[1], -1, -1)
             if compressed_kv.shape[3] != k_sw.shape[3]:
                 compressed_kv = compressed_kv[:, :, :, :k_sw.shape[3]]
-            min_seq = min(k_sw.shape[2], compressed_kv.shape[2])
             k_all = torch.cat([k_sw, compressed_kv.to(k_sw.dtype)], dim=-2)
             v_all = torch.cat([v_sw, compressed_kv.to(v_sw.dtype)], dim=-2)
         else:
@@ -630,14 +741,6 @@ class HomeSeekInferenceEngine:
         if cached is not None:
             return cached
 
-        if self._prefetch_enabled and self._prefetch_worker is not None:
-            prefetched = self._prefetch_worker.get_cached(layer_idx, eid)
-            if prefetched is not None:
-                w1_d, w3_d, w2_d = prefetched
-                pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
-                self.expert_cache.put(cache_key, w1_d, w3_d, w2_d, pin=pin)
-                return (w1_d, w3_d, w2_d)
-
         prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
         keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
                 f"{prefix}.w3.weight", f"{prefix}.w3.scale",
@@ -654,7 +757,7 @@ class HomeSeekInferenceEngine:
         w3_d = load_fp8_weight(w3, s3) if w3.dtype != torch.int8 else load_fp4_weight(w3, s3)
         w2_d = load_fp8_weight(w2, s2) if w2.dtype != torch.int8 else load_fp4_weight(w2, s2)
 
-        pin = layer_idx < self.config.num_hash_layers
+        pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
         self.expert_cache.put(cache_key, w1_d, w3_d, w2_d, pin=pin)
         return (w1_d, w3_d, w2_d)
 
@@ -783,14 +886,20 @@ class HomeSeekInferenceEngine:
     def _process_mhc_post(self, hidden, residual, post, comb):
         if post is None or comb is None:
             return hidden
-        B, S, D = hidden.shape
-        hc = comb.shape[-1]
-        x_expanded = hidden.unsqueeze(2)
-        term1 = post.unsqueeze(-1) * x_expanded
-        residual_expanded = residual.unsqueeze(3)
-        term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
-        y = term1 + term2
-        return y.to(hidden.dtype)
+        try:
+            post_4d = post.unsqueeze(-1) if post.dim() == 3 else post
+            result = tile_kernels.modeling.mhc.ops.mhc_post(
+                hidden.float(), residual.float(), post_4d.float(), comb.float())
+            return result.to(hidden.dtype)
+        except Exception:
+            B, S, D = hidden.shape
+            hc = comb.shape[-1]
+            x_expanded = hidden.unsqueeze(2)
+            term1 = post.unsqueeze(-1) * x_expanded
+            residual_expanded = residual.unsqueeze(3)
+            term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
+            y = term1 + term2
+            return y.to(hidden.dtype)
 
     def _hc_head(self, hidden_4d):
         B, T, hc_mult, D = hidden_4d.shape
@@ -849,18 +958,24 @@ class HomeSeekInferenceEngine:
             if layer_idx in self._cpu_fallback_layers:
                 self._prefetch_worker.clear()
 
-            if (layer_idx + 1) % 10 == 0:
+            if (layer_idx + 1) % 5 == 0:
                 mem = torch.cuda.memory_allocated() / (1024**3)
-                if mem > 19:
+                if mem > 18:
                     if self._prefetch_worker is not None:
                         self._prefetch_worker.clear()
-                    for li in range(max(0, layer_idx - 3), layer_idx + 1):
-                        if li in self.layer_states:
-                            self.layer_states[li].kv_latent_cache = None
-                            self.layer_states[li].archived_kv = None
-                            self.layer_states[li].archived_len = 0
-                            self.layer_states[li].compressed_kv = None
-                    self.expert_cache.cache.clear()
+                    for li in range(max(0, layer_idx - 5), layer_idx + 1):
+                        if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
+                            if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
+                                with torch.cuda.stream(self._kv_offload_stream):
+                                    self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
+                                    self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
+                            if self.layer_states[li].compressed_kv is not None:
+                                self.layer_states[li].compressed_kv = None
+                    if len([k for k in self.expert_cache.cache.keys() if k not in self.expert_cache.pinned]) > 64:
+                        for k in list(self.expert_cache.cache.keys()):
+                            if k not in self.expert_cache.pinned:
+                                del self.expert_cache.cache[k]
+                                break
                     torch.cuda.empty_cache()
                     self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
 
@@ -902,9 +1017,15 @@ class HomeSeekInferenceEngine:
                 else:
                     h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-                if self._prefetch_enabled and self._prefetch_worker is not None and layer_idx + 1 < self.config.num_hidden_layers:
-                    if len(used_experts) > 0:
-                        self._prefetch_worker.prefetch_next_layer(layer_idx + 1, list(used_experts))
+                if layer_idx == self.config.num_hidden_layers // 2:
+                    mem = torch.cuda.memory_allocated() / (1024**3)
+                    if mem > 18:
+                        for li in range(layer_idx):
+                            if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
+                                if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
+                                    with torch.cuda.stream(self._kv_offload_stream):
+                                        self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
+                                        self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
 
             h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
             if self.norm_weight is not None:
@@ -928,6 +1049,7 @@ class HomeSeekInferenceEngine:
             "num_prompt_tokens": T,
             "num_generated_tokens": len(generated),
         }
+        self.loader.close_handles()
         self._log(f"Done: {result['num_generated_tokens']} tokens in {total_time:.1f}s, "
                   f"peak mem: {result['peak_memory_gb']:.1f}GB")
         return result
