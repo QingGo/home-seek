@@ -96,6 +96,34 @@ class TestMHC:
         mixed = eng._process_mhc_post(ffn_out, h4d, post.float(), comb.float())
         assert mixed.shape == (B, T, hc, D)
 
+    def test_mhc_pre_big_fuse_api(self):
+        import tile_kernels.modeling.mhc.ops as mhc_ops
+        B, T, hc, D = 1, 4, 4, 4096
+        residual = torch.randn(B, T, hc, D, device="cuda", dtype=torch.bfloat16)
+        fn = torch.randn(hc * (2 + hc), hc * D, device="cuda", dtype=torch.float32)
+        scale = torch.tensor([1.0, 0.5, 0.1], device="cuda", dtype=torch.float32)
+        base = torch.randn(hc * (2 + hc), device="cuda", dtype=torch.float32)
+        post_mix, comb_mix, layer_input = mhc_ops.mhc_pre_big_fuse(
+            residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 5)
+        assert post_mix.shape == (B, T, hc, 1)
+        assert comb_mix.shape == (B, T, hc, hc)
+        assert layer_input.shape == (B, T, D)
+
+    def test_mhc_post_api(self):
+        import tile_kernels.modeling.mhc.ops as mhc_ops
+        B, T, hc, D = 1, 4, 4, 4096
+        x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
+        residual = torch.randn(B, T, hc, D, device="cuda", dtype=torch.bfloat16)
+        post_mix = torch.randn(B, T, hc, 1, device="cuda", dtype=torch.float32)
+        comb_mix = torch.randn(B, T, hc, hc, device="cuda", dtype=torch.float32)
+        try:
+            result = mhc_ops.mhc_post(x, residual, post_mix, comb_mix)
+            assert result.shape == (B, T, D)
+        except Exception as e:
+            if "PDL" in str(e) or "tilelang" in str(e).lower():
+                pytest.skip("TileKernels MHC post kernel compilation unavailable")
+            raise
+
     def test_mhc_shape_mismatch_skip(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.verbose = False
@@ -437,15 +465,137 @@ class TestExpertCache:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-    def test_expert_weight_cache(self):
+    def test_expert_weight_cache_lru(self):
         from home_seek.inference_engine import ExpertWeightCache
         cache = ExpertWeightCache(max_experts=3)
         w1 = torch.randn(4, 8, device="cuda")
         w3 = torch.randn(4, 8, device="cuda")
         w2 = torch.randn(8, 4, device="cuda")
-        cache.put("e0", w1, w3, w2)
+        cache.put_deq("e0", w1, w3, w2)
         assert cache.get("e0") is not None
-        cache.put("e1", w1, w3, w2)
-        cache.put("e2", w1, w3, w2)
-        cache.put("e3", w1, w3, w2)
+        cache.put_deq("e1", w1, w3, w2)
+        cache.put_deq("e2", w1, w3, w2)
+        cache.put_deq("e3", w1, w3, w2)
         assert cache.get("e0") is None
+
+    def test_expert_cache_pin_protects_entries(self):
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=3)
+        w = torch.randn(4, 8, device="cuda")
+        cache.put_deq("pinned", w, w, w, pin=True)
+        cache.put_deq("e1", w, w, w)
+        cache.put_deq("e2", w, w, w)
+        cache.put_deq("e3", w, w, w)
+        cache.put_deq("e4", w, w, w)
+        assert cache.get("pinned") is not None
+        assert cache.get("e1") is None
+
+    def test_expert_cache_hot_deq(self):
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10)
+        w1 = torch.randn(4, 8, device="cuda")
+        w3 = torch.randn(4, 8, device="cuda")
+        w2 = torch.randn(8, 4, device="cuda")
+        cache.put_deq("e0", w1, w3, w2)
+        deq = cache.deq("e0")
+        assert deq is not None
+        w1_d, w3_d, w2_d = deq
+        assert w1_d.shape == w1.shape
+
+    def test_expert_cache_raw_fp8_entry(self):
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10)
+        data = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+        entry = (data, None, "bf16")
+        cache.put("e0", entry, entry, entry)
+        assert cache.get("e0") is not None
+        deq = cache.deq("e0")
+        assert deq is not None
+
+    def test_expert_cache_trim(self):
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=100)
+        w = torch.randn(4, 8, device="cuda")
+        for i in range(20):
+            cache.put_deq(f"e{i}", w, w, w)
+        assert len(cache) == 20
+        cache.trim(target_count=5)
+        assert len(cache) <= 5 + len(cache.pinned)
+
+    def test_expert_cache_rejects_duplicate_key(self):
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10)
+        w = torch.randn(4, 8, device="cuda")
+        cache.put_deq("k", w, w, w)
+        assert len(cache) == 1
+        cache.put_deq("k", w, w, w)
+        assert len(cache) == 1
+
+
+class TestPrefetchWorker:
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_async_prefetch_worker_init(self):
+        from home_seek.prefetch_worker import AsyncPrefetchWorker
+        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
+        assert worker is not None
+        assert worker._stream is not None
+        worker.shutdown()
+
+    def test_async_prefetch_clear(self):
+        from home_seek.prefetch_worker import AsyncPrefetchWorker
+        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
+        worker._prefetch_cache[(0, 1)] = "dummy"
+        worker.clear()
+        assert len(worker._prefetch_cache) == 0
+        worker.shutdown()
+
+    def test_async_prefetch_get_missing(self):
+        from home_seek.prefetch_worker import AsyncPrefetchWorker
+        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
+        result = worker.get(0, 1)
+        assert result is None
+        worker.shutdown()
+
+    def test_async_prefetch_empty(self):
+        from home_seek.prefetch_worker import AsyncPrefetchWorker
+        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
+        worker.prefetch(0, [])
+        assert len(worker._pending_keys) == 0
+        assert len(worker._prefetch_cache) == 0
+        worker.shutdown()
+
+
+class TestWeightLoaderMmap:
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_weight_loader_init_no_weights(self):
+        from home_seek.inference_engine import WeightLoader
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            loader = WeightLoader(td, device="cuda")
+            assert loader.weight_map == {}
+            assert loader._mmap_cache == {}
+            loader.close()
+
+    def test_weight_loader_get_missing(self):
+        from home_seek.inference_engine import WeightLoader
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            loader = WeightLoader(td, device="cuda")
+            result = loader.get_weight("nonexistent.key")
+            assert result is None
+            loader.close()
+
+    def test_weight_loader_device_propagation(self):
+        from home_seek.inference_engine import WeightLoader
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            loader = WeightLoader(td, device="cuda:0")
+            assert str(loader.device) == "cuda:0"
+            loader.close()

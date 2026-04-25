@@ -10,7 +10,7 @@ from collections import defaultdict, OrderedDict
 import math
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
-from home_seek.prefetch_worker import PrefetchWorker
+from home_seek.prefetch_worker import AsyncPrefetchWorker
 from tile_reference import cast_back, unpack_from_e2m1fn_x2, swiglu_forward
 import tile_kernels
 
@@ -92,45 +92,29 @@ def load_fp4_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return deq.to(torch.bfloat16)
 
 
-class ExpertWeightCache:
-    def __init__(self, max_experts: int = 64):
-        self.max_experts = max_experts
-        self.cache = OrderedDict()
-        self.pinned = set()
+class CompressedKVCache:
+    def __init__(self, compress_ratio: int, dim: int, device: str, idx_dim: int = 0):
+        self.compress_ratio = compress_ratio
+        self.dim = dim
+        self.device = torch.device(device)
+        self.cache = torch.zeros(0, dim, device=self.device, dtype=torch.bfloat16)
+        self.indexer_keys = torch.zeros(0, idx_dim, device=self.device, dtype=torch.bfloat16) if idx_dim > 0 else None
 
-    def get(self, key: str):
-        if key not in self.cache:
-            return None
-        self.cache.move_to_end(key)
-        return self.cache[key]
+    def append(self, compressed: torch.Tensor, idx_keys: torch.Tensor = None):
+        self.cache = torch.cat([self.cache, compressed], dim=0)
+        if idx_keys is not None and self.indexer_keys is not None:
+            self.indexer_keys = torch.cat([self.indexer_keys, idx_keys], dim=0)
 
-    def put(self, key: str, w1, w3, w2, pin: bool = False):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return
-        if not pin and len(self.cache) >= self.max_experts + len(self.pinned):
-            for k, _ in list(self.cache.items()):
-                if k not in self.pinned:
-                    self.cache.pop(k)
-                    break
-        self.cache[key] = (w1, w3, w2)
-        if pin:
-            self.pinned.add(key)
+    def get(self):
+        return self.cache
 
+    def get_indexer_keys(self):
+        return self.indexer_keys
 
-class FileHandleCache:
-    def __init__(self):
-        self._handles = {}
-
-    def get_handle(self, fpath, device):
-        dev_str = device if isinstance(device, str) else str(device)
-        key = (fpath, dev_str)
-        if key not in self._handles:
-            self._handles[key] = safe_open(fpath, framework="pt", device=dev_str)
-        return self._handles[key]
-
-    def close_all(self):
-        self._handles.clear()
+    def clear(self):
+        self.cache = torch.zeros(0, self.dim, device=self.device, dtype=torch.bfloat16)
+        if self.indexer_keys is not None:
+            self.indexer_keys = torch.zeros(0, self.indexer_keys.shape[-1], device=self.device, dtype=torch.bfloat16)
 
 
 class WeightLoader:
@@ -138,7 +122,7 @@ class WeightLoader:
         self.weight_dir = weight_dir
         self.device = torch.device(device)
         self.weight_map = {}
-        self._file_handles = FileHandleCache()
+        self._mmap_cache = {}
         self._build_index()
 
     def _build_index(self):
@@ -162,16 +146,22 @@ class WeightLoader:
             except Exception:
                 pass
 
-    def get_weight(self, key: str):
+    def _open_mmap(self, fname: str):
+        if fname not in self._mmap_cache:
+            fpath = os.path.join(self.weight_dir, fname)
+            self._mmap_cache[fname] = safe_open(fpath, framework="pt", device="cpu")
+        return self._mmap_cache[fname]
+
+    def get_weight(self, key: str, device: str = None):
         fname = self.weight_map.get(key)
         if fname is None:
             return None
-        fpath = os.path.join(self.weight_dir, fname)
-        if not os.path.exists(fpath):
-            return None
         try:
-            f = self._file_handles.get_handle(fpath, str(self.device))
-            return f.get_tensor(key)
+            f = self._open_mmap(fname)
+            tensor = f.get_tensor(key)
+            if device is not None and str(device) != "cpu":
+                return tensor.to(device, non_blocking=True)
+            return tensor
         except Exception:
             return None
 
@@ -183,19 +173,16 @@ class WeightLoader:
             if fname:
                 file_keys[fname].append(k)
         for fname, ks in file_keys.items():
-            fpath = os.path.join(self.weight_dir, fname)
-            if not os.path.exists(fpath):
-                continue
             try:
-                f = self._file_handles.get_handle(fpath, str(self.device))
+                f = self._open_mmap(fname)
                 for k in ks:
                     results[k] = f.get_tensor(k)
             except Exception:
                 pass
         return results
 
-    def close_handles(self):
-        self._file_handles.close_all()
+    def close(self):
+        self._mmap_cache.clear()
 
     def get_layer_weight(self, layer: int, weight_type: str):
         return self.get_weight(f"layers.{layer}.{weight_type}")
@@ -253,29 +240,90 @@ class LayerState:
         return self.kv_latent_cache
 
 
-class CompressedKVCache:
-    def __init__(self, compress_ratio: int, dim: int, device: str, idx_dim: int = 0):
-        self.compress_ratio = compress_ratio
-        self.dim = dim
-        self.device = torch.device(device)
-        self.cache = torch.zeros(0, dim, device=self.device, dtype=torch.bfloat16)
-        self.indexer_keys = torch.zeros(0, idx_dim, device=self.device, dtype=torch.bfloat16) if idx_dim > 0 else None
+class ExpertWeightCache:
+    def __init__(self, max_experts: int = 128):
+        self.max_experts = max_experts
+        self.cache = OrderedDict()
+        self.pinned = set()
 
-    def append(self, compressed: torch.Tensor, idx_keys: torch.Tensor = None):
-        self.cache = torch.cat([self.cache, compressed], dim=0)
-        if idx_keys is not None and self.indexer_keys is not None:
-            self.indexer_keys = torch.cat([self.indexer_keys, idx_keys], dim=0)
+        self._hot_deq = OrderedDict()
+        self._max_hot_deq = 32
 
-    def get(self):
-        return self.cache
+    def get(self, key: str):
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
 
-    def get_indexer_keys(self):
-        return self.indexer_keys
+    def deq(self, key: str):
+        if key in self._hot_deq:
+            self._hot_deq.move_to_end(key)
+            return self._hot_deq[key]
+
+        entry = self.get(key)
+        if entry is None:
+            return None
+
+        raw_w1, raw_w3, raw_w2 = entry
+        w1 = self._dequantize_entry(raw_w1)
+        w3 = self._dequantize_entry(raw_w3)
+        w2 = self._dequantize_entry(raw_w2)
+
+        self._hot_deq[key] = (w1, w3, w2)
+        if len(self._hot_deq) > self._max_hot_deq:
+            self._hot_deq.popitem(last=False)
+        return (w1, w3, w2)
+
+    def _dequantize_entry(self, entry):
+        if entry is None:
+            return None
+        data, scale, fmt = entry
+        if fmt == "bf16":
+            return data
+        if fmt == "fp8":
+            return load_fp8_weight(data, scale)
+        if fmt == "fp4":
+            return load_fp4_weight(data, scale)
+        return data.to(torch.bfloat16)
+
+    def put(self, key: str, w1_entry, w3_entry, w2_entry, pin: bool = False):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return
+        if not pin and len(self.cache) >= self.max_experts + len(self.pinned):
+            for k, _ in list(self.cache.items()):
+                if k not in self.pinned:
+                    self.cache.pop(k)
+                    if k in self._hot_deq:
+                        del self._hot_deq[k]
+                    break
+        self.cache[key] = (w1_entry, w3_entry, w2_entry)
+        if pin:
+            self.pinned.add(key)
+
+    def put_deq(self, key: str, w1_d, w3_d, w2_d, pin: bool = False):
+        self.put(key, (w1_d, None, "bf16"), (w3_d, None, "bf16"), (w2_d, None, "bf16"), pin=pin)
 
     def clear(self):
-        self.cache = torch.zeros(0, self.dim, device=self.device, dtype=torch.bfloat16)
-        if self.indexer_keys is not None:
-            self.indexer_keys = torch.zeros(0, self.indexer_keys.shape[-1], device=self.device, dtype=torch.bfloat16)
+        self.cache.clear()
+        self._hot_deq.clear()
+        self.pinned.clear()
+
+    def trim(self, target_count: int = 64):
+        excess = len(self.cache) - len(self.pinned) - target_count
+        if excess <= 0:
+            return
+        for k in list(self.cache.keys()):
+            if k in self.pinned:
+                continue
+            if excess <= 0:
+                break
+            self.cache.pop(k)
+            self._hot_deq.pop(k, None)
+            excess -= 1
+
+    def __len__(self):
+        return len(self.cache)
 
 
 class HomeSeekInferenceEngine:
@@ -290,18 +338,16 @@ class HomeSeekInferenceEngine:
         self.expert_cache = ExpertWeightCache(max_experts=128)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
-        self._prefetch_enabled = True
-        self._prefetch_worker = PrefetchWorker(self.loader, device)
+        self._prefetch_worker = None
         self._load_global_weights()
-        self._prefetch_a = {}
-        self._prefetch_b = {}
-        self._prefetch_buffer = 'a'
+        self._prefetch_enabled = True
         self._cpu_fallback_enabled = True
         self._cpu_fallback_layers = set(range(min(3, self.config.num_hidden_layers))) | set(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
         self._hot_expert_ids = []
         self._hash_expert_ids = []
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _log(self, msg):
         if getattr(self, 'verbose', False):
@@ -319,9 +365,14 @@ class HomeSeekInferenceEngine:
         self._log(f"Hot experts: {len(self._hot_expert_ids)} IDs, "
                   f"Hash experts: {len(self._hash_expert_ids)} IDs")
 
+    def _init_prefetch(self):
+        if self._prefetch_enabled and self._prefetch_worker is None:
+            self._prefetch_worker = AsyncPrefetchWorker(
+                self.weight_dir, self.loader.weight_map, str(self.device))
+
     def _load_global_weights(self):
         def safe(key):
-            return self.loader.get_weight(key)
+            return self.loader.get_weight(key, device=self.device)
 
         self.embed = safe("embed.weight")
         if self.embed is not None and not isinstance(self.embed, torch.Tensor):
@@ -388,7 +439,7 @@ class HomeSeekInferenceEngine:
         for full_key in keys_needed:
             short_key = full_key.replace(f"layers.{layer_idx}.", "")
             if full_key in present and present[full_key] is not None:
-                lw[short_key] = present[full_key]
+                lw[short_key] = present[full_key].to(self.device, non_blocking=True)
         return lw
 
     def _deq(self, name, data, scale, layer_idx=None):
@@ -513,7 +564,7 @@ class HomeSeekInferenceEngine:
 
         idx_k = idx_k.unsqueeze(0).unsqueeze(0)
         scores = torch.matmul(idx_q.float() * (self.config.index_head_dim ** -0.5), idx_k.float().transpose(-2, -1))
-        scores_pooled = scores[:, :, -1:, :].mean(dim=1).squeeze(1)  # [B, 1, nc] -> [B, nc]
+        scores_pooled = scores[:, :, -1:, :].mean(dim=1).squeeze(1)
 
         k = min(self.config.index_topk, n_compressed)
         _, topk_indices = torch.topk(scores_pooled, k, dim=-1)
@@ -545,7 +596,7 @@ class HomeSeekInferenceEngine:
                                   device=compressed_kv.device, dtype=compressed_kv.dtype)
                 compressed_kv = torch.cat([compressed_kv, pad], dim=-1)
         compressed_kv = compressed_kv.unsqueeze(0).unsqueeze(1).contiguous()
-        return compressed_kv  # [B=1, n_kv_head=1, seq, head_dim]
+        return compressed_kv
 
     def _expand_kv(self, kv_latent):
         B, T, _ = kv_latent.shape
@@ -561,11 +612,16 @@ class HomeSeekInferenceEngine:
             self._log(f"mHC skip: hc_fn needs {fn_in_features}-d input, hidden is {D}-d "
                       f"(expected expanded to {expected_in})")
             return hidden_4d.sum(dim=2), None, None
+        dev = hidden_4d.device
+        hc_fn = hc_fn.to(dev)
+        hc_base = hc_base.to(dev)
+        hc_scale = hc_scale.to(dev)
         try:
+            hidden_contig = hidden_4d.contiguous()
             post_mix, comb_mix, layer_input = tile_kernels.modeling.mhc.ops.mhc_pre_big_fuse(
-                hidden_4d, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
+                hidden_contig, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
                 self.config.rms_norm_eps, self.config.hc_eps, self.config.hc_eps,
-                2.0, self.config.hc_sinkhorn_iters, 16)
+                2.0, self.config.hc_sinkhorn_iters)
             if apply_pre:
                 hidden = layer_input.to(hidden_4d.dtype)
             else:
@@ -700,7 +756,6 @@ class HomeSeekInferenceEngine:
             a_g = attn_p[:, g * n_kv:(g + 1) * n_kv]
             out[:, g * n_kv:(g + 1) * n_kv] = torch.matmul(a_g, v_all)
 
-        # Inverse RoPE on attention output (remove rotation from V)
         out = apply_rotary_emb(out, freqs_cis, rd=self.config.qk_rope_head_dim, inverse=True)
 
         out = out.transpose(1, 2).contiguous()
@@ -735,12 +790,39 @@ class HomeSeekInferenceEngine:
         topk_w = topk_w / topk_sum * self.config.routed_scaling_factor
         return topk_idx, topk_w
 
+    def _make_raw_entry(self, data, scale):
+        if data is None:
+            return None
+        dev = self.device
+        data = data.to(dev, non_blocking=True)
+        if scale is not None:
+            scale = scale.to(torch.float32).to(dev, non_blocking=True) if scale.dtype != torch.float32 else scale.to(dev, non_blocking=True)
+        if data.dtype == torch.bfloat16:
+            return (data, None, "bf16")
+        if data.dtype == torch.int8:
+            return (data, scale, "fp4")
+        if data.dtype == torch.float8_e4m3fn:
+            return (data, scale, "fp8")
+        if scale is not None:
+            return (data, scale, "fp8")
+        return (data, None, "bf16")
+
     def _load_expert_weights(self, layer_idx, eid):
         cache_key = f"{layer_idx}_{eid}"
         cached = self.expert_cache.get(cache_key)
         if cached is not None:
             return cached
 
+        if self._prefetch_worker is not None:
+            prefetched = self._prefetch_worker.get(layer_idx, eid)
+            if prefetched is not None:
+                w1_entry = self._make_raw_entry(prefetched.get(("w1", "data")), prefetched.get(("w1", "scale")))
+                w3_entry = self._make_raw_entry(prefetched.get(("w3", "data")), prefetched.get(("w3", "scale")))
+                w2_entry = self._make_raw_entry(prefetched.get(("w2", "data")), prefetched.get(("w2", "scale")))
+                pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+                self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+                return self.expert_cache.get(cache_key)
+
         prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
         keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
                 f"{prefix}.w3.weight", f"{prefix}.w3.scale",
@@ -753,48 +835,13 @@ class HomeSeekInferenceEngine:
         if w1 is None:
             return None
 
-        w1_d = load_fp8_weight(w1, s1) if w1.dtype != torch.int8 else load_fp4_weight(w1, s1)
-        w3_d = load_fp8_weight(w3, s3) if w3.dtype != torch.int8 else load_fp4_weight(w3, s3)
-        w2_d = load_fp8_weight(w2, s2) if w2.dtype != torch.int8 else load_fp4_weight(w2, s2)
+        w1_entry = self._make_raw_entry(w1, s1)
+        w3_entry = self._make_raw_entry(w3, s3)
+        w2_entry = self._make_raw_entry(w2, s2)
 
         pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
-        self.expert_cache.put(cache_key, w1_d, w3_d, w2_d, pin=pin)
-        return (w1_d, w3_d, w2_d)
-
-    def _cpu_ffn_fallback(self, layer_idx: int, eid: int):
-        cache_key = f"cpu_{layer_idx}_{eid}"
-        cached = self.expert_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
-        keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
-                f"{prefix}.w3.weight", f"{prefix}.w3.scale",
-                f"{prefix}.w2.weight", f"{prefix}.w2.scale"]
-        start = time.time()
-        tensors = self.loader.get_weights(*keys)
-        w1 = tensors.get(keys[0]); s1 = tensors.get(keys[1])
-        w3 = tensors.get(keys[2]); s3 = tensors.get(keys[3])
-        w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
-        if w1 is None:
-            return None
-        w1_d = load_fp8_weight(w1, s1) if w1.dtype != torch.int8 else load_fp4_weight(w1, s1)
-        w3_d = load_fp8_weight(w3, s3) if w3.dtype != torch.int8 else load_fp4_weight(w3, s3)
-        w2_d = load_fp8_weight(w2, s2) if w2.dtype != torch.int8 else load_fp4_weight(w2, s2)
-        self.expert_cache.put(cache_key, w1_d, w3_d, w2_d, pin=False)
-        elapsed = time.time() - start
-        if elapsed > 0.1:
-            self._log(f"CPU fallback: layer {layer_idx} expert {eid} loaded in {elapsed*1000:.0f}ms")
-        return (w1_d, w3_d, w2_d)
-
-    def _forward_single_expert(self, h, w1_d, w3_d, w2_d):
-        gate_out = torch.matmul(h, w1_d.t())
-        up_out = torch.matmul(h, w3_d.t())
-        x = torch.cat([gate_out, up_out], dim=-1)
-        x_2d = x.view(-1, x.shape[-1]).contiguous()
-        activated = swiglu_forward(x_2d, swiglu_clamp_value=self.config.swiglu_limit)
-        activated = activated.view(*x.shape[:-1], -1)
-        out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
-        return out
+        self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+        return self.expert_cache.get(cache_key)
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
@@ -829,13 +876,18 @@ class HomeSeekInferenceEngine:
                 token_mask = inverse == eid_idx
                 if not token_mask.any():
                     continue
-                expert_w = self._load_expert_weights(layer_idx, eid)
-                if expert_w is None:
+                raw_entry = self._load_expert_weights(layer_idx, eid)
+                if raw_entry is None:
                     if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
-                        expert_w = self._cpu_ffn_fallback(layer_idx, eid)
-                    if expert_w is None:
+                        raw_entry = self._cpu_ffn_fallback(layer_idx, eid)
+                    if raw_entry is None:
                         continue
-                w1_d, w3_d, w2_d = expert_w
+                deq_triple = self.expert_cache.deq(f"{layer_idx}_{eid}")
+                if deq_triple is None:
+                    deq_triple = raw_entry
+                w1_d, w3_d, w2_d = deq_triple
+                if w1_d is None:
+                    continue
                 h_batch = flat_hidden[token_mask].to(w1_d.dtype)
                 gate_out = torch.matmul(h_batch, w1_d.t())
                 up_out = torch.matmul(h_batch, w3_d.t())
@@ -851,26 +903,33 @@ class HomeSeekInferenceEngine:
         shared_tensors = self.loader.get_weights(*shared_keys)
         shared_w1 = shared_tensors.get(shared_keys[0])
         if shared_w1 is not None:
+            dev = self.device
             def _load_w(data, scale):
                 if data is None:
                     return None
                 if data.dtype == torch.int8:
-                    return load_fp4_weight(data, scale)
-                return load_fp8_weight(data, scale)
+                    return load_fp4_weight(data.to(dev), scale.to(dev) if scale is not None else None)
+                return load_fp8_weight(data.to(dev), scale.to(dev) if scale is not None else None)
 
             s1 = shared_tensors.get(shared_keys[1])
             w3 = shared_tensors.get(shared_keys[2])
             s3 = shared_tensors.get(shared_keys[3])
             w2 = shared_tensors.get(shared_keys[4])
             s2 = shared_tensors.get(shared_keys[5])
-            w1_d = _load_w(shared_w1, s1)
+            w1_d = _load_w(shared_w1.to(dev), s1)
             w3_d = _load_w(w3, s3)
             w2_d = _load_w(w2, s2)
 
             if w3_d is not None and w2_d is not None:
                 h = hidden_states.to(w1_d.dtype)
-                shared_out = self._forward_single_expert(h, w1_d, w3_d, w2_d)
-                ffn_out = ffn_out + shared_out
+                gate_out = torch.matmul(h, w1_d.t())
+                up_out = torch.matmul(h, w3_d.t())
+                x = torch.cat([gate_out, up_out], dim=-1)
+                x_2d = x.view(-1, x.shape[-1]).contiguous()
+                activated = swiglu_forward(x_2d, swiglu_clamp_value=self.config.swiglu_limit)
+                activated = activated.view(*x.shape[:-1], -1)
+                out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                ffn_out = ffn_out + out
 
         return ffn_out, used_experts
 
@@ -909,6 +968,23 @@ class HomeSeekInferenceEngine:
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
         return (pre.unsqueeze(-1) * hidden_4d.float()).sum(dim=2).to(torch.bfloat16)
 
+    def _prefetch_next_layer(self, layer_idx, lw):
+        if not self._prefetch_enabled or self._prefetch_worker is None:
+            return
+        next_idx = layer_idx + 1
+        if next_idx >= self.config.num_hidden_layers:
+            return
+        next_lw = self._get_layer_weights(next_idx)
+        next_gate_w = next_lw.get("ffn.gate.weight")
+        if next_gate_w is not None:
+            sample_input = torch.randn(1, self.config.hidden_size,
+                                       device=self.device, dtype=torch.bfloat16)
+            scores = torch.matmul(sample_input.to(next_gate_w.dtype), next_gate_w.t())
+            scores = F.softplus(scores).sqrt()
+            _, topk_idx = torch.topk(scores, self.config.num_experts_per_tok + 4, dim=-1)
+            predicted_ids = topk_idx[0].tolist()
+            self._prefetch_worker.prefetch(next_idx, predicted_ids)
+
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=50, temperature=0.6):
         if input_ids.dim() == 1:
@@ -918,11 +994,10 @@ class HomeSeekInferenceEngine:
 
         self.layer_states = {}
         self._deq_cache.clear()
-        for k in list(self.expert_cache.cache.keys()):
-            if k not in self.expert_cache.pinned:
-                del self.expert_cache.cache[k]
+        self.expert_cache.clear()
         if self._prefetch_worker is not None:
             self._prefetch_worker.clear()
+        self._init_prefetch()
         import gc
         gc.collect()
         torch.cuda.empty_cache()
@@ -955,7 +1030,10 @@ class HomeSeekInferenceEngine:
             else:
                 h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-            if layer_idx in self._cpu_fallback_layers:
+            if self._prefetch_worker is not None:
+                self._prefetch_next_layer(layer_idx, lw)
+
+            if layer_idx in self._cpu_fallback_layers and self._prefetch_worker is not None:
                 self._prefetch_worker.clear()
 
             if (layer_idx + 1) % 5 == 0:
@@ -971,11 +1049,7 @@ class HomeSeekInferenceEngine:
                                     self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
                             if self.layer_states[li].compressed_kv is not None:
                                 self.layer_states[li].compressed_kv = None
-                    if len([k for k in self.expert_cache.cache.keys() if k not in self.expert_cache.pinned]) > 64:
-                        for k in list(self.expert_cache.cache.keys()):
-                            if k not in self.expert_cache.pinned:
-                                del self.expert_cache.cache[k]
-                                break
+                    self.expert_cache.trim(64)
                     torch.cuda.empty_cache()
                     self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
 
@@ -1049,7 +1123,7 @@ class HomeSeekInferenceEngine:
             "num_prompt_tokens": T,
             "num_generated_tokens": len(generated),
         }
-        self.loader.close_handles()
+        self.loader.close()
         self._log(f"Done: {result['num_generated_tokens']} tokens in {total_time:.1f}s, "
                   f"peak mem: {result['peak_memory_gb']:.1f}GB")
         return result
