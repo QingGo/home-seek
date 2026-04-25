@@ -63,6 +63,13 @@ class DeepSeekV4FlashConfig:
         self.v_head_dim = cfg.get("v_head_dim", self.head_dim)
         self.qk_rope_head_dim = cfg.get("qk_rope_head_dim", 64)
         self.qk_nope_head_dim = cfg.get("qk_nope_head_dim", self.index_head_dim)
+        self.rope_theta = cfg.get("rope_theta", 10000.0)
+        self.compress_rope_theta = cfg.get("compress_rope_theta", 160000.0)
+        rope_scaling = cfg.get("rope_scaling", {})
+        self.rope_scaling_factor = rope_scaling.get("factor", 16.0)
+        self.rope_scaling_beta_fast = rope_scaling.get("beta_fast", 32)
+        self.rope_scaling_beta_slow = rope_scaling.get("beta_slow", 1)
+        self.rope_scaling_original_max_position_embeddings = rope_scaling.get("original_max_position_embeddings", 65536)
 
         self.num_hash_experts = self.num_hash_layers * self.num_experts_per_tok
         self.num_hot_experts = 16

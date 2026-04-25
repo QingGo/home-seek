@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import torch
@@ -6,9 +7,15 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from collections import defaultdict, OrderedDict
 
+import math
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from tile_reference import cast_back, unpack_from_e2m1fn_x2, swiglu_forward
+
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_encoding_dir = os.path.join(_current_dir, '../weights/encoding')
+sys.path.insert(0, os.path.abspath(_encoding_dir))
+from encoding_dsv4 import encode_messages
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -17,12 +24,60 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.
     return (weight.to(torch.float32) * x_normed).to(x.dtype)
 
 
+def precompute_freqs_cis(dim: int, seqlen: int, theta: float = 10000.0,
+                         original_seq_len: int = 0, factor: float = 1.0,
+                         beta_fast: int = 32, beta_slow: int = 1) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_seq_len > 0 and factor > 1.0:
+        low = math.floor(dim * math.log(original_seq_len / (beta_fast * 2 * math.pi)) / (2 * math.log(theta)))
+        high = math.ceil(dim * math.log(original_seq_len / (beta_slow * 2 * math.pi)) / (2 * math.log(theta)))
+        low = max(low, 0)
+        high = min(high, dim // 2 - 1)
+        ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low + 1e-3)).clamp(0, 1)
+        smooth = 1.0 - ramp
+        freqs = freqs / factor * (1.0 - smooth) + freqs * smooth
+    t = torch.arange(seqlen, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int = 64, inverse: bool = False) -> torch.Tensor:
+    x_rope = x[..., -rd:]
+    x_pass = x[..., :-rd]
+    T = x_rope.shape[-2]
+    if x_rope.ndim == 4:
+        h = x_rope.shape[1]
+        freqs = freqs_cis[:T].view(1, 1, T, rd // 2).expand(-1, h, -1, -1)
+    else:
+        freqs = freqs_cis[:T].view(1, T, rd // 2)
+    if inverse:
+        freqs = freqs.conj()
+    x_rope_complex = torch.view_as_real(
+        torch.view_as_complex(x_rope.float().reshape(*x_rope.shape[:-1], -1, 2)) * freqs
+    ).flatten(-2)
+    return torch.cat([x_pass, x_rope_complex.to(x.dtype)], dim=-1)
+
+
+def _ue8m0_to_f32(sf: torch.Tensor) -> torch.Tensor:
+    if sf.dtype == torch.float32:
+        return sf
+    if sf.element_size() != 1:
+        return sf.to(torch.float32)
+    sf_u8 = sf.view(torch.uint8)
+    sf_i32 = sf_u8.to(torch.int32)
+    return (sf_i32 << 23).view(torch.float32)
+
+
 def load_fp8_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     if data.dtype == torch.bfloat16 or data.dtype == torch.float32:
         return data.to(torch.bfloat16)
     if data.dtype == torch.float8_e4m3fn:
         data_f32 = data.to(torch.float32)
-        scale_f32 = scale.to(torch.float32)
+        scale_f32 = _ue8m0_to_f32(scale)
+        if scale_f32.shape != data_f32.shape:
+            bh = data_f32.shape[0] // scale_f32.shape[0]
+            bw = data_f32.shape[1] // scale_f32.shape[1]
+            scale_f32 = scale_f32.repeat_interleave(bh, dim=0).repeat_interleave(bw, dim=1)
         return (data_f32 * scale_f32).to(torch.bfloat16)
     return data.to(torch.bfloat16)
 
@@ -44,6 +99,7 @@ class ExpertWeightCache:
     def __init__(self, max_experts: int = 64):
         self.max_experts = max_experts
         self.cache = OrderedDict()
+        self.pinned = set()
 
     def get(self, key: str):
         if key not in self.cache:
@@ -51,10 +107,12 @@ class ExpertWeightCache:
         self.cache.move_to_end(key)
         return self.cache[key]
 
-    def put(self, key: str, w1, w3, w2):
-        if len(self.cache) >= self.max_experts:
+    def put(self, key: str, w1, w3, w2, pin: bool = False):
+        if not pin and len(self.cache) >= self.max_experts:
             self.cache.popitem(last=False)
         self.cache[key] = (w1, w3, w2)
+        if pin:
+            self.pinned.add(key)
 
 
 class WeightLoader:
@@ -161,7 +219,9 @@ class HomeSeekInferenceEngine:
         self.loader = WeightLoader(weight_dir, device)
         self.expert_cache = ExpertWeightCache(max_experts=128)
         self.layer_states = {}
+        self._deq_cache = OrderedDict()
         self._load_global_weights()
+        # Hash experts loaded on-demand per prompt; not preloaded to save GPU memory
 
     def _log(self, msg):
         if getattr(self, 'verbose', False):
@@ -190,6 +250,17 @@ class HomeSeekInferenceEngine:
         norm = safe("norm.weight")
         self.norm_weight = norm.to(torch.bfloat16) if norm is not None else None
         self._log(f"norm.weight: {self.norm_weight.shape if self.norm_weight is not None else 'missing'}")
+
+        self.hc_head_fn = safe("hc_head_fn")
+        self.hc_head_base = safe("hc_head_base")
+        self.hc_head_scale = safe("hc_head_scale")
+        if self.hc_head_fn is not None:
+            self.hc_head_fn = self.hc_head_fn.to(torch.float32)
+        if self.hc_head_base is not None:
+            self.hc_head_base = self.hc_head_base.to(torch.float32)
+        if self.hc_head_scale is not None:
+            self.hc_head_scale = self.hc_head_scale.to(torch.float32)
+        self._log(f"hc_head_fn: {self.hc_head_fn.shape if self.hc_head_fn is not None else 'missing'}")
 
     def _get_layer_weights(self, layer_idx: int):
         lw = {}
@@ -237,14 +308,26 @@ class HomeSeekInferenceEngine:
 
         return lw
 
-    def _deq(self, name, data, scale):
+    def _deq(self, name, data, scale, layer_idx=None):
         if data is None:
             return None
+        if layer_idx is not None:
+            cache_key = (layer_idx, name)
+            cached = self._deq_cache.get(cache_key)
+            if cached is not None:
+                self._deq_cache.move_to_end(cache_key)
+                return cached
         if scale is None:
-            return data.to(torch.bfloat16)
-        if data.dtype == torch.int8:
-            return load_fp4_weight(data, scale)
-        return load_fp8_weight(data, scale)
+            result = data.to(torch.bfloat16)
+        elif data.dtype == torch.int8:
+            result = load_fp4_weight(data, scale)
+        else:
+            result = load_fp8_weight(data, scale)
+        if layer_idx is not None:
+            if len(self._deq_cache) >= 6:
+                self._deq_cache.popitem(last=False)
+            self._deq_cache[cache_key] = result
+        return result
 
     def _compress_kv(self, hidden: torch.Tensor, lw: dict, layer_idx: int, state: LayerState):
         compress_ratio = self.config.get_compress_ratio(layer_idx)
@@ -267,14 +350,26 @@ class HomeSeekInferenceEngine:
         c_gate = torch.sigmoid(c_gate.float()).to(c_hidden.dtype)
         c_hidden = c_hidden * c_gate
 
-        if c_norm is not None:
+        if c_hidden.shape[1] >= compress_ratio:
+            c_hidden = c_hidden[:, :c_hidden.shape[1] // compress_ratio * compress_ratio, :]
+            c_hidden = c_hidden.view(B, -1, compress_ratio, c_dim).mean(dim=2)
+        else:
+            c_hidden = torch.zeros(B, 0, c_dim, device=c_hidden.device, dtype=c_hidden.dtype)
+
+        if c_ape is not None and c_ape.shape[-1] == c_dim and c_hidden.shape[1] > 0:
+            ape_seq = min(c_ape.shape[0], c_hidden.shape[1])
+            c_hidden[:, :ape_seq, :] = c_hidden[:, :ape_seq, :] + c_ape[:ape_seq, :].to(c_hidden.dtype)
+
+        norm_dim = c_norm.shape[-1] if c_norm is not None else c_dim
+        if c_dim != norm_dim:
+            if c_hidden.shape[1] > 0:
+                c_hidden = c_hidden.view(B, -1, c_dim // norm_dim, norm_dim).mean(dim=2)
+            else:
+                c_hidden = torch.zeros(B, 0, norm_dim, device=c_hidden.device, dtype=c_hidden.dtype)
+            c_dim = norm_dim
+
+        if c_norm is not None and c_hidden.shape[1] > 0:
             c_hidden = rms_norm(c_hidden, c_norm.to(torch.bfloat16))
-
-        c_hidden = c_hidden.view(B, -1, compress_ratio, c_dim).mean(dim=2)
-
-        if c_ape is not None:
-            ape_len = min(c_ape.shape[0], c_hidden.shape[1])
-            c_hidden[:, :ape_len, :] = c_hidden[:, :ape_len, :] + c_ape[:ape_len, :].to(c_hidden.dtype)
 
         if state.compressed_kv is None:
             state.compressed_kv = CompressedKVCache(compress_ratio, c_dim, str(self.device))
@@ -300,38 +395,37 @@ class HomeSeekInferenceEngine:
         k = kv_latent.unsqueeze(2).transpose(1, 2)
         return k, k
 
-    def _forward_mhc(self, hidden: torch.Tensor, hc_base: torch.Tensor,
+    def _forward_mhc(self, hidden_4d: torch.Tensor, hc_base: torch.Tensor,
                      hc_fn: torch.Tensor, hc_scale: torch.Tensor, apply_pre: bool = True):
-        B, T, D = hidden.shape
-        hc_mult = self.config.hc_mult
+        B, T, hc_mult, D = hidden_4d.shape
         fn_in_features = hc_fn.shape[-1]
         expected_in = D * hc_mult
         if fn_in_features != expected_in:
             self._log(f"mHC skip: hc_fn needs {fn_in_features}-d input, hidden is {D}-d "
                       f"(expected expanded to {expected_in})")
-            return hidden, None, None
-        hidden_expanded = hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1)
-        hidden_flat = hidden_expanded.reshape(B, T, expected_in)
-        mixes = torch.matmul(hidden_flat.to(hc_fn.dtype), hc_fn.t())
-        mixes = mixes.float()
+            return hidden_4d.sum(dim=2), None, None
+        hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
+        rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
         pre, post, comb = mhc_split_sinkhorn(
             mixes, hc_scale.to(torch.float32), hc_base.to(torch.float32),
             hc_mult=hc_mult, sinkhorn_iters=self.config.hc_sinkhorn_iters, eps=self.config.hc_eps,
         )
         if apply_pre:
-            hidden_g = hidden.view(B, T, hc_mult, D // hc_mult)
-            scaled = hidden_g * pre.unsqueeze(-1)
-            hidden = scaled.view(B, T, D)
+            scaled = hidden_4d * pre.unsqueeze(-1)
+            hidden = scaled.sum(dim=2)
+        else:
+            hidden = hidden_4d.sum(dim=2)
         return hidden, post, comb
 
     def _forward_attn(self, hidden_states, lw, layer_idx):
         B, T, D = hidden_states.shape
 
-        wq_a = self._deq("wq_a", lw.get("attn.wq_a.weight"), lw.get("attn.wq_a.scale"))
-        wq_b = self._deq("wq_b", lw.get("attn.wq_b.weight"), lw.get("attn.wq_b.scale"))
-        wkv = self._deq("wkv", lw.get("attn.wkv.weight"), lw.get("attn.wkv.scale"))
-        wo_a = self._deq("wo_a", lw.get("attn.wo_a.weight"), lw.get("attn.wo_a.scale"))
-        wo_b = self._deq("wo_b", lw.get("attn.wo_b.weight"), lw.get("attn.wo_b.scale"))
+        wq_a = self._deq("attn.wq_a.weight", lw.get("attn.wq_a.weight"), lw.get("attn.wq_a.scale"), layer_idx)
+        wq_b = self._deq("attn.wq_b.weight", lw.get("attn.wq_b.weight"), lw.get("attn.wq_b.scale"), layer_idx)
+        wkv = self._deq("attn.wkv.weight", lw.get("attn.wkv.weight"), lw.get("attn.wkv.scale"), layer_idx)
+        wo_a = self._deq("attn.wo_a.weight", lw.get("attn.wo_a.weight"), lw.get("attn.wo_a.scale"), layer_idx)
+        wo_b = self._deq("attn.wo_b.weight", lw.get("attn.wo_b.weight"), lw.get("attn.wo_b.scale"), layer_idx)
         q_norm = lw.get("attn.q_norm.weight")
         kv_norm = lw.get("attn.kv_norm.weight")
         attn_sink = lw.get("attn.attn_sink")
@@ -350,10 +444,29 @@ class HomeSeekInferenceEngine:
             q_latent = rms_norm(q_latent, q_norm)
         q = torch.matmul(q_latent, wq_b.t())
         q = q.view(B, T, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
         kv_latent = torch.matmul(hidden_states.to(wkv.dtype), wkv.t())
         if kv_norm is not None:
             kv_latent = rms_norm(kv_latent, kv_norm)
+
+        compress_ratio = self.config.get_compress_ratio(layer_idx)
+        if compress_ratio > 0:
+            rope_theta = self.config.compress_rope_theta
+            rope_original_seq_len = self.config.rope_scaling_original_max_position_embeddings
+            rope_factor = self.config.rope_scaling_factor
+            rope_beta_fast = self.config.rope_scaling_beta_fast
+            rope_beta_slow = self.config.rope_scaling_beta_slow
+        else:
+            rope_theta = self.config.rope_theta
+            rope_original_seq_len = 0
+            rope_factor = 1.0
+            rope_beta_fast = 32
+            rope_beta_slow = 1
+        rope_dim = self.config.qk_rope_head_dim
+        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=rope_theta, original_seq_len=rope_original_seq_len, factor=rope_factor, beta_fast=rope_beta_fast, beta_slow=rope_beta_slow).to(q.device)
+        q = apply_rotary_emb(q, freqs_cis, rd=self.config.qk_rope_head_dim)
+        kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=self.config.qk_rope_head_dim)
 
         state = self.layer_states.setdefault(layer_idx, LayerState())
 
@@ -370,43 +483,32 @@ class HomeSeekInferenceEngine:
         kv_sw = all_kv_latent[:, -sw:, :]
         k_sw, v_sw = self._expand_kv(kv_sw)
 
-        total_kv_len = k_sw.shape[-2]
-        compressed_kv = self._get_compressed_attention_kv(state, lw)
-        if compressed_kv is not None:
-            total_kv_len += compressed_kv.shape[-2]
+        n_kv = self.config.num_key_value_heads
+        n_groups = self.config.num_attention_heads // n_kv
+        scale_f = self.config.head_dim ** -0.5
 
-        attn = torch.zeros(B, self.config.num_attention_heads, T, total_kv_len, device=q.device, dtype=torch.float32)
-        scale = self.config.head_dim ** -0.5
-        num_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        sw_len = k_sw.shape[-2]
-        for g in range(num_groups):
-            q_g = q[:, g * self.config.num_key_value_heads:(g + 1) * self.config.num_key_value_heads]
-            scores_sw = torch.matmul(q_g.float() * scale, k_sw.float().transpose(-2, -1))
-            if compressed_kv is not None:
-                scores_c = torch.matmul(q_g.float() * scale, compressed_kv.float().transpose(-2, -1))
-                scores = torch.cat([scores_c, scores_sw], dim=-1)
-            else:
-                scores = scores_sw
-            attn[:, g * self.config.num_key_value_heads:(g + 1) * self.config.num_key_value_heads] = scores
+        attn = torch.zeros(B, self.config.num_attention_heads, T, k_sw.shape[-2],
+                           device=q.device, dtype=torch.float32)
+        for g in range(n_groups):
+            q_g = q[:, g * n_kv:(g + 1) * n_kv]
+            with torch.no_grad():
+                scores = torch.matmul(q_g.float() * scale_f, k_sw.float().transpose(-2, -1))
+            attn[:, g * n_kv:(g + 1) * n_kv] = scores
 
         if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
             for h in range(self.config.num_attention_heads):
                 attn[:, h, :, -1:] = attn[:, h, :, -1:] + attn_sink[h]
 
         attn_p = F.softmax(attn, dim=-1).to(v_sw.dtype)
-        out = torch.zeros(B, self.config.num_attention_heads, T, self.config.head_dim, device=q.device, dtype=v_sw.dtype)
-        for g in range(num_groups):
-            a_g = attn_p[:, g * self.config.num_key_value_heads:(g + 1) * self.config.num_key_value_heads]
-            if compressed_kv is not None:
-                c_len = compressed_kv.shape[-2]
-                a_c = a_g[:, :, :, :c_len]
-                a_sw = a_g[:, :, :, c_len:]
-                v_c = compressed_kv.expand(-1, a_g.shape[1], -1, -1)
-                v_part = torch.matmul(a_c, v_c) + torch.matmul(a_sw, v_sw)
-            else:
-                v_part = torch.matmul(a_g, v_sw)
-            out[:, g * self.config.num_key_value_heads:(g + 1) * self.config.num_key_value_heads] = v_part
+        out = torch.zeros(B, self.config.num_attention_heads, T, self.config.head_dim,
+                          device=q.device, dtype=v_sw.dtype)
+        for g in range(n_groups):
+            a_g = attn_p[:, g * n_kv:(g + 1) * n_kv]
+            out[:, g * n_kv:(g + 1) * n_kv] = torch.matmul(a_g, v_sw)
+
+        # Inverse RoPE on attention output (remove rotation from V)
+        out = apply_rotary_emb(out, freqs_cis, rd=self.config.qk_rope_head_dim, inverse=True)
+
         out = out.transpose(1, 2).contiguous()
 
         if wo_a is not None and wo_b is not None:
@@ -445,21 +547,31 @@ class HomeSeekInferenceEngine:
         if cached is not None:
             return cached
 
-        w1 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w1.weight")
-        s1 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w1.scale")
-        w3 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w3.weight")
-        s3 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w3.scale")
-        w2 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w2.weight")
-        s2 = self.loader.get_weight(f"layers.{layer_idx}.ffn.experts.{eid}.w2.scale")
+        prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
+        keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
+                f"{prefix}.w3.weight", f"{prefix}.w3.scale",
+                f"{prefix}.w2.weight", f"{prefix}.w2.scale"]
+        tensors = self.loader.get_weights(*keys)
+        w1 = tensors.get(keys[0]); s1 = tensors.get(keys[1])
+        w3 = tensors.get(keys[2]); s3 = tensors.get(keys[3])
+        w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
 
         if w1 is None:
             return None
 
-        w1_d = load_fp4_weight(w1, s1) if w1.dtype == torch.int8 else load_fp8_weight(w1, s1)
-        w3_d = load_fp4_weight(w3, s3) if w3 is not None and w3.dtype == torch.int8 else load_fp8_weight(w3, s3) if w3 is not None else w1_d
-        w2_d = load_fp8_weight(w2, s2) if w2 is not None else w1_d
+        def _load_w(data, scale):
+            if data is None:
+                return None
+            if data.dtype == torch.int8:
+                return load_fp4_weight(data, scale)
+            return load_fp8_weight(data, scale)
 
-        self.expert_cache.put(cache_key, w1_d, w3_d, w2_d)
+        w1_d = _load_w(w1, s1)
+        w3_d = _load_w(w3, s3)
+        w2_d = _load_w(w2, s2)
+
+        pin = layer_idx < self.config.num_hash_layers
+        self.expert_cache.put(cache_key, w1_d, w3_d, w2_d, pin=pin)
         return (w1_d, w3_d, w2_d)
 
     def _forward_single_expert(self, h, w1_d, w3_d, w2_d):
@@ -473,7 +585,7 @@ class HomeSeekInferenceEngine:
         return out
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
-        gate_w = self._deq("ffn.gate", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"))
+        gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
         gate_bias = lw.get("ffn.gate.bias")
         tid2eid = lw.get("ffn.gate.tid2eid")
 
@@ -487,34 +599,56 @@ class HomeSeekInferenceEngine:
 
         ffn_out = torch.zeros_like(hidden_states)
         B, T, D = hidden_states.shape
-        for b in range(B):
-            for t in range(T):
-                for k in range(self.config.num_experts_per_tok):
-                    eid = topk_idx[b, t, k].item()
-                    wgt = topk_w[b, t, k].item()
-                    if eid < 0:
-                        continue
+        total_tokens = B * T
+        flat_hidden = hidden_states.reshape(total_tokens, D)
+        flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
+        flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
 
-                    expert_w = self._load_expert_weights(layer_idx, eid)
-                    if expert_w is None:
-                        continue
-                    w1_d, w3_d, w2_d = expert_w
+        for k in range(self.config.num_experts_per_tok):
+            expert_ids = flat_topk_idx[:, k]
+            weights = flat_topk_w[:, k]
+            unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
+            for eid_idx in range(unique_eids.shape[0]):
+                eid = unique_eids[eid_idx].item()
+                if eid < 0:
+                    continue
+                token_mask = inverse == eid_idx
+                if not token_mask.any():
+                    continue
+                expert_w = self._load_expert_weights(layer_idx, eid)
+                if expert_w is None:
+                    continue
+                w1_d, w3_d, w2_d = expert_w
+                h_batch = flat_hidden[token_mask].to(w1_d.dtype)
+                gate_out = torch.matmul(h_batch, w1_d.t())
+                up_out = torch.matmul(h_batch, w3_d.t())
+                x = torch.cat([gate_out, up_out], dim=-1)
+                activated = swiglu_forward(x.contiguous(), swiglu_clamp_value=self.config.swiglu_limit)
+                out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                ffn_out.reshape(total_tokens, D)[token_mask] += out * weights[token_mask].unsqueeze(-1)
 
-                    h = hidden_states[b:b+1, t:t+1].to(w1_d.dtype)
-                    out = self._forward_single_expert(h, w1_d, w3_d, w2_d)
-                    ffn_out[b:b+1, t:t+1] += out * wgt
-
-        shared_w1 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w1.weight")
+        shared_prefix = f"layers.{layer_idx}.ffn.shared_experts"
+        shared_keys = [f"{shared_prefix}.w1.weight", f"{shared_prefix}.w1.scale",
+                       f"{shared_prefix}.w3.weight", f"{shared_prefix}.w3.scale",
+                       f"{shared_prefix}.w2.weight", f"{shared_prefix}.w2.scale"]
+        shared_tensors = self.loader.get_weights(*shared_keys)
+        shared_w1 = shared_tensors.get(shared_keys[0])
         if shared_w1 is not None:
-            s1 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w1.scale")
-            w3 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w3.weight")
-            s3 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w3.scale")
-            w2 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w2.weight")
-            s2 = self.loader.get_weight(f"layers.{layer_idx}.ffn.shared_experts.w2.scale")
+            def _load_w(data, scale):
+                if data is None:
+                    return None
+                if data.dtype == torch.int8:
+                    return load_fp4_weight(data, scale)
+                return load_fp8_weight(data, scale)
 
-            w1_d = load_fp8_weight(shared_w1, s1)
-            w3_d = load_fp8_weight(w3, s3) if w3 is not None else None
-            w2_d = load_fp8_weight(w2, s2) if w2 is not None else None
+            s1 = shared_tensors.get(shared_keys[1])
+            w3 = shared_tensors.get(shared_keys[2])
+            s3 = shared_tensors.get(shared_keys[3])
+            w2 = shared_tensors.get(shared_keys[4])
+            s2 = shared_tensors.get(shared_keys[5])
+            w1_d = _load_w(shared_w1, s1)
+            w3_d = _load_w(w3, s3)
+            w2_d = _load_w(w2, s2)
 
             if w3_d is not None and w2_d is not None:
                 h = hidden_states.to(w1_d.dtype)
@@ -523,57 +657,72 @@ class HomeSeekInferenceEngine:
 
         return ffn_out
 
-    def _process_mhc_layer(self, hidden, lw, prefix: str):
+    def _process_mhc_layer(self, hidden_4d, lw, prefix: str):
         hc_base = lw.get(f"{prefix}_base")
         hc_fn = lw.get(f"{prefix}_fn")
         hc_scale = lw.get(f"{prefix}_scale")
         if hc_base is None or hc_fn is None or hc_scale is None:
-            return hidden, None, None
-        return self._forward_mhc(hidden, hc_base.to(torch.bfloat16),
+            return hidden_4d.sum(dim=2), None, None
+        return self._forward_mhc(hidden_4d, hc_base.to(torch.bfloat16),
                                   hc_fn.to(torch.bfloat16), hc_scale.to(torch.bfloat16))
 
     def _process_mhc_post(self, hidden, residual, post, comb):
         if post is None or comb is None:
             return hidden
         B, S, D = hidden.shape
-        hc_mult = comb.shape[-1]
-        hidden_g = hidden.view(B, S, hc_mult, D // hc_mult)
-        mixed = torch.matmul(comb.transpose(-2, -1).float(), hidden_g.float())
-        result = mixed * post.unsqueeze(-1)
-        return result.to(hidden.dtype).view(B, S, D)
+        hc = comb.shape[-1]
+        x_expanded = hidden.unsqueeze(2)
+        term1 = post.unsqueeze(-1) * x_expanded
+        residual_expanded = residual.unsqueeze(3)
+        term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
+        y = term1 + term2
+        return y.to(hidden.dtype)
+
+    def _hc_head(self, hidden_4d):
+        B, T, hc_mult, D = hidden_4d.shape
+        x = hidden_4d.reshape(B, T, hc_mult * D).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        mixes = torch.matmul(x, self.hc_head_fn.t()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
+        return (pre.unsqueeze(-1) * hidden_4d.float()).sum(dim=2).to(torch.bfloat16)
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=50, temperature=0.0):
+    def generate(self, input_ids, max_new_tokens=50, temperature=0.6):
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         B, T = input_ids.shape
         self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}")
 
         self.layer_states = {}
+        self._deq_cache = OrderedDict()
         torch.cuda.reset_peak_memory_stats(self.device)
         start = time.time()
 
         h = self.embed[input_ids].to(torch.bfloat16)
+        h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
         for layer_idx in range(self.config.num_hidden_layers):
             lw = self._get_layer_weights(layer_idx)
+
+            residual_attn = h
+            h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
             if lw.get("attn_norm.weight") is not None:
-                h = rms_norm(h, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-
-            h_mhc, _, _ = self._process_mhc_layer(h, lw, "hc_attn")
-            attn_out = self._forward_attn(h if h_mhc is None else h_mhc, lw, layer_idx)
-            h = h + attn_out
-
-            if lw.get("ffn_norm.weight") is not None:
-                h = rms_norm(h, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+            attn_out = self._forward_attn(h_pre, lw, layer_idx)
+            if post is not None and comb is not None:
+                h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+            else:
+                h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
             residual = h
             h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-            h_ffn_in = h_pre if h_pre is not None else h
-
-            ffn_out = self._forward_ffn(h_ffn_in, lw, layer_idx, input_ids)
+            if lw.get("ffn_norm.weight") is not None:
+                h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+            ffn_out = self._forward_ffn(h_pre, lw, layer_idx, input_ids)
             if post is not None and comb is not None:
-                ffn_out = self._process_mhc_post(ffn_out, residual, post, comb)
-            h = h + ffn_out
+                h = self._process_mhc_post(ffn_out, residual, post, comb)
+            else:
+                h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
             if (layer_idx + 1) % 10 == 0:
                 mem = torch.cuda.memory_allocated() / (1024**3)
@@ -585,55 +734,57 @@ class HomeSeekInferenceEngine:
                     torch.cuda.empty_cache()
                     self._log(f"  Layer {layer_idx}: freed KV cache, mem={mem:.1f}GB")
 
+        h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
         if self.norm_weight is not None:
-            h = rms_norm(h, self.norm_weight, self.config.rms_norm_eps)
-        logits = torch.matmul(h[:, -1:].to(self.lm_head.dtype), self.lm_head.t())
+            h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+        logits = torch.matmul(h_3d[:, -1:].to(self.lm_head.dtype), self.lm_head.t())
 
         if temperature > 0:
-            probs = F.softmax(logits[:, -1] / temperature, dim=-1)
-            next_id = torch.multinomial(probs, 1).unsqueeze(0)
+            probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
+            next_id = torch.multinomial(probs, 1)
         else:
             next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
 
         generated = [next_id]
         for step in range(max_new_tokens - 1):
             h = self.embed[next_id].to(torch.bfloat16)
+            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):
                 lw = self._get_layer_weights(layer_idx)
                 st = self.layer_states.get(layer_idx)
                 if st is not None and st.kv_latent_cache is not None and st.kv_latent_cache.shape[1] > 2000000:
                     keep = self.config.sliding_window + 128
                     st.kv_latent_cache = st.kv_latent_cache[:, -keep:, :]
-                    if st.compressed_kv is not None:
-                        st.compressed_kv = None
                     self._log(f"  Layer {layer_idx}: truncated KV latent to {keep}")
 
+                residual_attn = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
                 if lw.get("attn_norm.weight") is not None:
-                    h = rms_norm(h, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-
-                h_mhc, _, _ = self._process_mhc_layer(h, lw, "hc_attn")
-                attn_out = self._forward_attn(h if h_mhc is None else h_mhc, lw, layer_idx)
-                h = h + attn_out
-
-                if lw.get("ffn_norm.weight") is not None:
-                    h = rms_norm(h, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                else:
+                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
                 residual = h
                 h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-                h_ffn_in = h_pre if h_pre is not None else h
-
-                ffn_out = self._forward_ffn(h_ffn_in, lw, layer_idx, next_id)
+                if lw.get("ffn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                ffn_out = self._forward_ffn(h_pre, lw, layer_idx, next_id)
                 if post is not None and comb is not None:
-                    ffn_out = self._process_mhc_post(ffn_out, residual, post, comb)
-                h = h + ffn_out
+                    h = self._process_mhc_post(ffn_out, residual, post, comb)
+                else:
+                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
+            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
             if self.norm_weight is not None:
-                h = rms_norm(h, self.norm_weight, self.config.rms_norm_eps)
-            logits = torch.matmul(h.to(self.lm_head.dtype), self.lm_head.t())
+                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+            logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
 
             if temperature > 0:
-                probs = F.softmax(logits[:, -1] / temperature, dim=-1)
-                next_id = torch.multinomial(probs, 1).unsqueeze(0)
+                probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
+                next_id = torch.multinomial(probs, 1)
             else:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
             generated.append(next_id)
@@ -664,13 +815,16 @@ def main():
     engine = HomeSeekInferenceEngine(args.weight_dir, verbose=args.verbose)
 
     tokenizer = None
-    try:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
-    except Exception:
-        pass
+    tokenizer_path = os.path.join(args.weight_dir, "tokenizer.json")
+    if os.path.exists(tokenizer_path):
+        try:
+            from transformers import PreTrainedTokenizerFast
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+        except Exception:
+            pass
     if tokenizer is not None:
-        input_ids = tokenizer.encode(args.prompt, return_tensors="pt").to(engine.device)
+        prompt_text = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(engine.device)
     else:
         input_ids = torch.randint(0, 100, (1, 8), device=engine.device)
 

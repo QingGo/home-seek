@@ -1,6 +1,13 @@
 import os
+import sys
 import torch
 import pytest
+
+
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_encoding_dir = os.path.join(_current_dir, '../../weights/encoding')
+sys.path.insert(0, os.path.abspath(_encoding_dir))
+from encoding_dsv4 import encode_messages
 
 
 class TestInferenceE2E:
@@ -19,14 +26,20 @@ class TestInferenceE2E:
         )
 
     def _get_tokenizer(self):
+        import os
+        weight_dir = os.environ.get("HOME_SEEK_WEIGHT_DIR", "weights")
+        tokenizer_path = os.path.join(weight_dir, "tokenizer.json")
+        if not os.path.exists(tokenizer_path):
+            pytest.skip(f"Tokenizer file not found at {tokenizer_path}")
         try:
-            from transformers import AutoTokenizer
-            return AutoTokenizer.from_pretrained(
-                os.environ.get("HOME_SEEK_WEIGHT_DIR", "weights"),
-                trust_remote_code=True,
-            )
+            from transformers import PreTrainedTokenizerFast
+            return PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
         except Exception as e:
             pytest.skip(f"Tokenizer not available: {e}")
+
+    def _encode_prompt(self, tokenizer, text):
+        prompt_text = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
+        return tokenizer.encode(prompt_text, return_tensors="pt").to(self.engine.device)
 
     def test_deterministic_generation(self):
         torch.manual_seed(42)
@@ -37,13 +50,13 @@ class TestInferenceE2E:
         torch.backends.cudnn.benchmark = False
 
         tokenizer = self._get_tokenizer()
-        input_ids = tokenizer.encode("Hello, world", return_tensors="pt").to(self.engine.device)
+        input_ids = self._encode_prompt(tokenizer, "Hello, world")
 
         results = []
         for _ in range(3):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            result = self.engine.generate(input_ids, max_new_tokens=1)
+            result = self.engine.generate(input_ids, max_new_tokens=1, temperature=0.0)
             results.append(result["tokens"].cpu())
 
         for i in range(1, len(results)):
@@ -57,7 +70,7 @@ class TestInferenceE2E:
 
     def test_generation_succeeds(self):
         tokenizer = self._get_tokenizer()
-        input_ids = tokenizer.encode("Testing inference", return_tensors="pt").to(self.engine.device)
+        input_ids = self._encode_prompt(tokenizer, "Testing inference")
 
         torch.cuda.reset_peak_memory_stats()
         result = self.engine.generate(input_ids, max_new_tokens=10)
