@@ -10,6 +10,34 @@ sys.path.insert(0, os.path.abspath(_encoding_dir))
 from encoding_dsv4 import encode_messages
 
 
+_engine = None
+_tokenizer = None
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        weight_dir = os.environ.get("HOME_SEEK_WEIGHT_DIR", "weights")
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        _engine = HomeSeekInferenceEngine(weight_dir=weight_dir, verbose=False)
+    return _engine
+
+
+def _get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        weight_dir = os.environ.get("HOME_SEEK_WEIGHT_DIR", "weights")
+        tokenizer_path = os.path.join(weight_dir, "tokenizer.json")
+        from transformers import PreTrainedTokenizerFast
+        _tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+    return _tokenizer
+
+
+def _encode_prompt(tokenizer, engine, text):
+    prompt_text = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
+    return tokenizer.encode(prompt_text, return_tensors="pt").to(engine.device)
+
+
 class TestInferenceE2E:
     def setup_method(self):
         if not torch.cuda.is_available():
@@ -18,28 +46,9 @@ class TestInferenceE2E:
         config_path = os.path.join(weight_dir, "config.json")
         if not os.path.exists(config_path):
             pytest.skip(f"Weights not found at {weight_dir}")
-
-        from home_seek.inference_engine import HomeSeekInferenceEngine
-        self.engine = HomeSeekInferenceEngine(
-            weight_dir=weight_dir,
-            verbose=False,
-        )
-
-    def _get_tokenizer(self):
-        import os
-        weight_dir = os.environ.get("HOME_SEEK_WEIGHT_DIR", "weights")
         tokenizer_path = os.path.join(weight_dir, "tokenizer.json")
         if not os.path.exists(tokenizer_path):
-            pytest.skip(f"Tokenizer file not found at {tokenizer_path}")
-        try:
-            from transformers import PreTrainedTokenizerFast
-            return PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-        except Exception as e:
-            pytest.skip(f"Tokenizer not available: {e}")
-
-    def _encode_prompt(self, tokenizer, text):
-        prompt_text = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
-        return tokenizer.encode(prompt_text, return_tensors="pt").to(self.engine.device)
+            pytest.skip(f"Tokenizer not found at {tokenizer_path}")
 
     def test_deterministic_generation(self):
         torch.manual_seed(42)
@@ -49,14 +58,15 @@ class TestInferenceE2E:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        tokenizer = self._get_tokenizer()
-        input_ids = self._encode_prompt(tokenizer, "Hello, world")
+        engine = _get_engine()
+        tokenizer = _get_tokenizer()
+        input_ids = _encode_prompt(tokenizer, engine, "Hello, world")
 
         results = []
         for _ in range(3):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            result = self.engine.generate(input_ids, max_new_tokens=1, temperature=0.0)
+            result = engine.generate(input_ids, max_new_tokens=1, temperature=0.0)
             results.append(result["tokens"].cpu())
 
         for i in range(1, len(results)):
@@ -69,11 +79,12 @@ class TestInferenceE2E:
         assert peak < 22.5 * (1024**3), f"Memory exceeded 22.5 GB: {peak / (1024**3):.2f} GB"
 
     def test_generation_succeeds(self):
-        tokenizer = self._get_tokenizer()
-        input_ids = self._encode_prompt(tokenizer, "Testing inference")
+        engine = _get_engine()
+        tokenizer = _get_tokenizer()
+        input_ids = _encode_prompt(tokenizer, engine, "Testing inference")
 
         torch.cuda.reset_peak_memory_stats()
-        result = self.engine.generate(input_ids, max_new_tokens=10)
+        result = engine.generate(input_ids, max_new_tokens=10)
         assert result["num_generated_tokens"] == 10
         assert result["tokens"].shape[1] == input_ids.shape[1] + 10
 

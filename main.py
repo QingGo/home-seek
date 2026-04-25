@@ -1,6 +1,4 @@
-def main():
-    print("Hello from home-seek!")
-
+from home_seek.inference_engine import main
 
 if __name__ == "__main__":
     main()

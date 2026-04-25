@@ -91,7 +91,7 @@ def analyze_hot_experts(weight_dir: str, num_tokens: int = 2048, output_path: st
         h_pre, _, _ = eng._process_mhc_layer(h, lw, "hc_ffn")
         h_ffn_in = h_pre if h_pre is not None else h
 
-        ffn_out = eng._forward_ffn(h_ffn_in, lw, layer_idx, input_ids)
+        ffn_out, _ = eng._forward_ffn(h_ffn_in, lw, layer_idx, input_ids)
         h = h + ffn_out
 
         if (layer_idx + 1) % 10 == 0:
