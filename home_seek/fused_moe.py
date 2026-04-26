@@ -433,10 +433,21 @@ class FusedMoEFFN:
 
             if len(weights_val) == 6:
                 w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights_val
+                device = hidden_states.device
+                w1_d = w1_d.to(device, non_blocking=True)
+                w1_s = w1_s.to(device, non_blocking=True)
+                w3_d = w3_d.to(device, non_blocking=True)
+                w3_s = w3_s.to(device, non_blocking=True)
+                w2_d = w2_d.to(device, non_blocking=True)
+                w2_s = w2_s.to(device, non_blocking=True)
                 w1_bf16, w3_bf16, w2_bf16 = triton_dequantize_fp4_all(
                     w1_d, w1_s, w3_d, w3_s, w2_d, w2_s)
             elif len(weights_val) == 3:
                 w1_d, w3_d, w2_d = weights_val
+                device = hidden_states.device
+                w1_d = w1_d.to(device, non_blocking=True)
+                w3_d = w3_d.to(device, non_blocking=True)
+                w2_d = w2_d.to(device, non_blocking=True)
                 w1_bf16 = w1_d if w1_d.dtype == torch.bfloat16 else w1_d.to(torch.bfloat16)
                 w3_bf16 = w3_d if w3_d.dtype == torch.bfloat16 else w3_d.to(torch.bfloat16)
                 w2_bf16 = w2_d if w2_d.dtype == torch.bfloat16 else w2_d.to(torch.bfloat16)

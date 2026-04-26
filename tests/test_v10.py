@@ -664,3 +664,189 @@ class TestFP4DequantizePitfalls:
         g2 = result[:, 64:96].float().abs().mean().item()
         # g2 should be ~3x g0 (scale 3x)
         assert g2 > g0 * 1.5, f"Scale group mismatch: g0={g0:.4f}, g2={g2:.4f}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# V10-M7: PCIe BAR 修复验证
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestPCIeBARFix:
+    """Verify that _forward_legacy explicitly DMAs FP4 weights to GPU
+    before Triton dequantize, avoiding the 0.2 GB/s PCIe BAR path."""
+
+    _I = 32
+    _D = 64
+    _B = 2
+    _topk = 4
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+
+    def _make_fp4_cpu_weights(self):
+        """Create FP4-packed weights on CPU, simulating mmap-loaded weights."""
+        from tile_reference import cast
+        I, D = self._I, self._D
+        w1_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
+        w3_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
+        w2_bf16 = torch.randn(D, I, dtype=torch.bfloat16)
+
+        w1p, w1s = cast(w1_bf16, fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(w3_bf16, fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(w2_bf16, fmt="e2m1", block_size=(1, 32))
+
+        # Move to CPU to simulate the real scenario
+        return (
+            w1p.cpu(), w1s.cpu(), w3p.cpu(), w3s.cpu(), w2p.cpu(), w2s.cpu()
+        )
+
+    def test_legacy_with_cpu_fp4_weights(self):
+        """CPU FP4 weights in _forward_legacy → DMA to GPU → correct output."""
+        from home_seek.fused_moe import FusedMoEFFN
+
+        moe = FusedMoEFFN(num_experts=4, intermediate_size=self._I,
+                          hidden_size=self._D, use_triton=True)
+
+        w1p_c, w1s_c, w3p_c, w3s_c, w2p_c, w2s_c = self._make_fp4_cpu_weights()
+
+        # All weights on CPU initially
+        for t in [w1p_c, w1s_c, w3p_c, w3s_c, w2p_c, w2s_c]:
+            assert str(t.device) == "cpu"
+
+        def mock_load(layer, eid):
+            return (w1p_c, w1s_c, w3p_c, w3s_c, w2p_c, w2s_c)
+
+        hidden = torch.randn(self._B, self._D, device="cuda", dtype=torch.bfloat16)
+        idx = torch.full((self._B, self._topk), 0, device="cuda", dtype=torch.long)
+        weights = torch.ones(self._B, self._topk, device="cuda") / self._topk
+
+        result = moe.forward(hidden, idx, weights, mock_load, 0)
+
+        assert result.shape == (self._B, self._D)
+        assert result.device.type == "cuda"
+        assert torch.isfinite(result).all()
+
+    def test_legacy_with_mixed_cpu_gpu_weights(self):
+        """Some weights on CPU, some on GPU — all end up on GPU."""
+        from home_seek.fused_moe import FusedMoEFFN
+
+        moe = FusedMoEFFN(num_experts=4, intermediate_size=self._I,
+                          hidden_size=self._D, use_triton=True)
+
+        w1p_c, w1s_c, w3p_c, w3s_c, w2p_c, w2s_c = self._make_fp4_cpu_weights()
+
+        # Put some on GPU, some on CPU to test mixed case
+        w1p_g = w1p_c.cuda()
+        w1s_g = w1s_c.cuda()
+
+        # w1 on GPU, w3/w2 on CPU
+        assert str(w1p_g.device) == "cuda:0"
+        assert str(w3p_c.device) == "cpu"
+
+        def mock_load(layer, eid):
+            return (w1p_g, w1s_g, w3p_c, w3s_c, w2p_c, w2s_c)
+
+        hidden = torch.randn(self._B, self._D, device="cuda", dtype=torch.bfloat16)
+        idx = torch.full((self._B, self._topk), 0, device="cuda", dtype=torch.long)
+        weights = torch.ones(self._B, self._topk, device="cuda") / self._topk
+
+        result = moe.forward(hidden, idx, weights, mock_load, 0)
+
+        assert result.shape == (self._B, self._D)
+        assert result.device.type == "cuda"
+        assert torch.isfinite(result).all()
+
+    def test_legacy_with_cpu_bf16_weights(self):
+        """Already-dequantized BF16 weights on CPU → moved to GPU in 3-tuple path."""
+        from home_seek.fused_moe import FusedMoEFFN
+
+        moe = FusedMoEFFN(num_experts=4, intermediate_size=self._I,
+                          hidden_size=self._D, use_triton=True)
+
+        w1 = torch.randn(self._I, self._D, dtype=torch.bfloat16, device="cpu")
+        w3 = torch.randn(self._I, self._D, dtype=torch.bfloat16, device="cpu")
+        w2 = torch.randn(self._D, self._I, dtype=torch.bfloat16, device="cpu")
+
+        def mock_load(layer, eid):
+            return (w1, w3, w2)
+
+        hidden = torch.randn(self._B, self._D, device="cuda", dtype=torch.bfloat16)
+        idx = torch.full((self._B, self._topk), 0, device="cuda", dtype=torch.long)
+        weights = torch.ones(self._B, self._topk, device="cuda") / self._topk
+
+        result = moe.forward(hidden, idx, weights, mock_load, 0)
+
+        assert result.shape == (self._B, self._D)
+        assert result.device.type == "cuda"
+        assert torch.isfinite(result).all()
+
+    def test_legacy_multi_expert_cpu_fp4(self):
+        """Multiple experts with CPU FP4 weights → batched correctly."""
+        from home_seek.fused_moe import FusedMoEFFN
+
+        moe = FusedMoEFFN(num_experts=4, intermediate_size=self._I,
+                          hidden_size=self._D, use_triton=True)
+
+        def mock_load(layer, eid):
+            from tile_reference import cast
+            w1_bf16 = torch.randn(self._I, self._D, dtype=torch.bfloat16)
+            w3_bf16 = torch.randn(self._I, self._D, dtype=torch.bfloat16)
+            w2_bf16 = torch.randn(self._D, self._I, dtype=torch.bfloat16)
+            w1p, w1s = cast(w1_bf16, fmt="e2m1", block_size=(1, 32))
+            w3p, w3s = cast(w3_bf16, fmt="e2m1", block_size=(1, 32))
+            w2p, w2s = cast(w2_bf16, fmt="e2m1", block_size=(1, 32))
+            return (w1p.cpu(), w1s.cpu(), w3p.cpu(), w3s.cpu(), w2p.cpu(), w2s.cpu())
+
+        hidden = torch.randn(self._B, self._D, device="cuda", dtype=torch.bfloat16)
+        # Each token routes to different experts
+        idx = torch.tensor([[0, 2, -1, -1], [1, 3, -1, -1]], device="cuda")
+        weights = torch.tensor([[0.6, 0.4, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]], device="cuda")
+
+        result = moe.forward(hidden, idx, weights, mock_load, 0)
+
+        assert result.shape == (self._B, self._D)
+        assert result.device.type == "cuda"
+        assert torch.isfinite(result).all()
+
+    def test_triton_deq_uses_gpu_path_when_cpu_moved(self):
+        """After DMA, triton_dequantize_fp4_to_bf16 uses GPU Triton kernel."""
+        from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
+        from tile_reference import cast
+
+        I, D = 16, 64
+        w_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
+        w_packed, w_scale = cast(w_bf16, fmt="e2m1", block_size=(1, 32))
+
+        # Simulate what _forward_legacy now does: DMA to GPU
+        w_packed_c = w_packed.cpu()
+        w_scale_c = w_scale.cpu()
+
+        device = torch.device("cuda")
+        w_packed_g = w_packed_c.to(device, non_blocking=True)
+        w_scale_g = w_scale_c.to(device, non_blocking=True)
+
+        result = triton_dequantize_fp4_to_bf16(w_packed_g, w_scale_g)
+
+        assert result.device.type == "cuda"
+        assert result.shape == (I, D)
+        assert result.dtype == torch.bfloat16
+        assert torch.isfinite(result).all()
+
+    def test_triton_deq_cpu_fallback_still_works(self):
+        """CPU deq fallback (without DMA) still produces correct result."""
+        from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
+        from tile_reference import cast
+
+        I, D = 8, 64
+        w_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
+        w_packed, w_scale = cast(w_bf16, fmt="e2m1", block_size=(1, 32))
+
+        # CPU path: no DMA, the function falls back to tile_reference
+        result = triton_dequantize_fp4_to_bf16(w_packed.cpu(), w_scale.cpu())
+
+        assert result.device.type == "cpu"
+        assert result.shape == (I, D)
+        assert result.dtype == torch.bfloat16

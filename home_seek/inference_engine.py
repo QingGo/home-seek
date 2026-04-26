@@ -160,6 +160,14 @@ class WeightLoader:
     def close(self):
         self._mmap_cache.clear()
 
+    def _safetensors_files(self):
+        """Return list of all safetensor file paths in weight_dir."""
+        weight_dir = self.weight_dir
+        files = [os.path.join(weight_dir, f)
+                 for f in sorted(os.listdir(weight_dir))
+                 if f.endswith(".safetensors")]
+        return [f for f in files if os.path.isfile(f)]
+
     def get_layer_weight(self, layer: int, weight_type: str):
         return self.get_weight(f"layers.{layer}.{weight_type}")
 
@@ -329,7 +337,7 @@ class HomeSeekInferenceEngine:
         self.device = torch.device(device)
         self.verbose = verbose
         self.loader = WeightLoader(weight_dir, device)
-        self.expert_cache = ExpertWeightCache(max_experts=512, device=device, hot_deq_size=0)
+        self.expert_cache = ExpertWeightCache(max_experts=5120, device=device, hot_deq_size=0)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
         self._compressors = {}       # per-layer Compressor instances (lazy)
@@ -352,9 +360,10 @@ class HomeSeekInferenceEngine:
         self._mtp_weights = {}
         self._mtp_loaded = False
         self._warmed_up = False
+        self._layer_weight_cache = {}
 
         self._gpu_expert_store = AllExpertFP4Store(
-            weight_dir, self.config, str(self.device), max_experts=512)
+            weight_dir, self.config, str(self.device), max_experts=128)
 
         self._fused_moe = FusedMoEFFN(
             num_experts=self.config.n_routed_experts,
@@ -397,7 +406,7 @@ class HomeSeekInferenceEngine:
         if self._prefetch_enabled and self._prefetch_worker is None:
             self._prefetch_worker = AsyncPrefetchWorker(
                 self.weight_dir, self.loader.weight_map, str(self.device),
-                num_prefetch=12)
+                num_prefetch=32)
 
     def _load_global_weights(self):
         def safe(key):
@@ -439,6 +448,8 @@ class HomeSeekInferenceEngine:
         self._log(f"hc_head_fn: {self.hc_head_fn.shape if self.hc_head_fn is not None else 'missing'}")
 
     def _get_layer_weights(self, layer_idx: int):
+        if layer_idx in self._layer_weight_cache:
+            return self._layer_weight_cache[layer_idx]
         lw = {}
         keys_needed = [
             f"layers.{layer_idx}.{t}" for t in [
@@ -473,6 +484,7 @@ class HomeSeekInferenceEngine:
             short_key = full_key.replace(f"layers.{layer_idx}.", "")
             if full_key in present and present[full_key] is not None:
                 lw[short_key] = present[full_key].to(self.device, non_blocking=True)
+        self._layer_weight_cache[layer_idx] = lw
         return lw
 
     def _get_compressor(self, layer_idx: int, lw: dict) -> NewCompressor | None:
@@ -1219,7 +1231,7 @@ class HomeSeekInferenceEngine:
                     h_flat.to(next_gate_w.dtype), next_gate_w.t())
                 scores = F.softplus(scores).sqrt()
                 _, topk_idx = torch.topk(
-                    scores, self.config.num_experts_per_tok + 4, dim=-1)
+                    scores, self.config.num_experts_per_tok + 16, dim=-1)
                 predicted_ids = list(set(int(x) for x in topk_idx[0].tolist()))
             else:
                 sample_input = torch.randn(
@@ -1229,7 +1241,7 @@ class HomeSeekInferenceEngine:
                     sample_input.to(next_gate_w.dtype), next_gate_w.t())
                 scores = F.softplus(scores).sqrt()
                 _, topk_idx = torch.topk(
-                    scores, self.config.num_experts_per_tok + 4, dim=-1)
+                    scores, self.config.num_experts_per_tok + 16, dim=-1)
                 predicted_ids = topk_idx[0].tolist()
             self._prefetch_worker.prefetch(next_idx, predicted_ids)
 
@@ -1285,6 +1297,41 @@ class HomeSeekInferenceEngine:
             w = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
             self._mtp_weights[key] = w
         return w
+
+    def _warmup_page_cache(self):
+        """Sequentially read all safetensors to warm the Linux page cache.
+
+        With 150GB weights and 900GB available RAM, all weight files should
+        fit in page cache after warmup.  Using 8 threads to saturate the RAID
+        read bandwidth (~1.5 GB/s measured → ~100s for 150GB).
+        """
+        import concurrent.futures
+
+        safetensors_files = self.loader._safetensors_files()
+        if not safetensors_files:
+            return
+
+        total_gb = sum(os.path.getsize(f) for f in safetensors_files) / (1024**3)
+        self._log(f"Warming page cache: {len(safetensors_files)} files, "
+                  f"{total_gb:.1f} GB...")
+        t0 = time.time()
+
+        def read_file(fpath):
+            try:
+                with open(fpath, "rb") as f:
+                    chunk_size = 16 * 1024 * 1024  # 16MB chunks
+                    while f.read(chunk_size):
+                        pass
+            except Exception:
+                pass
+
+        max_workers = min(8, len(safetensors_files))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(read_file, safetensors_files))
+
+        elapsed = time.time() - t0
+        bw = total_gb / elapsed if elapsed > 0 else 0
+        self._log(f"Page cache warmup done in {elapsed:.1f}s ({bw:.1f} GB/s)")
 
     def _warmup(self) -> bool:
         if self._warmed_up:
@@ -1449,6 +1496,7 @@ class HomeSeekInferenceEngine:
         self.layer_states = {}
         self._deq_cache.clear()
         self.expert_cache.clear()
+        self._layer_weight_cache.clear()
         clear_deq_cache()
         for compressor in self._compressors.values():
             compressor.reset()
@@ -1495,9 +1543,6 @@ class HomeSeekInferenceEngine:
             if self._prefetch_worker is not None:
                 self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
 
-            if layer_idx in self._cpu_fallback_layers and self._prefetch_worker is not None:
-                self._prefetch_worker.clear()
-
             if (layer_idx + 1) % 5 == 0:
                 mem = torch.cuda.memory_allocated() / (1024**3)
                 if mem > 18:
@@ -1512,7 +1557,7 @@ class HomeSeekInferenceEngine:
                             if self.layer_states[li].compressed_kv_data is not None:
                                 self.layer_states[li].compressed_kv_data = None
                                 self.layer_states[li].compressed_kv_idx = None
-                    self.expert_cache.trim(64)
+                    self._gpu_expert_store.resize(32)
                     torch.cuda.empty_cache()
                     self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
 
@@ -1562,6 +1607,9 @@ class HomeSeekInferenceEngine:
                     h = self._process_mhc_post(ffn_out, residual, post, comb)
                 else:
                     h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+                if self._prefetch_worker is not None:
+                    self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
 
                 if layer_idx == self.config.num_hidden_layers // 2:
                     mem = torch.cuda.memory_allocated() / (1024**3)

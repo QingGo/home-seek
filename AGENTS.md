@@ -26,6 +26,7 @@ make smoke             # 最小冒烟: 1 token 推理
 - 模型权重: `weights/` (46 个 safetensors, ~150GB)
 - 热专家: `hot_experts.json`
 - 架构文档: `docs/arch_design.md`
+- 实施记录：`docs/docs/implementation_notes.md`，记录实际实现中与设计相悖的地方，未预见的约束（硬件、库限制），尝试过但失败的方案。
 
 ## Triton Kernel 铁律
 
