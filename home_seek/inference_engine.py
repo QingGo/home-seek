@@ -12,6 +12,7 @@ from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
 from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN
+from home_seek.gpu_expert_store import AllExpertFP4Store
 from tile_reference import unpack_from_e2m1fn_x2
 import tile_kernels
 
@@ -242,14 +243,15 @@ class LayerState:
 
 
 class ExpertWeightCache:
-    def __init__(self, max_experts: int = 512, device: str = "cuda"):
+    def __init__(self, max_experts: int = 512, device: str = "cuda",
+                 hot_deq_size: int = 0):
         self.max_experts = max_experts
         self.device = torch.device(device)
         self.cache = OrderedDict()
         self.pinned = set()
 
         self._hot_deq = OrderedDict()
-        self._max_hot_deq = 32
+        self._max_hot_deq = hot_deq_size
 
     def get(self, key: str):
         if key not in self.cache:
@@ -258,7 +260,7 @@ class ExpertWeightCache:
         return self.cache[key]
 
     def deq(self, key: str):
-        if key in self._hot_deq:
+        if self._max_hot_deq > 0 and key in self._hot_deq:
             self._hot_deq.move_to_end(key)
             return self._hot_deq[key]
 
@@ -271,9 +273,17 @@ class ExpertWeightCache:
         w3 = self._dequantize_entry(raw_w3, self.device)
         w2 = self._dequantize_entry(raw_w2, self.device)
 
-        self._hot_deq[key] = (w1, w3, w2)
-        if len(self._hot_deq) > self._max_hot_deq:
-            self._hot_deq.popitem(last=False)
+        if self._max_hot_deq > 0:
+            self._hot_deq[key] = (w1, w3, w2)
+            if len(self._hot_deq) > self._max_hot_deq:
+                evicted = False
+                for k in list(self._hot_deq.keys()):
+                    if k not in self.pinned:
+                        self._hot_deq.pop(k)
+                        evicted = True
+                        break
+                if not evicted:
+                    self._hot_deq.popitem(last=False)
         return (w1, w3, w2)
 
     def _dequantize_entry(self, entry, device=None):
@@ -288,7 +298,7 @@ class ExpertWeightCache:
                 data = data.to(dev, non_blocking=True)
                 scale = scale.to(dev, non_blocking=True) if scale is not None else None
             return load_fp8_weight(data, scale)
-        if fmt == "fp4":
+        if fmt == "fp4_gpu" or fmt == "fp4":
             if str(data.device) != str(dev):
                 data = data.to(dev, non_blocking=True)
                 scale = scale.to(dev, non_blocking=True) if scale is not None else None
@@ -344,7 +354,7 @@ class HomeSeekInferenceEngine:
         self.device = torch.device(device)
         self.verbose = verbose
         self.loader = WeightLoader(weight_dir, device)
-        self.expert_cache = ExpertWeightCache(max_experts=512, device=device)
+        self.expert_cache = ExpertWeightCache(max_experts=512, device=device, hot_deq_size=0)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
         self._prefetch_worker = None
@@ -364,6 +374,9 @@ class HomeSeekInferenceEngine:
         self._mtp_loaded = False
         self._warmed_up = False
 
+        self._gpu_expert_store = AllExpertFP4Store(
+            weight_dir, self.config, str(self.device), max_experts=512)
+
         self._fused_moe = FusedMoEFFN(
             num_experts=self.config.n_routed_experts,
             intermediate_size=self.config.moe_intermediate_size,
@@ -379,6 +392,7 @@ class HomeSeekInferenceEngine:
 
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
+        self._init_prefetch()
         self._warmup()
 
     def _log(self, msg):
@@ -400,7 +414,8 @@ class HomeSeekInferenceEngine:
     def _init_prefetch(self):
         if self._prefetch_enabled and self._prefetch_worker is None:
             self._prefetch_worker = AsyncPrefetchWorker(
-                self.weight_dir, self.loader.weight_map, str(self.device))
+                self.weight_dir, self.loader.weight_map, str(self.device),
+                num_prefetch=12)
 
     def _load_global_weights(self):
         def safe(key):
@@ -858,12 +873,20 @@ class HomeSeekInferenceEngine:
             data = data.to(self.device, non_blocking=True)
             sf = scale.to(torch.float32).to(self.device, non_blocking=True) if scale is not None else None
             return (data, sf, "fp8")
-        keep_cpu = data.dtype == torch.int8
-        dev = self.device if not keep_cpu else "cpu"
-        data = data.to(dev, non_blocking=not keep_cpu)
-        if scale is not None:
-            scale = scale.to(torch.float32).to(dev, non_blocking=not keep_cpu) if scale.dtype != torch.float32 else scale.to(dev, non_blocking=not keep_cpu)
-        return (data, scale, "fp4")
+        if data.dtype == torch.int8:
+            same_device = (data.device.type == self.device.type and
+                           (data.device.index == self.device.index or
+                            self.device.index is None and data.device.index == 0))
+            if same_device:
+                scale_gpu = scale.to(torch.float32) if scale is not None and scale.dtype != torch.float32 else scale
+                return (data, scale_gpu, "fp4_gpu")
+            dev = "cpu"
+            data = data.to(dev)
+            if scale is not None:
+                scale = scale.to(torch.float32).to(dev) if scale.dtype != torch.float32 else scale.to(dev)
+            return (data, scale, "fp4")
+        data = data.to(self.device, non_blocking=True)
+        return (data, scale, "bf16")
 
     def _load_expert_weights(self, layer_idx, eid):
         cache_key = f"{layer_idx}_{eid}"
@@ -871,15 +894,15 @@ class HomeSeekInferenceEngine:
         if cached is not None:
             return cached
 
-        if self._prefetch_worker is not None:
-            prefetched = self._prefetch_worker.get(layer_idx, eid)
-            if prefetched is not None:
-                w1_entry = self._make_raw_entry(prefetched.get(("w1", "data")), prefetched.get(("w1", "scale")))
-                w3_entry = self._make_raw_entry(prefetched.get(("w3", "data")), prefetched.get(("w3", "scale")))
-                w2_entry = self._make_raw_entry(prefetched.get(("w2", "data")), prefetched.get(("w2", "scale")))
-                pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
-                self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
-                return self.expert_cache.get(cache_key)
+        gpu_cached = self._gpu_expert_store.get_cache_key(layer_idx, eid)
+        if gpu_cached is not None:
+            gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale = gpu_cached
+            w1_entry = self._make_raw_entry(gate_packed, gate_scale)
+            w3_entry = self._make_raw_entry(up_packed, up_scale)
+            w2_entry = self._make_raw_entry(down_packed, down_scale)
+            pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+            self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+            return self.expert_cache.get(cache_key)
 
         prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
         keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
@@ -891,8 +914,20 @@ class HomeSeekInferenceEngine:
         w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
 
         if w1 is None:
-            return None
+            if self._prefetch_worker is not None:
+                prefetched = self._prefetch_worker.get(layer_idx, eid)
+                if prefetched is not None:
+                    w1 = prefetched.get(("w1", "data"))
+                    s1 = prefetched.get(("w1", "scale"))
+                    w3 = prefetched.get(("w3", "data"))
+                    s3 = prefetched.get(("w3", "scale"))
+                    w2 = prefetched.get(("w2", "data"))
+                    s2 = prefetched.get(("w2", "scale"))
+            if w1 is None:
+                return None
 
+        self._gpu_expert_store.cache_on_gpu(
+            layer_idx, eid, w1, s1, w3, s3, w2, s2)
         w1_entry = self._make_raw_entry(w1, s1)
         w3_entry = self._make_raw_entry(w3, s3)
         w2_entry = self._make_raw_entry(w2, s2)
@@ -900,6 +935,15 @@ class HomeSeekInferenceEngine:
         pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
         return self.expert_cache.get(cache_key)
+
+    def _load_expert_raw(self, layer_idx, eid):
+        raw = self._load_expert_weights(layer_idx, eid)
+        if raw is None:
+            if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
+                raw = self._cpu_ffn_fallback(layer_idx, eid)
+            if raw is None:
+                return None
+        return raw
 
     def _load_expert_deq(self, layer_idx, eid):
         raw = self._load_expert_weights(layer_idx, eid)
@@ -912,6 +956,53 @@ class HomeSeekInferenceEngine:
         if deq is None:
             deq = raw
         return deq
+
+    def _load_expert_fp4_raw(self, layer_idx, eid):
+        raw = self._load_expert_raw(layer_idx, eid)
+        if raw is None:
+            return None
+        w1_entry, w3_entry, w2_entry = raw
+        if w1_entry is None:
+            return None
+
+        w1_data, w1_scale, w1_fmt = w1_entry
+        w3_data, w3_scale, w3_fmt = w3_entry
+        w2_data, w2_scale, w2_fmt = w2_entry
+
+        is_fp4_gpu = all(f in ("fp4_gpu", "fp4") for f in (w1_fmt, w3_fmt, w2_fmt))
+        if not is_fp4_gpu:
+            return None
+
+        w1_dev = w1_data.device if w1_data is not None else torch.device("cpu")
+        if str(w1_dev) != str(self.device) and w1_data is not None:
+            w1_data = w1_data.to(self.device, non_blocking=True)
+            if w1_scale is not None:
+                w1_scale = w1_scale.to(self.device, non_blocking=True)
+        w3_dev = w3_data.device if w3_data is not None else torch.device("cpu")
+        if str(w3_dev) != str(self.device) and w3_data is not None:
+            w3_data = w3_data.to(self.device, non_blocking=True)
+            if w3_scale is not None:
+                w3_scale = w3_scale.to(self.device, non_blocking=True)
+        w2_dev = w2_data.device if w2_data is not None else torch.device("cpu")
+        if str(w2_dev) != str(self.device) and w2_data is not None:
+            w2_data = w2_data.to(self.device, non_blocking=True)
+            if w2_scale is not None:
+                w2_scale = w2_scale.to(self.device, non_blocking=True)
+
+        if w1_scale is not None:
+            w1_scale = (w1_scale.to(torch.float32)
+                        if w1_scale.dtype != torch.float32
+                        else w1_scale)
+        if w3_scale is not None:
+            w3_scale = (w3_scale.to(torch.float32)
+                        if w3_scale.dtype != torch.float32
+                        else w3_scale)
+        if w2_scale is not None:
+            w2_scale = (w2_scale.to(torch.float32)
+                        if w2_scale.dtype != torch.float32
+                        else w2_scale)
+
+        return (w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
@@ -935,41 +1026,53 @@ class HomeSeekInferenceEngine:
         flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
 
         try:
+            def _fp4_load(layer, eid):
+                return self._load_expert_fp4_raw(layer, eid)
             result = self._fused_moe.forward(
                 flat_hidden, flat_topk_idx, flat_topk_w,
-                lambda layer, eid: self._load_expert_deq(layer, eid),
+                _fp4_load,
                 layer_idx,
             )
             ffn_out = result.reshape(B, T, D)
         except Exception as _e:
-            if self.verbose:
-                self._log(f"FusedMoE fallback at layer {layer_idx}: {type(_e).__name__}")
-            for k in range(self.config.num_experts_per_tok):
-                expert_ids = flat_topk_idx[:, k]
-                weights = flat_topk_w[:, k]
-                unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
-                for eid_idx in range(unique_eids.shape[0]):
-                    eid = unique_eids[eid_idx].item()
-                    if eid < 0:
-                        continue
-                    used_experts.add(eid)
-                    token_mask = inverse == eid_idx
-                    if not token_mask.any():
-                        continue
-                    deq_triple = self._load_expert_deq(layer_idx, eid)
-                    if deq_triple is None:
-                        continue
-                    w1_d, w3_d, w2_d = deq_triple
-                    if w1_d is None:
-                        continue
-                    h_batch = flat_hidden[token_mask].to(w1_d.dtype)
-                    gate_out = torch.matmul(h_batch, w1_d.t())
-                    up_out = torch.matmul(h_batch, w3_d.t())
-                    g = gate_out.float().clamp(max=self.config.swiglu_limit)
-                    u = up_out.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
-                    activated = (g * g.sigmoid() * u).to(w1_d.dtype)
-                    out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
-                    ffn_out.reshape(total_tokens, D)[token_mask] += out * weights[token_mask].unsqueeze(-1)
+            try:
+                def _deq_load(layer, eid):
+                    return self._load_expert_deq(layer, eid)
+                result = self._fused_moe.forward(
+                    flat_hidden, flat_topk_idx, flat_topk_w,
+                    _deq_load,
+                    layer_idx,
+                )
+                ffn_out = result.reshape(B, T, D)
+            except Exception as _e2:
+                if self.verbose:
+                    self._log(f"FusedMoE fallback at layer {layer_idx}: {type(_e2).__name__}")
+                for k in range(self.config.num_experts_per_tok):
+                    expert_ids = flat_topk_idx[:, k]
+                    weights = flat_topk_w[:, k]
+                    unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
+                    for eid_idx in range(unique_eids.shape[0]):
+                        eid = unique_eids[eid_idx].item()
+                        if eid < 0:
+                            continue
+                        used_experts.add(eid)
+                        token_mask = inverse == eid_idx
+                        if not token_mask.any():
+                            continue
+                        deq_triple = self._load_expert_deq(layer_idx, eid)
+                        if deq_triple is None:
+                            continue
+                        w1_d, w3_d, w2_d = deq_triple
+                        if w1_d is None:
+                            continue
+                        h_batch = flat_hidden[token_mask].to(w1_d.dtype)
+                        gate_out = torch.matmul(h_batch, w1_d.t())
+                        up_out = torch.matmul(h_batch, w3_d.t())
+                        g = gate_out.float().clamp(max=self.config.swiglu_limit)
+                        u = up_out.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+                        activated = (g * g.sigmoid() * u).to(w1_d.dtype)
+                        out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                        ffn_out.reshape(total_tokens, D)[token_mask] += out * weights[token_mask].unsqueeze(-1)
 
         shared_w = self._get_shared_expert(layer_idx)
         if shared_w is not None:
@@ -1015,7 +1118,7 @@ class HomeSeekInferenceEngine:
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
         return (pre.unsqueeze(-1) * hidden_4d.float()).sum(dim=2).to(torch.bfloat16)
 
-    def _prefetch_next_layer(self, layer_idx, lw):
+    def _prefetch_next_layer(self, layer_idx, lw, hidden_states=None):
         if not self._prefetch_enabled or self._prefetch_worker is None:
             return
         next_idx = layer_idx + 1
@@ -1024,12 +1127,24 @@ class HomeSeekInferenceEngine:
         next_lw = self._get_layer_weights(next_idx)
         next_gate_w = next_lw.get("ffn.gate.weight")
         if next_gate_w is not None:
-            sample_input = torch.randn(1, self.config.hidden_size,
-                                       device=self.device, dtype=torch.bfloat16)
-            scores = torch.matmul(sample_input.to(next_gate_w.dtype), next_gate_w.t())
-            scores = F.softplus(scores).sqrt()
-            _, topk_idx = torch.topk(scores, self.config.num_experts_per_tok + 4, dim=-1)
-            predicted_ids = topk_idx[0].tolist()
+            if hidden_states is not None:
+                h_flat = hidden_states.reshape(-1, self.config.hidden_size)
+                scores = torch.matmul(
+                    h_flat.to(next_gate_w.dtype), next_gate_w.t())
+                scores = F.softplus(scores).sqrt()
+                _, topk_idx = torch.topk(
+                    scores, self.config.num_experts_per_tok + 4, dim=-1)
+                predicted_ids = list(set(int(x) for x in topk_idx[0].tolist()))
+            else:
+                sample_input = torch.randn(
+                    1, self.config.hidden_size,
+                    device=self.device, dtype=torch.bfloat16)
+                scores = torch.matmul(
+                    sample_input.to(next_gate_w.dtype), next_gate_w.t())
+                scores = F.softplus(scores).sqrt()
+                _, topk_idx = torch.topk(
+                    scores, self.config.num_experts_per_tok + 4, dim=-1)
+                predicted_ids = topk_idx[0].tolist()
             self._prefetch_worker.prefetch(next_idx, predicted_ids)
 
     def _load_shared_experts_gpu(self):
@@ -1257,7 +1372,7 @@ class HomeSeekInferenceEngine:
                 h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
             if self._prefetch_worker is not None:
-                self._prefetch_next_layer(layer_idx, lw)
+                self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
 
             if layer_idx in self._cpu_fallback_layers and self._prefetch_worker is not None:
                 self._prefetch_worker.clear()

@@ -5,15 +5,15 @@ SHELL := /bin/bash
 
 tests:
 	@echo "=== Running ALL tests (unit + integration) ==="
-	source .venv/bin/activate && python -m pytest tests/ -v --tb=short
+	source .venv/bin/activate && python -m pytest tests/ -v --tb=short --durations=10
 
 unit-tests:
 	@echo "=== Running fast unit tests ==="
-	source .venv/bin/activate && python -m pytest tests/ -m "not slow" -v --tb=short
+	source .venv/bin/activate && python -m pytest tests/ -m "not slow" -v --tb=short --durations=10
 
 integration-tests:
 	@echo "=== Running integration tests (weights required) ==="
-	source .venv/bin/activate && python -m pytest tests/integration/ -v --tb=short
+	source .venv/bin/activate && python -m pytest tests/integration/ -v --tb=short --durations=10
 
 lint:
 	@echo "=== Linting ==="

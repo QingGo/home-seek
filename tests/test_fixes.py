@@ -492,7 +492,7 @@ class TestExpertCache:
 
     def test_expert_cache_hot_deq(self):
         from home_seek.inference_engine import ExpertWeightCache
-        cache = ExpertWeightCache(max_experts=10)
+        cache = ExpertWeightCache(max_experts=10, hot_deq_size=8)
         w1 = torch.randn(4, 8, device="cuda")
         w3 = torch.randn(4, 8, device="cuda")
         w2 = torch.randn(8, 4, device="cuda")

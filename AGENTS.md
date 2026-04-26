@@ -4,7 +4,7 @@
 - **依赖管理**: `uv` (非 pip)
 - **环境**: 激活 `.venv` (`source .venv/bin/activate`) 或用 `.venv/bin/python`
 - **静态检查**: `ruff check home_seek/ tests/`
-- **测试**: `python -m pytest tests/ -m "not slow" -v` (快速), `make integration-tests` (慢)
+- **测试**: `python -m pytest tests/ -m "not slow" -v --durations=10` (快速), `make integration-tests` (慢)
 - **入口**: `main.py` → `home_seek.inference_engine:main`
 
 ## 测试分层
@@ -28,3 +28,9 @@
 - TileKernels 首次调用触发 JIT 编译 (~100ms-2s), 须预热
 - `torch.unique` 在 CUDA 上是同步点, 避免在热路径使用
 - `reduce_fused` 要求 `topk_weights` 为 float32
+
+## 结构化状态与记忆管理 (Structured Memory)
+为了防止在长对话中丢失上下文，本项目采用**短期会话记忆 + 长期架构记忆**分离机制，统一维护 `.agent_memory.md`：
+- 短期记忆：当前会话临时任务、即时踩坑、未闭环问题、会话级上下文
+- 长期记忆：核心架构决策、人类最终决策、通用踩坑沉淀
+- 文件位置：根目录 `.agent_memory.md`（已加入 `.gitignore`，纯本地使用）
