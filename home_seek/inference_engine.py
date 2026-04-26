@@ -360,6 +360,7 @@ class HomeSeekInferenceEngine:
         self._shared_experts_loaded = False
         self._mtp_weights = {}
         self._mtp_loaded = False
+        self._mtp_eager = False
         self._warmed_up = False
         self._layer_weight_cache = {}
 
@@ -1299,13 +1300,15 @@ class HomeSeekInferenceEngine:
         return None
 
     def _load_mtp_weights(self):
-        self._mtp_loaded = True
-        self._log("MTP lazy loading enabled")
+        self._log("MTP weights lazily pre-loaded; call enable_mtp() to activate")
 
     def _get_mtp_weight(self, key: str):
         if key in self._mtp_weights:
             return self._mtp_weights[key]
-        w = self.loader.get_weight(key, device=str(self.device))
+        loader = getattr(self, 'loader', None)
+        if loader is None:
+            return None
+        w = loader.get_weight(key, device=str(self.device))
         if w is not None:
             w = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
             self._mtp_weights[key] = w
@@ -1440,25 +1443,61 @@ class HomeSeekInferenceEngine:
 
     @torch.no_grad()
     def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6):
-        device = self.device
-        mtp_embed = self._get_mtp_weight("mtp.0.embed.weight")
-        mtp_norm = self._get_mtp_weight("mtp.0.norm.weight")
-        mtp_head = self._get_mtp_weight("mtp.0.head.weight")
-        if mtp_head is None:
-            mtp_head = self.lm_head
-        mtp_head_norm = self._get_mtp_weight("mtp.0.head_norm.weight")
-        if mtp_embed is None:
+
+        embed = self.embed
+        lm_head = self.lm_head
+        if embed is None or lm_head is None:
             return None, 0
 
+        e_proj = self._get_mtp_weight("mtp.0.e_proj.weight")
+        e_proj_scale = self._get_mtp_weight("mtp.0.e_proj.scale")
+        enorm = self._get_mtp_weight("mtp.0.enorm.weight")
+        h_proj = self._get_mtp_weight("mtp.0.h_proj.weight")
+        h_proj_scale = self._get_mtp_weight("mtp.0.h_proj.scale")
+        hnorm = self._get_mtp_weight("mtp.0.hnorm.weight")
+
+        if e_proj is None:
+            return None, 0
+
+        if e_proj_scale is not None:
+            e_proj_bf16 = load_fp8_weight(e_proj, e_proj_scale)
+        else:
+            e_proj_bf16 = e_proj.to(torch.bfloat16)
+
+        if h_proj_scale is not None:
+            h_proj_bf16 = load_fp8_weight(h_proj, h_proj_scale)
+        else:
+            h_proj_bf16 = h_proj.to(torch.bfloat16)
+
+        if last_hidden.dim() == 4:
+            if self.hc_head_fn is not None:
+                h_main = self._hc_head(last_hidden)
+            else:
+                h_main = last_hidden.sum(dim=2)
+        else:
+            h_main = last_hidden
+
         draft_tokens = []
-        h = last_hidden
+
         for step in range(num_draft):
-            h_flat = h[:, -1:, :]
-            if mtp_norm is not None:
-                h_flat = rms_norm(h_flat, mtp_norm.to(torch.bfloat16))
-            logits = h_flat.to(mtp_head.dtype) @ mtp_head.t()
-            if mtp_head_norm is not None:
-                logits = rms_norm(logits, mtp_head_norm.to(torch.bfloat16))
+            if step == 0:
+                h_in = h_main
+            else:
+                prev_id = draft_tokens[-1]
+                h_in = embed[prev_id].to(torch.bfloat16)
+
+            h = h_in.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
+
+            if enorm is not None:
+                h = rms_norm(h, enorm.to(torch.bfloat16), self.config.rms_norm_eps)
+
+            h = h.to(h_proj_bf16.dtype) @ h_proj_bf16.t()
+
+            if hnorm is not None:
+                h = rms_norm(h, hnorm.to(torch.bfloat16), self.config.rms_norm_eps)
+
+            logits = h.to(lm_head.dtype) @ lm_head.t()
+
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1].float() / temperature, dim=-1)
                 next_id = torch.multinomial(probs, 1)
@@ -1466,78 +1505,121 @@ class HomeSeekInferenceEngine:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
             draft_tokens.append(next_id)
 
-            next_embed = mtp_embed[next_id].to(torch.bfloat16)
-            h = torch.cat([h, next_embed], dim=1)
-
         draft_ids = torch.cat(draft_tokens, dim=-1)
         return draft_ids, len(draft_tokens)
 
     @torch.no_grad()
     def _mtp_accept_drafts(self, input_ids, draft_ids, temperature=0.6):
+        """Verify draft tokens by sequentially processing them through the model,
+        extending the existing KV cache.  If a draft is rejected, the KV cache
+        is rolled back to the pre-verification state.
+
+        This incremental approach avoids re-running the full prefill forward
+        pass (O(T²) attention) and re-loading all expert weights from disk.
+        """
         if draft_ids is None or draft_ids.shape[1] == 0:
             return 0, None
 
-        full_ids = torch.cat([input_ids, draft_ids], dim=-1)
-        B, T_full = full_ids.shape
+        T_draft = draft_ids.shape[1]
 
-        h = self.embed[full_ids].to(torch.bfloat16)
-        h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        kv_snapshots = {}
+        for layer_idx, state in self.layer_states.items():
+            if state.kv_latent_cache is not None:
+                kv_snapshots[layer_idx] = state.kv_latent_cache.clone()
 
-        layer_states_bak = {}
-        for k, v in self.layer_states.items():
-            if v.kv_latent_cache is not None:
-                state_copy = LayerState(device=str(self.device))
-                state_copy.kv_latent_cache = v.kv_latent_cache.clone()
-                state_copy.archived_kv = v.archived_kv
-                state_copy.archived_len = v.archived_len
-                state_copy.compressed_kv_data = v.compressed_kv_data
-                state_copy.compressed_kv_idx = v.compressed_kv_idx
-                layer_states_bak[k] = state_copy
+        compressor_bak = {}
+        for layer_idx, comp in self._compressors.items():
+            if comp is not None:
+                compressor_bak[layer_idx] = (comp.accumulated,
+                    comp.kv_state.clone() if comp.kv_state is not None else None,
+                    comp.score_state.clone() if comp.score_state is not None else None)
 
-        self.layer_states = {}
+        pos_bak = self._global_pos
+
+        n_accept = 0
+        bonus_logits = None
+
         try:
-            for layer_idx in range(self.config.num_hidden_layers):
-                lw = self._get_layer_weights(layer_idx)
+            for i in range(T_draft):
+                self._global_pos += 1
+                draft_token = draft_ids[:, i:i + 1]
 
-                residual_attn = h
-                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
-                if lw.get("attn_norm.weight") is not None:
-                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-                attn_out = self._forward_attn(h_pre, lw, layer_idx)
-                if post is not None and comb is not None:
-                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
-                else:
-                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                h = self.embed[draft_token].to(torch.bfloat16)
+                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-                residual = h
-                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-                if lw.get("ffn_norm.weight") is not None:
-                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-                ffn_out, _ = self._forward_ffn(h_pre, lw, layer_idx, full_ids)
-                if post is not None and comb is not None:
-                    h = self._process_mhc_post(ffn_out, residual, post, comb)
-                else:
-                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                for layer_idx in range(self.config.num_hidden_layers):
+                    lw = self._get_layer_weights(layer_idx)
 
-            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-            if self.norm_weight is not None:
-                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+                    residual_attn = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                    if lw.get("attn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16),
+                                         self.config.rms_norm_eps)
+                    attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                    else:
+                        h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-            all_logits = h_3d.to(self.lm_head.dtype) @ self.lm_head.t()
-            draft_len = draft_ids.shape[1]
+                    residual = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                    if lw.get("ffn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16),
+                                         self.config.rms_norm_eps)
+                    ffn_out, _ = self._forward_ffn(h_pre, lw, layer_idx, draft_token)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(ffn_out, residual, post, comb)
+                    else:
+                        h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-            n_accept = 0
-            for i in range(draft_len):
-                expected = draft_ids[:, i]
-                pred_logits = all_logits[:, input_ids.shape[1] + i - 1, :]
-                pred_id = pred_logits.argmax(dim=-1)
-                if pred_id.item() == expected.item():
+                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+                if self.norm_weight is not None:
+                    h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+                logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
+
+                if i < T_draft - 1:
+                    expected_next = draft_ids[:, i + 1]
+                    pred_next = logits[:, -1].argmax(dim=-1)
+                    if pred_next.item() != expected_next.item():
+                        bonus_logits = logits[:, -1, :]
+                        break
                     n_accept += 1
                 else:
-                    break
-            return n_accept, all_logits[:, input_ids.shape[1] - 1 + n_accept, :]
+                    n_accept += 1
+
+            # Roll back KV cache and compressors for rejected positions
+            if n_accept < T_draft:
+                for layer_idx in kv_snapshots:
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None and state.kv_latent_cache is not None:
+                        orig_len = kv_snapshots[layer_idx].shape[1]
+                        keep_len = orig_len + n_accept
+                        if state.kv_latent_cache.dim() == 4:
+                            state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :, :].contiguous()
+                        else:
+                            state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :].contiguous()
+                for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
+                    comp = self._compressors.get(layer_idx)
+                    if comp is not None:
+                        comp.accumulated = acc
+                        comp.kv_state = kv_s
+                        comp.score_state = sc_s
+
         finally:
-            self.layer_states = layer_states_bak
+            self._global_pos = pos_bak
+            if n_accept == 0:
+                for layer_idx, saved_kv in kv_snapshots.items():
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None:
+                        state.kv_latent_cache = saved_kv
+                for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
+                    comp = self._compressors.get(layer_idx)
+                    if comp is not None:
+                        comp.accumulated = acc
+                        comp.kv_state = kv_s
+                        comp.score_state = sc_s
+
+        return n_accept, bonus_logits
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=50, temperature=0.6):
@@ -1629,9 +1711,7 @@ class HomeSeekInferenceEngine:
 
         generated = [next_id]
 
-        mtp_num_draft = 3 if self._mtp_loaded else 0
-        verify_extra_seen = 0
-        last_h_for_mtp = None
+        mtp_num_draft = 1 if self._mtp_loaded else 0
 
         step = 0
         while step < max_new_tokens - 1:
@@ -1674,8 +1754,7 @@ class HomeSeekInferenceEngine:
                                         self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
                                         self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
 
-            if layer_idx == self.config.num_hidden_layers - 1:
-                last_h_for_mtp = h
+            last_h_for_mtp = h
 
             h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
             if self.norm_weight is not None:
@@ -1696,7 +1775,16 @@ class HomeSeekInferenceEngine:
                 draft_ids, n_draft = self._mtp_generate_draft(
                     last_h_for_mtp, mtp_num_draft, temperature)
                 if draft_ids is not None and n_draft > 0:
-                    n_acc, verify_logits = self._mtp_accept_drafts(
+                    if self._mtp_eager:
+                        for i in range(n_draft):
+                            generated.append(draft_ids[:, i:i+1])
+                            step += 1
+                            if step >= max_new_tokens - 1:
+                                break
+                        if step < max_new_tokens - 1:
+                            next_id = draft_ids[:, -1:]
+                        continue
+                    n_acc, bonus_logits = self._mtp_accept_drafts(
                         all_inputs, draft_ids, temperature)
                     if n_acc > 0:
                         accepted_ids = draft_ids[:, :n_acc]
@@ -1706,12 +1794,12 @@ class HomeSeekInferenceEngine:
                             if step >= max_new_tokens - 1:
                                 break
                         if step < max_new_tokens - 1:
-                            if n_acc < n_draft and verify_logits is not None and verify_logits.dim() >= 1:
+                            if n_acc < n_draft and bonus_logits is not None and bonus_logits.dim() >= 1:
                                 if temperature > 0:
-                                    new_probs = F.softmax(verify_logits.float() / temperature, dim=-1)
+                                    new_probs = F.softmax(bonus_logits.float() / temperature, dim=-1)
                                     next_id = torch.multinomial(new_probs, 1)
                                 else:
-                                    next_id = verify_logits.argmax(dim=-1, keepdim=True)
+                                    next_id = bonus_logits.argmax(dim=-1, keepdim=True)
                                 generated.append(next_id)
                                 step += 1
                             elif n_acc == n_draft:
@@ -1749,12 +1837,20 @@ def main():
     parser.add_argument("--prefetch", action="store_true", help="Enable expert prefetch (may increase memory)")
     parser.add_argument("--no-fallback", action="store_true", help="Disable CPU fallback")
     parser.add_argument("--hot-experts", default="hot_experts.json", help="Hot experts JSON path")
+    parser.add_argument("--use-mtp", action="store_true", help="Enable MTP speculative decoding")
+    parser.add_argument("--mtp-eager", action="store_true",
+                        help="Eager MTP: accept all drafts without verification (fast, risky)")
     args = parser.parse_args()
     engine = HomeSeekInferenceEngine(args.weight_dir, verbose=args.verbose, hot_experts_path=args.hot_experts)
     if args.prefetch:
         engine._prefetch_enabled = True
     if args.no_fallback:
         engine._cpu_fallback_enabled = False
+    if args.use_mtp:
+        engine._mtp_loaded = True
+    if args.mtp_eager:
+        engine._mtp_loaded = True
+        engine._mtp_eager = True
 
     tokenizer = None
     tokenizer_path = os.path.join(args.weight_dir, "tokenizer.json")

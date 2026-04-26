@@ -450,8 +450,10 @@ def run_profile(args):
         engine._prefetch_enabled = True
     if args.no_fallback:
         engine._cpu_fallback_enabled = False
-    if not use_mtp:
-        engine._mtp_loaded = False
+    if use_mtp:
+        engine._mtp_loaded = True
+    if args.mtp_eager:
+        engine._mtp_eager = True
     init_time = time.time() - t_init
     print(f"  Init done in {init_time:.2f}s")
 
@@ -604,6 +606,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--use-mtp", action="store_true")
+    parser.add_argument("--mtp-eager", action="store_true",
+                        help="Eager MTP: accept all drafts without verification (fast but risky)")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--preload-all", action="store_true",
