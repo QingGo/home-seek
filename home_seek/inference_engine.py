@@ -11,7 +11,7 @@ import math
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
-from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN
+from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache
 from home_seek.gpu_expert_store import AllExpertFP4Store
 from tile_reference import unpack_from_e2m1fn_x2
 import tile_kernels
@@ -164,7 +164,8 @@ class WeightLoader:
             if device is not None and str(device) != "cpu":
                 return tensor.to(device, non_blocking=True)
             return tensor
-        except Exception:
+        except Exception as e:
+            self._log(f"Failed to get weight {key} from {fname}: {type(e).__name__}")
             return None
 
     def get_weights(self, *keys):
@@ -179,8 +180,8 @@ class WeightLoader:
                 f = self._open_mmap(fname)
                 for k in ks:
                     results[k] = f.get_tensor(k)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"Failed batch load from {fname}: {type(e).__name__}")
         return results
 
     def close(self):
@@ -393,7 +394,10 @@ class HomeSeekInferenceEngine:
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
         self._init_prefetch()
-        self._warmup()
+        warmup_ok = self._warmup()
+        if not warmup_ok:
+            self._log("WARNING: Warmup had failures — first inference will be slow "
+                      "due to JIT compilation on the critical path.")
 
     def _log(self, msg):
         if getattr(self, 'verbose', False):
@@ -713,7 +717,8 @@ class HomeSeekInferenceEngine:
             post = post_mix.squeeze(-1)
             comb = comb_mix
             return hidden, post, comb
-        except Exception:
+        except Exception as e:
+            self._log(f"mHC kernel fallback (not critical): {type(e).__name__}")
             hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
             rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
             mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
@@ -974,17 +979,17 @@ class HomeSeekInferenceEngine:
             return None
 
         w1_dev = w1_data.device if w1_data is not None else torch.device("cpu")
-        if str(w1_dev) != str(self.device) and w1_data is not None:
+        if w1_data is not None and w1_dev.type != self.device.type:
             w1_data = w1_data.to(self.device, non_blocking=True)
             if w1_scale is not None:
                 w1_scale = w1_scale.to(self.device, non_blocking=True)
         w3_dev = w3_data.device if w3_data is not None else torch.device("cpu")
-        if str(w3_dev) != str(self.device) and w3_data is not None:
+        if w3_data is not None and w3_dev.type != self.device.type:
             w3_data = w3_data.to(self.device, non_blocking=True)
             if w3_scale is not None:
                 w3_scale = w3_scale.to(self.device, non_blocking=True)
         w2_dev = w2_data.device if w2_data is not None else torch.device("cpu")
-        if str(w2_dev) != str(self.device) and w2_data is not None:
+        if w2_data is not None and w2_dev.type != self.device.type:
             w2_data = w2_data.to(self.device, non_blocking=True)
             if w2_scale is not None:
                 w2_scale = w2_scale.to(self.device, non_blocking=True)
@@ -1035,6 +1040,7 @@ class HomeSeekInferenceEngine:
             )
             ffn_out = result.reshape(B, T, D)
         except Exception as _e:
+            self._log(f"FusedMoE FP4 path failed at layer {layer_idx}: {type(_e).__name__}")
             try:
                 def _deq_load(layer, eid):
                     return self._load_expert_deq(layer, eid)
@@ -1100,7 +1106,8 @@ class HomeSeekInferenceEngine:
             result = tile_kernels.modeling.mhc.ops.mhc_post(
                 hidden.float(), residual.float(), post_4d.float(), comb.float())
             return result.to(hidden.dtype)
-        except Exception:
+        except Exception as e:
+            self._log(f"mHC post kernel fallback (not critical): {type(e).__name__}")
             B, S, D = hidden.shape
             hc = comb.shape[-1]
             x_expanded = hidden.unsqueeze(2)
@@ -1163,6 +1170,13 @@ class HomeSeekInferenceEngine:
         if w1 is None:
             self._shared_expert_weights[layer_idx] = None
             return None
+        s1 = tensors.get(shared_keys[1])
+        w3_t = tensors.get(shared_keys[2])
+        s3 = tensors.get(shared_keys[3])
+        w2_t = tensors.get(shared_keys[4])
+        s2 = tensors.get(shared_keys[5])
+        assert w1.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.int8), \
+            f"Shared expert w1 unexpected dtype: {w1.dtype}"
         def _load_w(data, scale):
             if data is None:
                 return None
@@ -1170,11 +1184,6 @@ class HomeSeekInferenceEngine:
             if data.dtype == torch.int8:
                 return load_fp4_weight(data.to(dev), scale.to(dev) if scale is not None else None)
             return load_fp8_weight(data.to(dev), scale.to(dev) if scale is not None else None)
-        s1 = tensors.get(shared_keys[1])
-        w3_t = tensors.get(shared_keys[2])
-        s3 = tensors.get(shared_keys[3])
-        w2_t = tensors.get(shared_keys[4])
-        s2 = tensors.get(shared_keys[5])
         w1_d = _load_w(w1, s1)
         w3_d = _load_w(w3_t, s3) if w3_t is not None else None
         w2_d = _load_w(w2_t, s2) if w2_t is not None else None
@@ -1198,17 +1207,29 @@ class HomeSeekInferenceEngine:
             self._mtp_weights[key] = w
         return w
 
-    def _warmup(self):
+    def _warmup(self) -> bool:
         if self._warmed_up:
-            return
+            return True
         self._log("Warming up kernels...")
+
+        cast_ok = False
         try:
             dummy = torch.zeros(1, 1, device=self.device, dtype=torch.bfloat16)
-            _ = tile_kernels.quant.cast_back(
-                (dummy, torch.ones(1, 1, device=self.device)),
-                'bf16', (128, 128))
-        except Exception:
-            pass
+            s = torch.ones(1, 1, device=self.device)
+            _ = tile_kernels.quant.cast_back((dummy, s), 'bf16', (128, 128))
+            cast_ok = True
+            self._log("cast_back kernel warmup OK")
+        except Exception as e:
+            self._log(f"Warmup: cast_back kernel failed ({type(e).__name__}), "
+                      f"quantized ops may JIT-compile on first use")
+        finally:
+            del dummy
+            try:
+                del s
+            except NameError:
+                pass
+
+        moe_ok = False
         try:
             from tile_kernels.moe import get_fused_mapping, expand_to_fused, reduce_fused
             from tile_kernels.torch.moe import inplace_unique_group_indices
@@ -1220,11 +1241,23 @@ class HomeSeekInferenceEngine:
             tw = torch.randn(16, 6, device=self.device, dtype=torch.float32)
             _ = reduce_fused(ex, tw, m[3])
             torch.cuda.synchronize(self.device)
-            self._log("MoE kernels warmed")
+            moe_ok = True
+            self._log("MoE kernels warmup OK")
         except Exception as e:
-            self._log(f"MoE warmup: {e}")
-        self._warmed_up = True
-        self._log("Warmup complete")
+            self._log(f"Warmup: MoE kernels failed ({type(e).__name__}), "
+                      f"fused routing may JIT-compile on first use")
+        finally:
+            try:
+                del dw, ti, ex, tw, m
+            except NameError:
+                pass
+            torch.cuda.empty_cache()
+
+        all_ok = cast_ok and moe_ok
+        self._warmed_up = all_ok
+        status = "OK" if all_ok else "partial failure"
+        self._log(f"Warmup complete: {status} (cast={cast_ok}, moe={moe_ok})")
+        return all_ok
 
     @torch.no_grad()
     def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6):
@@ -1336,6 +1369,7 @@ class HomeSeekInferenceEngine:
         self.layer_states = {}
         self._deq_cache.clear()
         self.expert_cache.clear()
+        clear_deq_cache()
         if self._prefetch_worker is not None:
             self._prefetch_worker.clear()
         self._init_prefetch()
@@ -1502,6 +1536,11 @@ class HomeSeekInferenceEngine:
             "num_prompt_tokens": T,
             "num_generated_tokens": len(generated),
         }
+        from home_seek.fused_moe import deq_cache_stats
+        hits, misses = deq_cache_stats()
+        if hits + misses > 0:
+            self._log(f"Deq cache: hits={hits} misses={misses} "
+                      f"hit_rate={hits/(hits+misses)*100:.1f}%")
         self.loader.close()
         self._log(f"Done: {result['num_generated_tokens']} tokens in {total_time:.1f}s, "
                   f"peak mem: {result['peak_memory_gb']:.1f}GB")

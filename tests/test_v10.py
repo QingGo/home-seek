@@ -304,3 +304,149 @@ class TestMakeRawEntry:
         entry = eng._make_raw_entry(data, None)
         assert entry is not None
         assert entry[2] == "bf16"
+
+
+@pytest.mark.fast
+class TestFusedMoEFP4Triton:
+    _I = 64
+    _D = 128
+    _B = 4
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+
+    def _make_fp4_weights(self, seed: int = 42):
+        torch.manual_seed(seed)
+        I, D = self._I, self._D
+        w1_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w3_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w2_bf16 = torch.randn(D, I, device="cuda", dtype=torch.bfloat16)
+
+        from tile_reference import cast
+        w1_packed, w1_scale = cast(w1_bf16, fmt="e2m1", block_size=(1, 32))
+        w3_packed, w3_scale = cast(w3_bf16, fmt="e2m1", block_size=(1, 32))
+        w2_packed, w2_scale = cast(w2_bf16, fmt="e2m1", block_size=(1, 32))
+
+        return (w1_bf16, w3_bf16, w2_bf16,
+                w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale)
+
+    def _deq_ref(self, packed, scale):
+        from tile_reference import unpack_from_e2m1fn_x2
+        deq = unpack_from_e2m1fn_x2(packed)
+        if scale.dim() == 2:
+            sf = scale.repeat_interleave(32, dim=1)
+        else:
+            sf = scale
+        return deq.float() * sf.float()
+
+    def test_fp4_vs_pt_reference_single_token(self):
+        from home_seek.fused_moe import fused_expert_ffn_triton, fused_expert_ffn_pt
+        (w1_bf16, w3_bf16, w2_bf16,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
+
+        torch.manual_seed(123)
+        hidden = torch.randn(1, self._D, device="cuda", dtype=torch.bfloat16)
+
+        out_triton = fused_expert_ffn_triton(
+            hidden, w1p, w3p, w2p, swiglu_limit=10.0,
+            w1_scale=w1s, w3_scale=w3s, w2_scale=w2s)
+        out_ref = fused_expert_ffn_pt(
+            hidden, w1_bf16, w3_bf16, w2_bf16, swiglu_limit=10.0)
+
+        assert out_triton.shape == out_ref.shape == (1, self._D)
+        assert torch.isfinite(out_triton).all()
+        diff = (out_triton.float() - out_ref.float()).abs().max().item()
+        ref_norm = out_ref.float().abs().max().item()
+        assert diff < max(1.0, ref_norm * 0.5), \
+            f"diff={diff:.4f} ref_max={ref_norm:.4f}"
+
+    def test_fp4_vs_pt_reference_batch(self):
+        from home_seek.fused_moe import fused_expert_ffn_triton, fused_expert_ffn_pt
+        (w1_bf16, w3_bf16, w2_bf16,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
+
+        torch.manual_seed(456)
+        hidden = torch.randn(self._B, self._D, device="cuda", dtype=torch.bfloat16)
+
+        out_triton = fused_expert_ffn_triton(
+            hidden, w1p, w3p, w2p, swiglu_limit=10.0,
+            w1_scale=w1s, w3_scale=w3s, w2_scale=w2s)
+        out_ref = fused_expert_ffn_pt(
+            hidden, w1_bf16, w3_bf16, w2_bf16, swiglu_limit=10.0)
+
+        diff = (out_triton.float() - out_ref.float()).abs().max().item()
+        ref_norm = out_ref.float().abs().max().item()
+        assert out_triton.shape == out_ref.shape
+        assert torch.isfinite(out_triton).all()
+        assert diff < max(2.0, ref_norm * 0.5), \
+            f"diff={diff:.4f} ref_max={ref_norm:.4f}"
+
+    def test_fp4_vs_deq_manual_reference(self):
+        from home_seek.fused_moe import fused_expert_ffn_pt
+        (w1_bf16, w3_bf16, w2_bf16,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
+
+        w1_deq = self._deq_ref(w1p, w1s).to(torch.bfloat16)
+        w3_deq = self._deq_ref(w3p, w3s).to(torch.bfloat16)
+        w2_deq = self._deq_ref(w2p, w2s).to(torch.bfloat16)
+
+        hidden = torch.randn(2, self._D, device="cuda", dtype=torch.bfloat16)
+
+        out_triton_fp4 = fused_expert_ffn_pt(
+            hidden, w1_deq, w3_deq, w2_deq, swiglu_limit=10.0)
+        out_ref_orig = fused_expert_ffn_pt(
+            hidden, w1_bf16, w3_bf16, w2_bf16, swiglu_limit=10.0)
+
+        cos_fp4 = torch.nn.functional.cosine_similarity(
+            out_ref_orig.float().flatten(), out_triton_fp4.float().flatten(), dim=0)
+        assert cos_fp4.item() > 0.95, f"FP4 dequantized vs original: {cos_fp4.item():.6f}"
+
+    def test_fp4_swiglu_clamp(self):
+        from home_seek.fused_moe import fused_expert_ffn_triton
+        (w1_bf16, w3_bf16, w2_bf16,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
+
+        hidden = torch.randn(4, self._D, device="cuda", dtype=torch.bfloat16) * 3.0
+
+        out = fused_expert_ffn_triton(
+            hidden, w1p, w3p, w2p, swiglu_limit=2.0,
+            w1_scale=w1s, w3_scale=w3s, w2_scale=w2s)
+        assert out.shape == (4, self._D)
+        assert torch.isfinite(out).all()
+
+    def test_fp4_fuses_gate_up_computation(self):
+        from home_seek.fused_moe import fused_expert_ffn_triton, fused_expert_ffn_pt
+        (w1_bf16, w3_bf16, w2_bf16,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
+
+        torch.manual_seed(789)
+        hidden = torch.randn(1, self._D, device="cuda", dtype=torch.bfloat16)
+
+        out_triton = fused_expert_ffn_triton(
+            hidden, w1p, w3p, w2p, swiglu_limit=10.0,
+            w1_scale=w1s, w3_scale=w3s, w2_scale=w2s)
+
+        gate = hidden @ w1_bf16.t()
+        up = hidden @ w3_bf16.t()
+        g = gate.float().clamp(max=10.0)
+        u = up.float().clamp(min=-10.0, max=10.0)
+        activated = (g * g.sigmoid() * u).to(w1_bf16.dtype)
+        out_ref = activated @ w2_bf16.t()
+
+        diff = (out_triton.float() - out_ref.float()).abs().max().item()
+        ref_norm = out_ref.float().abs().max().item()
+        assert diff < max(2.0, ref_norm * 0.5), \
+            f"FP4 Triton max diff vs manual: {diff:.4f} ref_max={ref_norm:.4f}"
+
+    def test_fp4_wrong_dtype_graceful(self):
+        from home_seek.fused_moe import fused_expert_ffn_triton
+        hidden = torch.randn(2, self._D, device="cuda", dtype=torch.bfloat16)
+        w1 = torch.randn(self._I, self._D, device="cuda", dtype=torch.bfloat16)
+        w2 = torch.randn(self._D, self._I, device="cuda", dtype=torch.bfloat16)
+
+        out = fused_expert_ffn_triton(hidden, w1, w1, w2,
+                                       swiglu_limit=10.0)
+        assert out.shape == (2, self._D)

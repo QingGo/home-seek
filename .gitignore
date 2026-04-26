@@ -154,4 +154,4 @@ weights/
 weights
 artifacts/
 hot_experts.json
-.gitignore
+.agent_memory.md

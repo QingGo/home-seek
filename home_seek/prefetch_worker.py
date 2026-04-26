@@ -65,7 +65,10 @@ class AsyncPrefetchWorker:
                         result[(name, "scale")] = f.get_tensor(s_key)
                     else:
                         result[(name, "scale")] = None
-            except Exception:
+            except Exception as e:
+                import sys
+                print(f"[prefetch] Failed to load expert ({layer_idx},{eid}) "
+                      f"from {fname}: {type(e).__name__}", file=sys.stderr)
                 return None
         return result
 

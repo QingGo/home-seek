@@ -1,9 +1,9 @@
-import os
 import torch
 import pytest
 
 
 @pytest.mark.fast
+@pytest.mark.usefixtures("require_weights")
 class TestAllExpertFP4StoreIndex:
     def setup_method(self):
         if not torch.cuda.is_available():
@@ -35,6 +35,7 @@ class TestAllExpertFP4StoreIndex:
 
 
 @pytest.mark.fast
+@pytest.mark.usefixtures("require_weights")
 class TestAllExpertFP4StoreLoad:
     def setup_method(self):
         if not torch.cuda.is_available():

@@ -4,79 +4,36 @@ import triton.language as tl
 from typing import Callable, Optional
 
 
-def _decode_fp4_e2m1(x: tl.tensor) -> tl.tensor:
-    s = (x >> 3) & 0x1
-    e = (x >> 1) & 0x3
-    m = x & 0x1
-    sign = tl.where(s == 1, -1.0, 1.0).to(tl.float32)
-    exp_val = (e - 1).to(tl.float32)
-    norm = (1.0 + m.to(tl.float32) * 0.5) * tl.math.exp2(exp_val)
-    sub = (m.to(tl.float32) * 0.5) * 0.5
-    return tl.where(e == 0, sub, norm) * sign
+# ──────────────────────────────────────────────────────────────────────
+# FP4 → BF16 dequantization helper (one kernel launch for all 3 weight mats)
+# ──────────────────────────────────────────────────────────────────────
+
+def _dequantize_fp4_to_bf16(
+    w1_packed: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w3_packed: torch.Tensor,
+    w3_scale: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dequantize all three FP4-packed weight matrices to BF16 in one step."""
+    from tile_reference import unpack_from_e2m1fn_x2
+
+    def _deq_one(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        deq = unpack_from_e2m1fn_x2(packed)
+        block_size = 32
+        sf = scale.repeat_interleave(block_size, dim=1) if scale.dim() == 2 else scale
+        return (deq.float() * sf.float()).to(torch.bfloat16)
+
+    w1 = _deq_one(w1_packed, w1_scale)
+    w3 = _deq_one(w3_packed, w3_scale)
+    w2 = _deq_one(w2_packed, w2_scale)
+    return w1, w3, w2
 
 
-@triton.jit
-def _triton_fp4_deq_matmul_kernel(
-    a_ptr, b_packed_ptr, b_scale_ptr,
-    c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bn, stride_bk_packed,
-    stride_scn, stride_sck_blocks,
-    stride_cm, stride_cn,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-    offs_k = tl.arange(0, BK)
-
-    acc = tl.zeros([BM, BN], dtype=tl.float32)
-
-    for k in range(0, K, BK):
-        mask_k = (k + offs_k) < K
-        a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k)[None, :] * stride_ak
-        a_tile = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
-
-        k_idx = k + offs_k
-        k_packed_idx = k_idx // 2
-        k_parity = k_idx % 2
-
-        b_packed_ptrs = (b_packed_ptr + offs_n[:, None] * stride_bn
-                         + k_packed_idx[None, :] * stride_bk_packed)
-        b_packed = tl.load(b_packed_ptrs, mask=mask_k[None, :], other=0)
-        b_packed = b_packed.to(tl.int32)
-
-        k_scale_idx = k_idx // 32
-        b_scale_ptrs = (b_scale_ptr + offs_n[:, None] * stride_scn
-                        + k_scale_idx[None, :] * stride_sck_blocks)
-        b_scale = tl.load(b_scale_ptrs, mask=mask_k[None, :], other=127)
-        b_scale_f32 = b_scale.to(tl.uint8).to(tl.int32)
-        b_scale_f32 = (b_scale_f32 << 23).to(tl.float32, bitcast=True)
-
-        b_lo = b_packed & 0x0F
-        b_hi = (b_packed >> 4) & 0x0F
-
-        b_lo_f32 = _decode_fp4_e2m1(b_lo) * b_scale_f32
-        b_hi_f32 = _decode_fp4_e2m1(b_hi) * b_scale_f32
-
-        interleaved_shape = (BN, BK)
-        b_f32 = tl.zeros(interleaved_shape, dtype=tl.float32)
-        k_even_mask = (k_parity[None, :] == 0)
-        k_odd_mask = (k_parity[None, :] == 1)
-        b_f32 = tl.where(k_even_mask, b_lo_f32, b_f32)
-        b_f32 = tl.where(k_odd_mask, b_hi_f32, b_f32)
-
-        acc += tl.dot(a_tile.to(tl.float32), b_f32.T)
-
-    offs_cm = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    _out_dtype = c_ptr.dtype.element_ty
-    tl.store(c_ptr + offs_cm, acc.to(_out_dtype))
-
+# ──────────────────────────────────────────────────────────────────────
+# Triton fused kernels (BF16 weights)
+# ──────────────────────────────────────────────────────────────────────
 
 @triton.jit
 def _triton_fused_gate_up_kernel(
@@ -118,12 +75,13 @@ def _triton_fused_gate_up_kernel(
         gate_acc += tl.dot(h, w1_tile)
         up_acc += tl.dot(h, w3_tile)
 
+    mask_m = offs_m[:, None] < M
     mask_n = offs_n[None, :] < I
     gate_ptrs = gate_out_ptr + offs_m[:, None] * stride_gat_m + offs_n[None, :] * stride_gat_n
     up_ptrs = up_out_ptr + offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n
     _out_dtype = gate_out_ptr.dtype.element_ty
-    tl.store(gate_ptrs, gate_acc.to(_out_dtype), mask=mask_n)
-    tl.store(up_ptrs, up_acc.to(_out_dtype), mask=mask_n)
+    tl.store(gate_ptrs, gate_acc.to(_out_dtype), mask=mask_m & mask_n)
+    tl.store(up_ptrs, up_acc.to(_out_dtype), mask=mask_m & mask_n)
 
 
 @triton.jit
@@ -150,12 +108,13 @@ def _triton_fused_down_kernel(
 
     for k in range(0, I, BK):
         mask_k = (k + offs_k) < I
+        mask_m = offs_m < M
 
         gate_ptrs = gate_ptr + offs_m[:, None] * stride_gat_m + (k + offs_k)[None, :] * stride_gat_n
-        gate_tile = tl.load(gate_ptrs, mask=mask_k[None, :], other=0.0)
+        gate_tile = tl.load(gate_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
 
         up_ptrs = up_ptr + offs_m[:, None] * stride_up_m + (k + offs_k)[None, :] * stride_up_n
-        up_tile = tl.load(up_ptrs, mask=mask_k[None, :], other=0.0)
+        up_tile = tl.load(up_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
 
         gate_f32 = gate_tile.to(tl.float32)
         up_f32 = up_tile.to(tl.float32)
@@ -170,165 +129,12 @@ def _triton_fused_down_kernel(
 
     out_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
     _out_dtype = out_ptr.dtype.element_ty
-    tl.store(out_ptrs, out_acc.to(_out_dtype), mask=offs_n[None, :] < D)
+    tl.store(out_ptrs, out_acc.to(_out_dtype), mask=(offs_m[:, None] < M) & (offs_n[None, :] < D))
 
 
-@triton.jit
-def _triton_fused_gate_up_fp4_kernel(
-    hidden_ptr,
-    w1_packed_ptr, w1_scale_ptr,
-    w3_packed_ptr, w3_scale_ptr,
-    gate_out_ptr, up_out_ptr,
-    M, I, D, swiglu_limit,
-    stride_hid_m, stride_hid_k,
-    stride_w1_n, stride_w1_kp,
-    stride_w1s_n, stride_w1s_kb,
-    stride_w3_n, stride_w3_kp,
-    stride_w3s_n, stride_w3s_kb,
-    stride_gat_m, stride_gat_n,
-    stride_up_m, stride_up_n,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-    offs_k = tl.arange(0, BK)
-
-    gate_acc = tl.zeros([BM, BN], dtype=tl.float32)
-    up_acc = tl.zeros([BM, BN], dtype=tl.float32)
-
-    for k in range(0, D, BK):
-        mask_k = (k + offs_k) < D
-        mask_m = offs_m < M
-
-        h_ptrs = hidden_ptr + offs_m[:, None] * stride_hid_m + (k + offs_k)[None, :] * stride_hid_k
-        h = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-
-        k_idx = k + offs_k
-        k_packed_idx = k_idx // 2
-        k_parity = k_idx % 2
-
-        def _load_decode_fp4(packed_ptr, scale_ptr, n_stride, kp_stride, s_n_stride, s_kb_stride):
-            b_p_ptrs = (packed_ptr + offs_n[:, None] * n_stride
-                        + k_packed_idx[None, :] * kp_stride)
-            b_packed = tl.load(b_p_ptrs, mask=mask_k[None, :], other=0)
-            b_packed = b_packed.to(tl.int32)
-
-            k_scale_idx = k_idx // 32
-            b_s_ptrs = (scale_ptr + offs_n[:, None] * s_n_stride
-                        + k_scale_idx[None, :] * s_kb_stride)
-            b_scale = tl.load(b_s_ptrs, mask=mask_k[None, :], other=127)
-            b_scale_f32 = b_scale.to(tl.uint8).to(tl.int32)
-            b_scale_f32 = (b_scale_f32 << 23).to(tl.float32, bitcast=True)
-
-            b_lo = b_packed & 0x0F
-            b_hi = (b_packed >> 4) & 0x0F
-            b_lo_f32 = _decode_fp4_e2m1(b_lo) * b_scale_f32
-            b_hi_f32 = _decode_fp4_e2m1(b_hi) * b_scale_f32
-
-            b_f32 = tl.zeros([BN, BK], dtype=tl.float32)
-            k_even = (k_parity[None, :] == 0)
-            k_odd = (k_parity[None, :] == 1)
-            b_f32 = tl.where(k_even, b_lo_f32, b_f32)
-            b_f32 = tl.where(k_odd, b_hi_f32, b_f32)
-            return b_f32
-
-        w1_f32 = _load_decode_fp4(
-            w1_packed_ptr, w1_scale_ptr,
-            stride_w1_n, stride_w1_kp,
-            stride_w1s_n, stride_w1s_kb)
-        w3_f32 = _load_decode_fp4(
-            w3_packed_ptr, w3_scale_ptr,
-            stride_w3_n, stride_w3_kp,
-            stride_w3s_n, stride_w3s_kb)
-
-        gate_acc += tl.dot(h.to(tl.float32), w1_f32.T)
-        up_acc += tl.dot(h.to(tl.float32), w3_f32.T)
-
-    mask_n = offs_n[None, :] < I
-    gate_ptrs = gate_out_ptr + offs_m[:, None] * stride_gat_m + offs_n[None, :] * stride_gat_n
-    up_ptrs = up_out_ptr + offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n
-    _out_dtype = gate_out_ptr.dtype.element_ty
-    tl.store(gate_ptrs, gate_acc.to(_out_dtype), mask=mask_n)
-    tl.store(up_ptrs, up_acc.to(_out_dtype), mask=mask_n)
-
-
-@triton.jit
-def _triton_fused_down_fp4_kernel(
-    gate_ptr, up_ptr,
-    w2_packed_ptr, w2_scale_ptr,
-    out_ptr,
-    M, D, I, swiglu_limit,
-    stride_gat_m, stride_gat_n,
-    stride_up_m, stride_up_n,
-    stride_w2_n, stride_w2_kp,
-    stride_w2s_n, stride_w2s_kb,
-    stride_out_m, stride_out_n,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-    offs_k = tl.arange(0, BK)
-
-    out_acc = tl.zeros([BM, BN], dtype=tl.float32)
-
-    for k in range(0, I, BK):
-        mask_k = (k + offs_k) < I
-
-        gate_ptrs = gate_ptr + offs_m[:, None] * stride_gat_m + (k + offs_k)[None, :] * stride_gat_n
-        gate_tile = tl.load(gate_ptrs, mask=mask_k[None, :], other=0.0)
-
-        up_ptrs = up_ptr + offs_m[:, None] * stride_up_m + (k + offs_k)[None, :] * stride_up_n
-        up_tile = tl.load(up_ptrs, mask=mask_k[None, :], other=0.0)
-
-        gate_f32 = gate_tile.to(tl.float32)
-        up_f32 = up_tile.to(tl.float32)
-        gate_f32 = tl.minimum(gate_f32, swiglu_limit)
-        up_f32 = tl.minimum(tl.maximum(up_f32, -swiglu_limit), swiglu_limit)
-        activated = gate_f32 * tl.sigmoid(gate_f32.to(tl.float32)) * up_f32
-
-        k_idx = k + offs_k
-        k_packed_idx = k_idx // 2
-        k_parity = k_idx % 2
-
-        w2p_ptrs = (w2_packed_ptr + offs_n[:, None] * stride_w2_n
-                    + k_packed_idx[None, :] * stride_w2_kp)
-        w2_packed = tl.load(w2p_ptrs, mask=mask_k[None, :], other=0)
-        w2_packed = w2_packed.to(tl.int32)
-
-        k_scale_idx = k_idx // 32
-        w2s_ptrs = (w2_scale_ptr + offs_n[:, None] * stride_w2s_n
-                    + k_scale_idx[None, :] * stride_w2s_kb)
-        w2_scale = tl.load(w2s_ptrs, mask=mask_k[None, :], other=127)
-        w2_scale_f32 = w2_scale.to(tl.uint8).to(tl.int32)
-        w2_scale_f32 = (w2_scale_f32 << 23).to(tl.float32, bitcast=True)
-
-        w2_lo = w2_packed & 0x0F
-        w2_hi = (w2_packed >> 4) & 0x0F
-        w2_lo_f32 = _decode_fp4_e2m1(w2_lo) * w2_scale_f32
-        w2_hi_f32 = _decode_fp4_e2m1(w2_hi) * w2_scale_f32
-
-        w2_f32 = tl.zeros([BN, BK], dtype=tl.float32)
-        k_even = (k_parity[None, :] == 0)
-        k_odd = (k_parity[None, :] == 1)
-        w2_f32 = tl.where(k_even, w2_lo_f32, w2_f32)
-        w2_f32 = tl.where(k_odd, w2_hi_f32, w2_f32)
-
-        out_acc += tl.dot(activated, w2_f32.T)
-
-    out_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
-    _out_dtype = out_ptr.dtype.element_ty
-    tl.store(out_ptrs, out_acc.to(_out_dtype), mask=offs_n[None, :] < D)
-
+# ──────────────────────────────────────────────────────────────────────
+# Tuning and format detection
+# ──────────────────────────────────────────────────────────────────────
 
 def _tune_blocks(device) -> tuple:
     props = torch.cuda.get_device_properties(device)
@@ -346,6 +152,36 @@ def _is_fp4_packed(data: torch.Tensor) -> bool:
     return data is not None and data.dtype == torch.int8
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Per-inference dequantization cache (avoids repeated FP4→BF16 for
+# experts reused during token-by-token decode)
+# ──────────────────────────────────────────────────────────────────────
+
+_deq_cache: dict = {}          # packed_ptr → (w1_bf16, w3_bf16, w2_bf16)
+_deq_cache_order: list = []    # LRU order of keys
+_DEQ_CACHE_SIZE = 64
+_deq_cache_hits: int = 0
+_deq_cache_misses: int = 0
+
+
+def clear_deq_cache():
+    """Clear the dequantization cache. Call at start of each generate()."""
+    global _deq_cache, _deq_cache_order, _deq_cache_hits, _deq_cache_misses
+    _deq_cache.clear()
+    _deq_cache_order.clear()
+    _deq_cache_hits = 0
+    _deq_cache_misses = 0
+
+
+def deq_cache_stats() -> tuple[int, int]:
+    """Return (hits, misses) since last clear."""
+    return _deq_cache_hits, _deq_cache_misses
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────
+
 def fused_expert_ffn_triton(
     hidden: torch.Tensor,
     w1: torch.Tensor,
@@ -360,63 +196,40 @@ def fused_expert_ffn_triton(
         return fused_expert_ffn_pt(hidden, w1, w3, w2, swiglu_limit)
 
     M = hidden.shape[0]
-    D = w1.shape[1] if w1 is not None else 0
-    I = w1.shape[0] if w1 is not None else 0
+    H = hidden.shape[1]
+
+    # Dequantize FP4 to BF16 first, then use unified BF16 kernels
+    if _is_fp4_packed(w1):
+        cache_key = w1.data_ptr()
+        cached = _deq_cache.get(cache_key)
+        if cached is not None:
+            global _deq_cache_hits
+            _deq_cache_hits += 1
+            w1, w3, w2 = cached
+        else:
+            global _deq_cache_misses
+            _deq_cache_misses += 1
+            w1, w3, w2 = _dequantize_fp4_to_bf16(
+                w1, w1_scale, w3, w3_scale, w2, w2_scale)
+            _deq_cache[cache_key] = (w1, w3, w2)
+            _deq_cache_order.append(cache_key)
+            while len(_deq_cache_order) > _DEQ_CACHE_SIZE:
+                old_key = _deq_cache_order.pop(0)
+                _deq_cache.pop(old_key, None)
+
+    D = w1.shape[1]
+    I = w1.shape[0]
+
+    assert H == D, f"hidden dim mismatch: hidden={H} vs weight D={D}"
+    assert w2.shape[0] == D and w2.shape[1] == I, \
+        f"w2 shape mismatch: got {w2.shape}, expected ({D}, {I})"
 
     if M == 0 or D == 0:
         return torch.zeros(M, D, device=hidden.device, dtype=hidden.dtype)
 
-    use_fp4 = _is_fp4_packed(w1)
-
-    if not use_fp4:
-        return fused_expert_ffn_pt(hidden, w1, w3, w2, swiglu_limit)
     BM, BN, BK = _tune_blocks(hidden.device)
 
-    if use_fp4 and w1_scale is not None and w3_scale is not None:
-        gate = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
-        up = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
-
-        grid_m = triton.cdiv(M, BM)
-        grid_n = triton.cdiv(I, BN)
-        grid = (grid_m, grid_n)
-
-        _triton_fused_gate_up_fp4_kernel[grid](
-            hidden,
-            w1, w1_scale,
-            w3, w3_scale,
-            gate, up,
-            M, I, D, swiglu_limit,
-            hidden.stride(0), hidden.stride(1),
-            w1.stride(0), w1.stride(1),
-            w1_scale.stride(0), w1_scale.stride(1),
-            w3.stride(0), w3.stride(1),
-            w3_scale.stride(0), w3_scale.stride(1),
-            gate.stride(0), gate.stride(1),
-            up.stride(0), up.stride(1),
-            BM=BM, BN=BN, BK=BK,
-            num_stages=1,
-        )
-
-        out = torch.empty(M, D, device=hidden.device, dtype=hidden.dtype)
-        grid_down_m = triton.cdiv(M, BM)
-        grid_down_n = triton.cdiv(D, BN)
-        grid_down = (grid_down_m, grid_down_n)
-
-        _triton_fused_down_fp4_kernel[grid_down](
-            gate, up,
-            w2, w2_scale,
-            out,
-            M, D, I, swiglu_limit,
-            gate.stride(0), gate.stride(1),
-            up.stride(0), up.stride(1),
-            w2.stride(0), w2.stride(1),
-            w2_scale.stride(0), w2_scale.stride(1),
-            out.stride(0), out.stride(1),
-            BM=BM, BN=BN, BK=BK,
-            num_stages=1,
-        )
-        return out
-
+    # Phase 1: gate_proj + up_proj (fused, shares hidden tile load)
     gate = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
     up = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
 
@@ -438,6 +251,7 @@ def fused_expert_ffn_triton(
         num_stages=1,
     )
 
+    # Phase 2: SwiGLU activation + down_proj (fused, no intermediate global mem write)
     out = torch.empty(M, D, device=hidden.device, dtype=hidden.dtype)
     grid_down_m = triton.cdiv(M, BM)
     grid_down_n = triton.cdiv(D, BN)
@@ -453,6 +267,7 @@ def fused_expert_ffn_triton(
         w2.stride(0), w2.stride(1),
         out.stride(0), out.stride(1),
         BM=BM, BN=BN, BK=BK,
+        num_stages=1,
     )
     return out
 
@@ -472,17 +287,9 @@ def fused_expert_ffn_pt(
     return activated @ w2.t()
 
 
-def build_fp4_stride_info(
-    w1_packed: torch.Tensor, w1_scale: torch.Tensor,
-    w3_packed: torch.Tensor, w3_scale: torch.Tensor,
-    w2_packed: torch.Tensor, w2_scale: torch.Tensor,
-) -> dict:
-    return {
-        "w1_packed": w1_packed, "w1_scale": w1_scale,
-        "w3_packed": w3_packed, "w3_scale": w3_scale,
-        "w2_packed": w2_packed, "w2_scale": w2_scale,
-    }
-
+# ──────────────────────────────────────────────────────────────────────
+# MoE orchestrator classes
+# ──────────────────────────────────────────────────────────────────────
 
 class FusedMoEFFN:
     def __init__(
@@ -572,24 +379,14 @@ class FusedMoEFFN:
 
             if len(weights) == 3:
                 w1_d, w3_d, w2_d = weights
-                fp4_info = None
+                out_slice = expert_fn(h_slice, w1_d, w3_d, w2_d, self.swiglu_limit)
             elif len(weights) == 6:
                 w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights
-                fp4_info = {
-                    "w1_scale": w1_s, "w3_scale": w3_s, "w2_scale": w2_s,
-                }
-            else:
-                continue
-
-            if fp4_info is not None and self.use_triton:
                 out_slice = expert_fn(
                     h_slice, w1_d, w3_d, w2_d, self.swiglu_limit,
-                    w1_scale=fp4_info["w1_scale"],
-                    w3_scale=fp4_info["w3_scale"],
-                    w2_scale=fp4_info["w2_scale"],
-                )
+                    w1_scale=w1_s, w3_scale=w3_s, w2_scale=w2_s)
             else:
-                out_slice = expert_fn(h_slice, w1_d, w3_d, w2_d, self.swiglu_limit)
+                continue
 
             expanded_out[start:end] = out_slice.to(expanded_out.dtype)
 
@@ -619,10 +416,22 @@ class FusedMoEFFN:
                 weights_val = load_expert_fn(layer_idx, eid)
                 if weights_val is None:
                     continue
-                w1_d, w3_d, w2_d = weights_val
-                h_batch = hidden_states[token_mask].to(w1_d.dtype)
-                activated = self._swiglu(h_batch, w1_d, w3_d)
-                out = activated.to(w2_d.dtype) @ w2_d.t()
+
+                h_batch = hidden_states[token_mask].to(
+                    weights_val[0].dtype if weights_val[0].dtype == torch.bfloat16
+                    else torch.bfloat16)
+
+                if len(weights_val) == 3:
+                    w1_d, w3_d, w2_d = weights_val
+                    activated = self._swiglu(h_batch, w1_d, w3_d)
+                    out = activated.to(w2_d.dtype) @ w2_d.t()
+                elif len(weights_val) == 6:
+                    w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights_val
+                    out = fused_expert_ffn_triton(
+                        h_batch, w1_d, w3_d, w2_d, self.swiglu_limit,
+                        w1_scale=w1_s, w3_scale=w3_s, w2_scale=w2_s)
+                else:
+                    continue
                 result[token_mask] += out * weights[token_mask].unsqueeze(-1)
 
         return result

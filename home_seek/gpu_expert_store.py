@@ -73,7 +73,10 @@ class AllExpertFP4Store:
                     load("w3.weight"), load("w3.scale"),
                     load("w2.weight"), load("w2.scale"),
                 )
-        except Exception:
+        except Exception as e:
+            import sys
+            print(f"[gpu_expert_store] Failed to load expert ({layer_idx},{expert_idx}) "
+                  f"from {target_file}: {type(e).__name__}", file=sys.stderr)
             return None
 
     def cache_on_gpu(self, layer_idx: int, expert_idx: int,
