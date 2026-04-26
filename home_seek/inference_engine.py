@@ -352,6 +352,9 @@ class HomeSeekInferenceEngine:
         self._cpu_fallback_layers = set(range(min(3, self.config.num_hidden_layers))) | set(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
         self._hot_expert_ids = []
         self._hash_expert_ids = []
+        self._hot_expert_set = set()
+        self._gpu_hot_experts = {}
+        self._max_hot_experts = 16
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -383,6 +386,8 @@ class HomeSeekInferenceEngine:
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
         self._init_prefetch()
+        if self._hot_expert_ids:
+            self._preload_gpu_hot_experts()
         if preload_all:
             self._preload_all_experts()
         warmup_ok = self._warmup()
@@ -401,10 +406,26 @@ class HomeSeekInferenceEngine:
         with open(hot_experts_path) as f:
             data = json.load(f)
         self._hot_expert_ids = data.get("top_16_hot_experts", [])
+        self._hot_expert_set = set(self._hot_expert_ids)
         hash_ids = data.get("hash_layer_expert_ids", [])
         self._hash_expert_ids = hash_ids[:18] if len(hash_ids) > 18 else hash_ids
         self._log(f"Hot experts: {len(self._hot_expert_ids)} IDs, "
                   f"Hash experts: {len(self._hash_expert_ids)} IDs")
+
+    def _preload_gpu_hot_experts(self):
+        if not self._hot_expert_ids:
+            return
+        count = 0
+        for layer in range(min(2, self.config.num_hidden_layers)):
+            for eid in self._hot_expert_ids[:8]:
+                if (layer, eid) not in self._gpu_hot_experts:
+                    self._load_expert_fp4_raw(layer, eid)
+                    count += 1
+                if len(self._gpu_hot_experts) >= self._max_hot_experts:
+                    break
+            if len(self._gpu_hot_experts) >= self._max_hot_experts:
+                break
+        self._log(f"Pre-loaded {count} hot expert BF16 weights on GPU")
 
     def _init_prefetch(self):
         if self._prefetch_enabled and self._prefetch_worker is None:
@@ -1068,6 +1089,10 @@ class HomeSeekInferenceEngine:
         return deq
 
     def _load_expert_fp4_raw(self, layer_idx, eid):
+        hot_key = (layer_idx, eid)
+        if hot_key in self._gpu_hot_experts:
+            return self._gpu_hot_experts[hot_key]
+
         raw = self._load_expert_raw(layer_idx, eid)
         if raw is None:
             return None
@@ -1112,7 +1137,90 @@ class HomeSeekInferenceEngine:
                         if w2_scale.dtype != torch.float32
                         else w2_scale)
 
+        if eid in self._hot_expert_set:
+            w1_b = load_fp4_weight(w1_data, w1_scale).to(torch.bfloat16).to(self.device)
+            w3_b = load_fp4_weight(w3_data, w3_scale).to(torch.bfloat16).to(self.device)
+            w2_b = load_fp4_weight(w2_data, w2_scale).to(torch.bfloat16).to(self.device)
+            if len(self._gpu_hot_experts) >= self._max_hot_experts:
+                self._gpu_hot_experts.pop(next(iter(self._gpu_hot_experts)))
+            self._gpu_hot_experts[hot_key] = (w1_b, w3_b, w2_b)
+            self._log(f"Cached hot expert ({layer_idx},{eid}) as BF16 on GPU")
+            return (w1_b, w3_b, w2_b)
+
         return (w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
+
+    def _load_gpu_hot_expert_bf16(self, layer: int, eid: int):
+        key = (layer, eid)
+        if key in self._gpu_hot_experts:
+            return self._gpu_hot_experts[key]
+        result = self._load_expert_fp4_raw(layer, eid)
+        if result is None:
+            return None
+        if len(result) == 3:
+            return result
+        if len(result) == 6:
+            w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = result
+            w1_b = load_fp4_weight(w1_d, w1_s).to(torch.bfloat16).to(self.device)
+            w3_b = load_fp4_weight(w3_d, w3_s).to(torch.bfloat16).to(self.device)
+            w2_b = load_fp4_weight(w2_d, w2_s).to(torch.bfloat16).to(self.device)
+            if len(self._gpu_hot_experts) >= self._max_hot_experts:
+                self._gpu_hot_experts.pop(next(iter(self._gpu_hot_experts)))
+            self._gpu_hot_experts[key] = (w1_b, w3_b, w2_b)
+            return (w1_b, w3_b, w2_b)
+        return None
+
+    def _forward_ffn_hot_batched(self, flat_hidden, flat_topk_idx, flat_topk_w, layer_idx):
+        B, D = flat_hidden.shape
+        num_topk = flat_topk_idx.shape[1]
+        all_eids = set()
+        for b in range(B):
+            for k in range(num_topk):
+                eid = int(flat_topk_idx[b, k].item())
+                if eid >= 0:
+                    all_eids.add(eid)
+        if not all_eids:
+            return torch.zeros_like(flat_hidden)
+        loaded = {}
+        I_dim = None
+        for eid in sorted(all_eids):
+            weights = self._load_gpu_hot_expert_bf16(layer_idx, eid)
+            if weights is None:
+                return None
+            w1, w3, w2 = weights
+            if I_dim is None:
+                I_dim = w1.shape[0]
+            loaded[eid] = (w1, w3, w2)
+        loaded_eids = sorted(loaded.keys())
+        eid_to_idx = {eid: i for i, eid in enumerate(loaded_eids)}
+        num_e = len(loaded_eids)
+        w1 = torch.cat([loaded[eid][0] for eid in loaded_eids], dim=0)
+        w3 = torch.cat([loaded[eid][1] for eid in loaded_eids], dim=0)
+        w2 = torch.cat([loaded[eid][2] for eid in loaded_eids], dim=1)
+        gate = flat_hidden.to(w1.dtype) @ w1.T
+        up = flat_hidden.to(w3.dtype) @ w3.T
+        g = gate.float().clamp(max=self.config.swiglu_limit)
+        u = up.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+        activated = (g * g.sigmoid() * u).to(torch.bfloat16)
+        routing = torch.zeros(B, num_e * I_dim, device=flat_hidden.device, dtype=torch.bfloat16)
+        for b in range(B):
+            for k in range(num_topk):
+                eid = int(flat_topk_idx[b, k].item())
+                if eid < 0:
+                    continue
+                idx = eid_to_idx.get(eid)
+                if idx is None:
+                    continue
+                routing[b, idx * I_dim:(idx + 1) * I_dim] = flat_topk_w[b, k]
+        activated_weighted = activated * routing
+        return activated_weighted.to(w2.dtype) @ w2.T
+
+    def _all_routed_are_hot(self, topk_idx) -> bool:
+        for b in range(topk_idx.shape[0]):
+            for k in range(topk_idx.shape[1]):
+                eid = int(topk_idx[b, k].item())
+                if eid >= 0 and eid not in self._hot_expert_set:
+                    return False
+        return True
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
@@ -1134,6 +1242,23 @@ class HomeSeekInferenceEngine:
         flat_hidden = hidden_states.reshape(total_tokens, D)
         flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
         flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
+
+        if self._hot_expert_set and total_tokens > 0:
+            try:
+                if self._all_routed_are_hot(flat_topk_idx):
+                    hot_result = self._forward_ffn_hot_batched(
+                        flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
+                    if hot_result is not None:
+                        ffn_out = hot_result.reshape(B, T, D)
+                        shared_w = self._get_shared_expert(layer_idx)
+                        if shared_w is not None:
+                            w1_d, w3_d, w2_d = shared_w
+                            shared_out = self._shared_ffn.forward(
+                                hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
+                            ffn_out = ffn_out + shared_out
+                        return ffn_out, used_experts
+            except Exception:
+                pass
 
         try:
             def _fp4_load(layer, eid):
