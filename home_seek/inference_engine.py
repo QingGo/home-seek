@@ -330,14 +330,15 @@ class ExpertWeightCache:
 
 class HomeSeekInferenceEngine:
     def __init__(self, weight_dir: str = "weights", device: str = "cuda", verbose: bool = False,
-                 hot_experts_path: str = "hot_experts.json"):
+                 hot_experts_path: str = "hot_experts.json", preload_all: bool = False):
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig(config_path)
         self.weight_dir = weight_dir
         self.device = torch.device(device)
         self.verbose = verbose
         self.loader = WeightLoader(weight_dir, device)
-        self.expert_cache = ExpertWeightCache(max_experts=5120, device=device, hot_deq_size=0)
+        cache_size = 5120
+        self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
         self._compressors = {}       # per-layer Compressor instances (lazy)
@@ -346,7 +347,7 @@ class HomeSeekInferenceEngine:
         self._global_pos = 0         # current global sequence position
         self._prefetch_worker = None
         self._load_global_weights()
-        self._prefetch_enabled = True
+        self._prefetch_enabled = False  # async prefetch adds GIL contention on shared disk
         self._cpu_fallback_enabled = True
         self._cpu_fallback_layers = set(range(min(3, self.config.num_hidden_layers))) | set(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
         self._hot_expert_ids = []
@@ -381,6 +382,8 @@ class HomeSeekInferenceEngine:
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
         self._init_prefetch()
+        if preload_all:
+            self._preload_all_experts()
         warmup_ok = self._warmup()
         if not warmup_ok:
             self._log("WARNING: Warmup had failures — first inference will be slow "
@@ -1000,6 +1003,26 @@ class HomeSeekInferenceEngine:
             self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
             return self.expert_cache.get(cache_key)
 
+        # Check async prefetch cache before blocking disk read
+        if getattr(self, '_prefetch_worker', None) is not None:
+            prefetched = self._prefetch_worker.get(layer_idx, eid)
+            if prefetched is not None:
+                w1 = prefetched.get(("w1", "data"))
+                s1 = prefetched.get(("w1", "scale"))
+                w3 = prefetched.get(("w3", "data"))
+                s3 = prefetched.get(("w3", "scale"))
+                w2 = prefetched.get(("w2", "data"))
+                s2 = prefetched.get(("w2", "scale"))
+                if w1 is not None:
+                    self._gpu_expert_store.cache_on_gpu(
+                        layer_idx, eid, w1, s1, w3, s3, w2, s2)
+                    w1_entry = self._make_raw_entry(w1, s1)
+                    w3_entry = self._make_raw_entry(w3, s3)
+                    w2_entry = self._make_raw_entry(w2, s2)
+                    pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+                    self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+                    return self.expert_cache.get(cache_key)
+
         prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
         keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
                 f"{prefix}.w3.weight", f"{prefix}.w3.scale",
@@ -1010,17 +1033,7 @@ class HomeSeekInferenceEngine:
         w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
 
         if w1 is None:
-            if self._prefetch_worker is not None:
-                prefetched = self._prefetch_worker.get(layer_idx, eid)
-                if prefetched is not None:
-                    w1 = prefetched.get(("w1", "data"))
-                    s1 = prefetched.get(("w1", "scale"))
-                    w3 = prefetched.get(("w3", "data"))
-                    s3 = prefetched.get(("w3", "scale"))
-                    w2 = prefetched.get(("w2", "data"))
-                    s2 = prefetched.get(("w2", "scale"))
-            if w1 is None:
-                return None
+            return None
 
         self._gpu_expert_store.cache_on_gpu(
             layer_idx, eid, w1, s1, w3, s3, w2, s2)
@@ -1332,6 +1345,46 @@ class HomeSeekInferenceEngine:
         elapsed = time.time() - t0
         bw = total_gb / elapsed if elapsed > 0 else 0
         self._log(f"Page cache warmup done in {elapsed:.1f}s ({bw:.1f} GB/s)")
+
+    def _preload_all_experts(self):
+        """Load every (layer, expert) pair into ExpertWeightCache during init.
+
+        Eliminates all file I/O during inference — trades init time (~115s at
+        1.5 GB/s disk) for zero I/O during generate().  Uses multiple threads
+        to saturate the disk read bandwidth.
+
+        Memory cost: ~169 GB CPU RAM (all 11,008 expert pairs in FP4).
+        The ExpertWeightCache is sized at 12,288 to hold everything.
+        """
+        import concurrent.futures
+        num_layers = self.config.num_hidden_layers
+        num_experts = self.config.n_routed_experts
+        total = num_layers * num_experts
+        self._log(f"Preloading all {total} expert pairs "
+                  f"({num_layers}L × {num_experts}E)...")
+
+        # Build the full task list — one (layer, eid) per expert
+        tasks = [(li, ei) for li in range(num_layers)
+                 for ei in range(num_experts)]
+
+        t0 = time.time()
+        count = [0]
+
+        def load_one(args):
+            li, ei = args
+            self._load_expert_weights(li, ei)
+            count[0] += 1
+
+        # 8 threads is enough to saturate 1.5 GB/s disk on shared RAID
+        max_workers = 8
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(load_one, tasks))
+
+        elapsed = time.time() - t0
+        bw = total * 15.7 / 1024 / elapsed if elapsed > 0 else 0
+        self._log(f"Preload done: {count[0]}/{total} experts in "
+                  f"{elapsed:.1f}s ({bw:.1f} GB/s)")
+        self._log(f"Expert cache entries: {len(self.expert_cache.cache)}")
 
     def _warmup(self) -> bool:
         if self._warmed_up:

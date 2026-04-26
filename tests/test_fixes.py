@@ -538,15 +538,16 @@ class TestPrefetchWorker:
         from home_seek.prefetch_worker import AsyncPrefetchWorker
         worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
         assert worker is not None
-        assert worker._stream is not None
+        assert worker._worker.is_alive()
         worker.shutdown()
 
     def test_async_prefetch_clear(self):
         from home_seek.prefetch_worker import AsyncPrefetchWorker
         worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
-        worker._prefetch_cache[(0, 1)] = "dummy"
+        with worker._cache_lock:
+            worker._prefetch_cache[(0, 1)] = "dummy"
         worker.clear()
-        assert len(worker._prefetch_cache) == 0
+        assert worker.size() == 0
         worker.shutdown()
 
     def test_async_prefetch_get_missing(self):
@@ -560,8 +561,7 @@ class TestPrefetchWorker:
         from home_seek.prefetch_worker import AsyncPrefetchWorker
         worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
         worker.prefetch(0, [])
-        assert len(worker._pending_keys) == 0
-        assert len(worker._prefetch_cache) == 0
+        assert worker.size() == 0
         worker.shutdown()
 
 

@@ -444,6 +444,7 @@ def run_profile(args):
         weight_dir, device="cuda", verbose=args.verbose,
         hot_experts_path=os.path.join(weight_dir, "..", "hot_experts.json")
         if not os.path.exists(args.hot_experts) else args.hot_experts,
+        preload_all=args.preload_all,
     )
     if args.prefetch:
         engine._prefetch_enabled = True
@@ -605,6 +606,8 @@ def main():
     parser.add_argument("--use-mtp", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--prefetch", action="store_true")
+    parser.add_argument("--preload-all", action="store_true",
+                        help="Pre-load all experts to CPU RAM during init (eliminates file I/O)")
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--hot-experts", default="hot_experts.json")
     parser.add_argument("--output", default=None)
