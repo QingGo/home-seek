@@ -1,0 +1,7 @@
+!.venv/
+!docs/arch_design.md
+!docs/paper.md
+!weights/
+!TileKernels/
+!.agent_memory.md
+!docs/implementation_notes.md

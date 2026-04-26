@@ -242,21 +242,22 @@ class TestKVCache:
         assert "allocated_gb" in stats
 
     def test_compressed_kv_cache(self):
-        from home_seek.inference_engine import CompressedKVCache
-        c = CompressedKVCache(compress_ratio=4, dim=512, device="cuda")
+        from home_seek.hybrid_kv_cache import HybridKVCache
+        c = HybridKVCache(compress_ratio=4, head_dim=512, device="cuda")
         t1 = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16)
         t2 = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
-        c.append(t1)
-        c.append(t2)
-        assert c.get().shape == (5, 512)
+        for t in [t1, t2]:
+            for i in range(t.shape[0]):
+                c.append_compressed(t[i:i+1])
+        result = c.get_compressed_kv()
+        assert result is not None and result.shape == (5, 512)
 
     def test_get_compressed_attention_kv(self):
-        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState, CompressedKVCache
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.config = type('obj', (object,), {'head_dim': 512})()
         state = LayerState()
-        state.compressed_kv = CompressedKVCache(4, 512, "cuda")
-        state.compressed_kv.append(torch.randn(4, 512, device="cuda", dtype=torch.bfloat16))
+        state.compressed_kv_data = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
         result = eng._get_compressed_attention_kv(state, {})
         assert result is not None and result.dim() == 4
 
@@ -277,8 +278,8 @@ class TestKVCache:
         }
         state = LayerState()
         eng._compress_kv(hidden, lw, 0, state)
-        assert state.compressed_kv is not None
-        c = state.compressed_kv.get()
+        assert state.compressed_kv_data is not None
+        c = state.compressed_kv_data
         assert c.shape[0] >= T // 4 and c.shape[1] == 512
 
 
@@ -332,7 +333,7 @@ class TestCSAIndexer:
             pytest.skip("CUDA not available")
 
     def test_compute_indexer_shapes(self):
-        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState, CompressedKVCache
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         from home_seek.model_config import DeepSeekV4FlashConfig
         config = DeepSeekV4FlashConfig()
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
@@ -346,11 +347,8 @@ class TestCSAIndexer:
         num_compressed = 600
         idx_dim = config.index_head_dim
         state = LayerState(device="cuda")
-        state.compressed_kv = CompressedKVCache(4, config.kv_lora_rank, "cuda", idx_dim=idx_dim)
-        state.compressed_kv.append(
-            torch.randn(num_compressed, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16),
-            torch.randn(num_compressed, idx_dim, device="cuda", dtype=torch.bfloat16)
-        )
+        state.compressed_kv_data = torch.randn(num_compressed, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+        state.compressed_kv_idx = torch.randn(num_compressed, idx_dim, device="cuda", dtype=torch.bfloat16)
 
         lw = {
             "attn.indexer.wq_b.weight": torch.randn(
@@ -358,7 +356,7 @@ class TestCSAIndexer:
                 device="cuda", dtype=torch.bfloat16),
         }
 
-        result = eng._compute_indexer(q_latent, lw, state, 0)
+        result = eng._compute_indexer(q_latent, torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16), lw, state, 0)
         assert result is not None
         assert result.dim() == 4, f"Expected 4D, got {result.dim()}D"
         B_r, n_kv_r, seq_r, hd_r = result.shape
@@ -367,7 +365,7 @@ class TestCSAIndexer:
         assert seq_r == config.index_topk, f"Expected {config.index_topk} selected, got {seq_r}"
 
     def test_compute_indexer_no_weights_fallback(self):
-        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState, CompressedKVCache
+        from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         from home_seek.model_config import DeepSeekV4FlashConfig
         config = DeepSeekV4FlashConfig()
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
@@ -379,10 +377,9 @@ class TestCSAIndexer:
         q_latent = torch.randn(B, T, q_rank, device="cuda", dtype=torch.bfloat16)
 
         state = LayerState(device="cuda")
-        state.compressed_kv = CompressedKVCache(4, config.kv_lora_rank, "cuda")
-        state.compressed_kv.append(torch.randn(2, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16))
+        state.compressed_kv_data = torch.randn(2, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16)
 
-        result = eng._compute_indexer(q_latent, {}, state, 0)
+        result = eng._compute_indexer(q_latent, torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16), {}, state, 0)
         assert result is None, "Should return None when no indexer weights"
 
     def test_csa_attn_dispatch(self):

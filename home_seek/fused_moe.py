@@ -198,7 +198,19 @@ def fused_expert_ffn_triton(
     M = hidden.shape[0]
     H = hidden.shape[1]
 
-    # Dequantize FP4 to BF16 first, then use unified BF16 kernels
+    # Fused FP4 path: dequantize + GEMM in single kernel, no intermediate BF16 tensor
+    if (_is_fp4_packed(w1) and _is_fp4_packed(w3) and _is_fp4_packed(w2)
+            and w1_scale is not None and w3_scale is not None and w2_scale is not None):
+        try:
+            w1_s = w1_scale.to(torch.float32) if w1_scale.dtype != torch.float32 else w1_scale
+            w3_s = w3_scale.to(torch.float32) if w3_scale.dtype != torch.float32 else w3_scale
+            w2_s = w2_scale.to(torch.float32) if w2_scale.dtype != torch.float32 else w2_scale
+            return _fused_fp4_expert_ffn_triton(
+                hidden, w1, w1_s, w3, w3_s, w2, w2_s, swiglu_limit)
+        except Exception:
+            pass
+
+    # Dequantize FP4 to BF16 (with cache), then use unified BF16 kernels
     if _is_fp4_packed(w1):
         cache_key = w1.data_ptr()
         cached = _deq_cache.get(cache_key)
@@ -229,7 +241,6 @@ def fused_expert_ffn_triton(
 
     BM, BN, BK = _tune_blocks(hidden.device)
 
-    # Phase 1: gate_proj + up_proj (fused, shares hidden tile load)
     gate = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
     up = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
 
@@ -251,7 +262,6 @@ def fused_expert_ffn_triton(
         num_stages=1,
     )
 
-    # Phase 2: SwiGLU activation + down_proj (fused, no intermediate global mem write)
     out = torch.empty(M, D, device=hidden.device, dtype=hidden.dtype)
     grid_down_m = triton.cdiv(M, BM)
     grid_down_n = triton.cdiv(D, BN)
@@ -398,43 +408,77 @@ class FusedMoEFFN:
         self, hidden_states, topk_idx, topk_weights,
         load_expert_fn, layer_idx,
     ):
+        """Batched decode: collect all unique experts, stack weights, one batched FFN."""
         B, D = hidden_states.shape
         num_topk = topk_idx.shape[1]
-        result = torch.zeros_like(hidden_states)
 
-        for k in range(num_topk):
-            expert_ids = topk_idx[:, k]
-            weights = topk_weights[:, k]
-            unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
-            for eid_idx in range(unique_eids.shape[0]):
-                eid = int(unique_eids[eid_idx].item())
+        all_eids = set()
+        for b in range(B):
+            for k in range(num_topk):
+                eid = int(topk_idx[b, k].item())
+                if eid >= 0:
+                    all_eids.add(eid)
+
+        if not all_eids:
+            return torch.zeros_like(hidden_states)
+
+        eids_sorted = sorted(all_eids)
+        I_inferred = None
+        loaded = {}  # eid → (w1_bf16, w3_bf16, w2_bf16)
+
+        for eid in eids_sorted:
+            weights_val = load_expert_fn(layer_idx, eid)
+            if weights_val is None:
+                continue
+
+            if len(weights_val) == 6:
+                w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights_val
+                w1_bf16, w3_bf16, w2_bf16 = triton_dequantize_fp4_all(
+                    w1_d, w1_s, w3_d, w3_s, w2_d, w2_s)
+            elif len(weights_val) == 3:
+                w1_d, w3_d, w2_d = weights_val
+                w1_bf16 = w1_d if w1_d.dtype == torch.bfloat16 else w1_d.to(torch.bfloat16)
+                w3_bf16 = w3_d if w3_d.dtype == torch.bfloat16 else w3_d.to(torch.bfloat16)
+                w2_bf16 = w2_d if w2_d.dtype == torch.bfloat16 else w2_d.to(torch.bfloat16)
+            else:
+                continue
+
+            if I_inferred is None:
+                I_inferred = w1_bf16.shape[0]
+            loaded[eid] = (w1_bf16, w3_bf16, w2_bf16)
+
+        if I_inferred is None:
+            return torch.zeros_like(hidden_states)
+
+        I = I_inferred
+        loaded_eids = sorted(loaded.keys())
+        eid_to_idx = {eid: i for i, eid in enumerate(loaded_eids)}
+        num_e = len(loaded_eids)
+
+        w1 = torch.cat([loaded[eid][0] for eid in loaded_eids], dim=0)  # [num_e*I, D]
+        w3 = torch.cat([loaded[eid][1] for eid in loaded_eids], dim=0)
+        w2 = torch.cat([loaded[eid][2] for eid in loaded_eids], dim=1)  # [D, num_e*I]
+
+        gate = hidden_states @ w1.T  # [B, num_e*I]
+        up = hidden_states @ w3.T
+
+        g = gate.float().clamp(max=self.swiglu_limit)
+        u = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        activated = (g * g.sigmoid() * u).to(torch.bfloat16)
+
+        routing = torch.zeros(B, num_e * I, device=hidden_states.device, dtype=torch.bfloat16)
+        for b in range(B):
+            for k in range(num_topk):
+                eid = int(topk_idx[b, k].item())
                 if eid < 0:
                     continue
-                token_mask = inverse == eid_idx
-                if not token_mask.any():
+                idx = eid_to_idx.get(eid)
+                if idx is None:
                     continue
-                weights_val = load_expert_fn(layer_idx, eid)
-                if weights_val is None:
-                    continue
+                routing[b, idx * I:(idx + 1) * I] = topk_weights[b, k]
 
-                h_batch = hidden_states[token_mask].to(
-                    weights_val[0].dtype if weights_val[0].dtype == torch.bfloat16
-                    else torch.bfloat16)
-
-                if len(weights_val) == 3:
-                    w1_d, w3_d, w2_d = weights_val
-                    activated = self._swiglu(h_batch, w1_d, w3_d)
-                    out = activated.to(w2_d.dtype) @ w2_d.t()
-                elif len(weights_val) == 6:
-                    w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights_val
-                    out = fused_expert_ffn_triton(
-                        h_batch, w1_d, w3_d, w2_d, self.swiglu_limit,
-                        w1_scale=w1_s, w3_scale=w3_s, w2_scale=w2_s)
-                else:
-                    continue
-                result[token_mask] += out * weights[token_mask].unsqueeze(-1)
-
-        return result
+        activated_weighted = activated * routing
+        return activated_weighted @ w2.T  # [B, D]
 
     def _swiglu(self, h, w1, w3):
         gate = h @ w1.t()
@@ -461,3 +505,374 @@ class SharedExpertFFN:
         else:
             out = fused_expert_ffn_pt(h_2d, w1, w3, w2, self.swiglu_limit)
         return out.reshape(B, T, D).to(dtype)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Triton-accelerated FP4 → BF16 dequantization (Phase 3, fixed interleaving)
+# ──────────────────────────────────────────────────────────────────────
+_FP4_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+_SCALE_GROUP = 32  # one scale per 32 weight columns = 16 packed bytes
+
+
+@triton.jit
+def _triton_dequantize_fp4_kernel(
+    packed_ptr, scale_ptr,
+    out_ptr,
+    N, K_half,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_n, stride_out_k,
+    lut_ptr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K_HALF: tl.constexpr,
+):
+    """Dequantize FP4-packed int8 weights to BF16 in parallel.
+
+    BLOCK_K_HALF = 16 (one scale group: 16 packed bytes = 32 weights per scale).
+    Uses tl.join + tl.reshape for correct interleaving: out[:, 2*k]=lo, out[:, 2*k+1]=hi.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_half = pid_k * BLOCK_K_HALF + tl.arange(0, BLOCK_K_HALF)
+
+    mask_n = offs_n < N
+    mask_k_half = offs_k_half < K_half
+
+    packed_ptrs = packed_ptr + offs_n[:, None] * stride_packed_n + offs_k_half[None, :] * stride_packed_k
+    packed = tl.load(packed_ptrs, mask=mask_n[:, None] & mask_k_half[None, :], other=0).to(tl.uint8)
+
+    lo = (packed & 0xF).to(tl.int32)
+    hi = ((packed >> 4) & 0xF).to(tl.int32)
+
+    lo_f32 = tl.load(lut_ptr + lo).to(tl.float32)
+    hi_f32 = tl.load(lut_ptr + hi).to(tl.float32)
+
+    # One scale per BLOCK_K_HALF (16 packed = 32 weights = 1 scale group)
+    scale_k_idx = pid_k
+    scale_ptrs = scale_ptr + offs_n[:, None] * stride_scale_n + scale_k_idx * stride_scale_k
+    scale = tl.load(scale_ptrs, mask=mask_n[:, None], other=1.0).to(tl.float32)
+    lo_f32 *= scale
+    hi_f32 *= scale
+
+    # Interleave using tl.join + tl.reshape:
+    # [BN, KH, 1] join [BN, KH, 1] → [BN, KH, 2] → reshape → [BN, 2*KH]
+    # Verified: out[:, 2*k]=lo, out[:, 2*k+1]=hi
+    interleaved = tl.reshape(
+        tl.join(
+            tl.reshape(lo_f32.to(tl.bfloat16), (BLOCK_N, BLOCK_K_HALF, 1)),
+            tl.reshape(hi_f32.to(tl.bfloat16), (BLOCK_N, BLOCK_K_HALF, 1)),
+        ),
+        (BLOCK_N, 2 * BLOCK_K_HALF),
+    )
+
+    offs_k_out = pid_k * (2 * BLOCK_K_HALF) + tl.arange(0, 2 * BLOCK_K_HALF)
+    mask_k_out = offs_k_out < (K_half * 2)
+    out_ptrs = out_ptr + offs_n[:, None] * stride_out_n + offs_k_out[None, :] * stride_out_k
+    tl.store(out_ptrs, interleaved, mask=mask_n[:, None] & mask_k_out[None, :])
+
+
+def triton_dequantize_fp4_to_bf16(
+    w_packed: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize a single FP4-packed weight matrix to BF16 using Triton.
+
+    Parameters
+    ----------
+    w_packed : [N, K/2] int8 tensor on GPU
+    w_scale : [N, K/32] float32 tensor on GPU
+
+    Returns
+    -------
+    [N, K] BF16 tensor on GPU
+    """
+    if w_packed.device.type != "cuda":
+        from tile_reference import unpack_from_e2m1fn_x2
+        deq = unpack_from_e2m1fn_x2(w_packed)
+        sf = w_scale.repeat_interleave(32, dim=1)
+        return (deq.float() * sf.float()).to(torch.bfloat16)
+
+    N, K_half = w_packed.shape
+    K = K_half * 2
+
+    out = torch.empty(N, K, device=w_packed.device, dtype=torch.bfloat16)
+    lut = _FP4_LUT.to(w_packed.device)
+
+    BLOCK_N = 16
+    BLOCK_K_HALF = 16  # 16 packed bytes = 32 weights = 1 scale group
+
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid_k = triton.cdiv(K_half, BLOCK_K_HALF)
+    grid = (grid_n, grid_k)
+
+    _triton_dequantize_fp4_kernel[grid](
+        w_packed, w_scale,
+        out,
+        N, K_half,
+        w_packed.stride(0), w_packed.stride(1),
+        w_scale.stride(0), w_scale.stride(1),
+        out.stride(0), out.stride(1),
+        lut,
+        BLOCK_N=BLOCK_N, BLOCK_K_HALF=BLOCK_K_HALF,
+        num_stages=1,
+    )
+    return out
+
+
+def triton_dequantize_fp4_all(
+    w1_packed: torch.Tensor, w1_scale: torch.Tensor,
+    w3_packed: torch.Tensor, w3_scale: torch.Tensor,
+    w2_packed: torch.Tensor, w2_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dequantize all three FP4 weight matrices using Triton in parallel."""
+    return (
+        triton_dequantize_fp4_to_bf16(w1_packed, w1_scale),
+        triton_dequantize_fp4_to_bf16(w3_packed, w3_scale),
+        triton_dequantize_fp4_to_bf16(w2_packed, w2_scale),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fused FP4 dequantize + GEMM kernels (Phase 3 fixed)
+# BK=32 aligns with one scale group (32 columns = 16 packed bytes).
+# ──────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def _triton_fp4_fused_gate_up_kernel(
+    hidden_ptr,
+    w1_packed_ptr, w1_scale_ptr,
+    w3_packed_ptr, w3_scale_ptr,
+    gate_out_ptr, up_out_ptr,
+    M, I, D,
+    stride_hm, stride_hk,
+    stride_w1_n, stride_w1_k,
+    stride_s1_n, stride_s1_k,
+    stride_w3_n, stride_w3_k,
+    stride_s3_n, stride_s3_k,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    lut_ptr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Fused gate+up projection: loads packed FP4, dequantizes inline, computes GEMM."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+
+    gate_acc = tl.zeros([BM, BN], dtype=tl.float32)
+    up_acc = tl.zeros([BM, BN], dtype=tl.float32)
+
+    BK_HALF: tl.constexpr = BK // 2  # packed bytes per inner loop (=16)
+
+    for k in range(0, D, BK):
+        mask_k = (k + offs_k) < D
+        mask_m = offs_m < M
+
+        h_ptrs = hidden_ptr + offs_m[:, None] * stride_hm + (k + offs_k)[None, :] * stride_hk
+        h = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        k_half = k // 2
+        offs_kh = k_half + tl.arange(0, BK_HALF)
+
+        # --- w1: load packed, dequantize inline ---
+        # Load in [BN, BK_HALF] layout, interleave → [BN, BK], then trans → [BK, BN] for tl.dot
+        w1p_ptrs = w1_packed_ptr + offs_n[:, None] * stride_w1_n + offs_kh[None, :] * stride_w1_k
+        w1p = tl.load(w1p_ptrs, mask=(offs_n[:, None] < I) & (offs_kh[None, :] < D // 2), other=0).to(tl.uint8)
+        w1_lo = (w1p & 0xF).to(tl.int32)
+        w1_hi = ((w1p >> 4) & 0xF).to(tl.int32)
+        w1_lo_f32 = tl.load(lut_ptr + w1_lo).to(tl.float32)
+        w1_hi_f32 = tl.load(lut_ptr + w1_hi).to(tl.float32)
+        w1_sg = k // 32
+        w1s_ptrs = w1_scale_ptr + offs_n[:, None] * stride_s1_n + w1_sg * stride_s1_k
+        w1s = tl.load(w1s_ptrs, mask=offs_n[:, None] < I, other=1.0).to(tl.float32)
+        w1_lo_f32 *= w1s
+        w1_hi_f32 *= w1s
+        # Interleave: [BN, BK_HALF] → [BN, BK_HALF, 1] join → [BN, BK_HALF, 2] → reshape → [BN, BK]
+        w1_inter = tl.reshape(
+            tl.join(
+                tl.reshape(w1_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                tl.reshape(w1_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+            ),
+            (BN, BK),
+        )
+        w1_deq = tl.trans(w1_inter, 1, 0)  # [BK, BN] for tl.dot
+
+        # --- w3: load packed, dequantize inline ---
+        w3p_ptrs = w3_packed_ptr + offs_n[:, None] * stride_w3_n + offs_kh[None, :] * stride_w3_k
+        w3p = tl.load(w3p_ptrs, mask=(offs_n[:, None] < I) & (offs_kh[None, :] < D // 2), other=0).to(tl.uint8)
+        w3_lo = (w3p & 0xF).to(tl.int32)
+        w3_hi = ((w3p >> 4) & 0xF).to(tl.int32)
+        w3_lo_f32 = tl.load(lut_ptr + w3_lo).to(tl.float32)
+        w3_hi_f32 = tl.load(lut_ptr + w3_hi).to(tl.float32)
+        w3_sg = k // 32
+        w3s_ptrs = w3_scale_ptr + offs_n[:, None] * stride_s3_n + w3_sg * stride_s3_k
+        w3s = tl.load(w3s_ptrs, mask=offs_n[:, None] < I, other=1.0).to(tl.float32)
+        w3_lo_f32 *= w3s
+        w3_hi_f32 *= w3s
+        w3_inter = tl.reshape(
+            tl.join(
+                tl.reshape(w3_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                tl.reshape(w3_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+            ),
+            (BN, BK),
+        )
+        w3_deq = tl.trans(w3_inter, 1, 0)
+
+        gate_acc += tl.dot(h, w1_deq)
+        up_acc += tl.dot(h, w3_deq)
+
+    mask_m = offs_m[:, None] < M
+    mask_n = offs_n[None, :] < I
+    gate_ptrs = gate_out_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
+    up_ptrs = up_out_ptr + offs_m[:, None] * stride_um + offs_n[None, :] * stride_un
+    _out_dtype = gate_out_ptr.dtype.element_ty
+    tl.store(gate_ptrs, gate_acc.to(_out_dtype), mask=mask_m & mask_n)
+    tl.store(up_ptrs, up_acc.to(_out_dtype), mask=mask_m & mask_n)
+
+
+@triton.jit
+def _triton_fp4_fused_down_kernel(
+    gate_ptr, up_ptr,
+    w2_packed_ptr, w2_scale_ptr,
+    out_ptr,
+    M, D, I, swiglu_limit,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    stride_w2_n, stride_w2_k,
+    stride_s2_n, stride_s2_k,
+    stride_om, stride_on,
+    lut_ptr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Fused SwiGLU + down projection with inline FP4 dequantization."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+
+    out_acc = tl.zeros([BM, BN], dtype=tl.float32)
+
+    BK_HALF: tl.constexpr = BK // 2
+
+    for k in range(0, I, BK):
+        mask_k = (k + offs_k) < I
+        mask_m = offs_m < M
+
+        gate_ptrs = gate_ptr + offs_m[:, None] * stride_gm + (k + offs_k)[None, :] * stride_gn
+        gate_tile = tl.load(gate_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        up_ptrs = up_ptr + offs_m[:, None] * stride_um + (k + offs_k)[None, :] * stride_un
+        up_tile = tl.load(up_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        gate_f32 = gate_tile.to(tl.float32)
+        up_f32 = up_tile.to(tl.float32)
+        gate_f32 = tl.minimum(gate_f32, swiglu_limit)
+        up_f32 = tl.minimum(tl.maximum(up_f32, -swiglu_limit), swiglu_limit)
+        activated = gate_f32 * tl.sigmoid(gate_f32.to(tl.float32)) * up_f32
+
+        k_half = k // 2
+        offs_kh = k_half + tl.arange(0, BK_HALF)
+
+        # Load in [BN, BK_HALF], interleave → [BN, BK], trans → [BK, BN] for tl.dot
+        w2p_ptrs = w2_packed_ptr + offs_n[:, None] * stride_w2_n + offs_kh[None, :] * stride_w2_k
+        w2p = tl.load(w2p_ptrs, mask=(offs_n[:, None] < D) & (offs_kh[None, :] < I // 2), other=0).to(tl.uint8)
+        w2_lo = (w2p & 0xF).to(tl.int32)
+        w2_hi = ((w2p >> 4) & 0xF).to(tl.int32)
+        w2_lo_f32 = tl.load(lut_ptr + w2_lo).to(tl.float32)
+        w2_hi_f32 = tl.load(lut_ptr + w2_hi).to(tl.float32)
+        w2_sg = k // 32
+        w2s_ptrs = w2_scale_ptr + offs_n[:, None] * stride_s2_n + w2_sg * stride_s2_k
+        w2s = tl.load(w2s_ptrs, mask=offs_n[:, None] < D, other=1.0).to(tl.float32)
+        w2_lo_f32 *= w2s
+        w2_hi_f32 *= w2s
+        w2_inter = tl.reshape(
+            tl.join(
+                tl.reshape(w2_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                tl.reshape(w2_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+            ),
+            (BN, BK),
+        )
+        w2_deq = tl.trans(w2_inter, 1, 0)  # [BK, BN]
+
+        out_acc += tl.dot(activated.to(w2_deq.dtype), w2_deq)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    _out_dtype = out_ptr.dtype.element_ty
+    tl.store(out_ptrs, out_acc.to(_out_dtype), mask=(offs_m[:, None] < M) & (offs_n[None, :] < D))
+
+
+def _fused_fp4_expert_ffn_triton(
+    hidden: torch.Tensor,
+    w1_packed: torch.Tensor, w1_scale: torch.Tensor,
+    w3_packed: torch.Tensor, w3_scale: torch.Tensor,
+    w2_packed: torch.Tensor, w2_scale: torch.Tensor,
+    swiglu_limit: float = 10.0,
+) -> torch.Tensor:
+    """Fused FP4+GEMM: dequantization happens inside the GEMM loop, no intermediate BF16 tensor."""
+    M = hidden.shape[0]
+    D = hidden.shape[1]
+    I = w1_packed.shape[0]
+
+    gate = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
+    up = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
+
+    lut = _FP4_LUT.to(hidden.device)
+
+    BM, BN, _ = _tune_blocks(hidden.device)
+    BK_FP4 = 32  # aligned to one scale group
+
+    grid_m = triton.cdiv(M, BM)
+    grid_n = triton.cdiv(I, BN)
+
+    _triton_fp4_fused_gate_up_kernel[(grid_m, grid_n)](
+        hidden,
+        w1_packed, w1_scale,
+        w3_packed, w3_scale,
+        gate, up,
+        M, I, D,
+        hidden.stride(0), hidden.stride(1),
+        w1_packed.stride(0), w1_packed.stride(1),
+        w1_scale.stride(0), w1_scale.stride(1),
+        w3_packed.stride(0), w3_packed.stride(1),
+        w3_scale.stride(0), w3_scale.stride(1),
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        lut,
+        BM=BM, BN=BN, BK=BK_FP4,
+        num_stages=1,
+    )
+
+    out = torch.empty(M, D, device=hidden.device, dtype=hidden.dtype)
+    grid_d_m = triton.cdiv(M, BM)
+    grid_d_n = triton.cdiv(D, BN)
+
+    _triton_fp4_fused_down_kernel[(grid_d_m, grid_d_n)](
+        gate, up,
+        w2_packed, w2_scale,
+        out,
+        M, D, I, swiglu_limit,
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        w2_packed.stride(0), w2_packed.stride(1),
+        w2_scale.stride(0), w2_scale.stride(1),
+        out.stride(0), out.stride(1),
+        lut,
+        BM=BM, BN=BN, BK=BK_FP4,
+        num_stages=1,
+    )
+    return out

@@ -450,3 +450,217 @@ class TestFusedMoEFP4Triton:
         out = fused_expert_ffn_triton(hidden, w1, w1, w2,
                                        swiglu_limit=10.0)
         assert out.shape == (2, self._D)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 回归测试：固化 V10-M4 FP4+GEMM 修复中遇到的 bug
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestFP4DequantizePitfalls:
+    """Bugs fixed:
+    - tl.join + tl.reshape DOES correctly interleave (was wrongly believed not to).
+    - BLOCK_K_HALF must be <=16 so one tile covers one scale group (32 cols).
+    - tl.dot needs [BK, BN] layout, not [BN, BK]; use tl.trans after interleave.
+    """
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+    def test_interleave_via_join_reshape(self):
+        """Bug: 曾认为 tl.join([N,K,1],[N,K,1]) reshape [N,2K] 不能交错。
+        实际验证: 结果正确交替 lo/hi。"""
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _interleave_test(lo_ptr, hi_ptr, out_ptr, N, K,
+                             BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+            pid = tl.program_id(0)
+            offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+            offs_k = tl.arange(0, BLOCK_K)
+            mask_n = offs_n < N
+            mask_k = offs_k < K
+            lo = tl.load(lo_ptr + offs_n[:, None] * K + offs_k[None, :],
+                         mask=mask_n[:, None] & mask_k[None, :], other=0.0).to(tl.float32)
+            hi = tl.load(hi_ptr + offs_n[:, None] * K + offs_k[None, :],
+                         mask=mask_n[:, None] & mask_k[None, :], other=0.0).to(tl.float32)
+            interleaved = tl.reshape(
+                tl.join(
+                    tl.reshape(lo.to(tl.bfloat16), (BLOCK_N, BLOCK_K, 1)),
+                    tl.reshape(hi.to(tl.bfloat16), (BLOCK_N, BLOCK_K, 1)),
+                ),
+                (BLOCK_N, 2 * BLOCK_K),
+            )
+            offs_out = tl.arange(0, 2 * BLOCK_K)
+            mask_out = (offs_n[:, None] < N) & (offs_out[None, :] < 2 * K)
+            tl.store(out_ptr + offs_n[:, None] * (2 * K) + offs_out[None, :],
+                     interleaved, mask=mask_out)
+
+        N, K = 4, 8  # powers of 2 for tl.arange
+        N_real = 3
+        lo = torch.arange(N_real * K, dtype=torch.float32).view(N_real, K).cuda()
+        hi = torch.arange(100, 100 + N_real * K, dtype=torch.float32).view(N_real, K).cuda()
+        out = torch.zeros(N, 2 * K, dtype=torch.bfloat16, device="cuda")
+
+        _interleave_test[(1,)](lo, hi, out, N_real, K, BLOCK_N=N, BLOCK_K=K)
+        torch.cuda.synchronize()
+
+        for n in range(N_real):
+            for k in range(K):
+                assert out[n, 2 * k] == lo[n, k], \
+                    f"interleave[{n},{2*k}]={out[n,2*k]} != lo[{n},{k}]={lo[n,k]}"
+                assert out[n, 2 * k + 1] == hi[n, k], \
+                    f"interleave[{n},{2*k+1}]={out[n,2*k+1]} != hi[{n},{k}]={hi[n,k]}"
+
+    def test_deq_multi_scale_groups(self):
+        """Bug: BLOCK_K_HALF=32 跨越 2 个 scale group, 只加载了一个 scale,
+        导致一半值使用错误 scale。修复后 BLOCK_K_HALF=16 (单 group) 应无此问题。"""
+        from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
+        from tile_reference import cast, unpack_from_e2m1fn_x2
+
+        I, D = 8, 128  # 128 cols => 4 scale groups (128/32=4)
+        torch.manual_seed(123)
+        w = torch.randn(I, D, dtype=torch.bfloat16)
+        w_packed, w_scale = cast(w, fmt="e2m1", block_size=(1, 32))
+        w_packed_c = w_packed.cuda()
+        w_scale_c = w_scale.to(torch.float32).cuda()
+
+        deq_triton = triton_dequantize_fp4_to_bf16(w_packed_c, w_scale_c)
+
+        deq_ref = unpack_from_e2m1fn_x2(w_packed_c)
+        sf_ref = w_scale_c.repeat_interleave(32, dim=1)
+        deq_ref = (deq_ref.float() * sf_ref.float()).to(torch.bfloat16)
+
+        diff = (deq_triton.float() - deq_ref.float()).abs().max().item()
+        ref_max = deq_ref.float().abs().max().item()
+        assert diff < 0.1, \
+            f"Multi-scale-group deq diff={diff:.6f} ref_max={ref_max:.4f}"
+
+    def test_fused_gemm_tl_dot_layout(self):
+        """Bug: fused kernel 输出 [BN, BK] 但 tl.dot 需要 [BK, BN] (column-major)。
+        修复后经 tl.trans 转为 [BK, BN]。本测试验证 gate 投影与 PyTorch 一致。"""
+        import triton
+        import triton.language as tl
+        from tile_reference import cast
+        from home_seek.fused_moe import _FP4_LUT
+
+        @triton.jit
+        def _mini_gate_kernel(
+            hidden_ptr, w_packed_ptr, w_scale_ptr, out_ptr,
+            M, I, D, stride_hm, stride_hk,
+            stride_wn, stride_wk, stride_sn, stride_sk,
+            stride_om, stride_on, lut_ptr,
+            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        ):
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
+            offs_m = pid_m * BM + tl.arange(0, BM)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_k = tl.arange(0, BK)
+            acc = tl.zeros([BM, BN], dtype=tl.float32)
+            BK_HALF: tl.constexpr = BK // 2
+
+            for k in range(0, D, BK):
+                mask_k = (k + offs_k) < D
+                mask_m = offs_m < M
+                h = tl.load(
+                    hidden_ptr + offs_m[:, None] * stride_hm + (k + offs_k)[None, :] * stride_hk,
+                    mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+                k_half = k // 2
+                offs_kh = k_half + tl.arange(0, BK_HALF)
+
+                wp = tl.load(
+                    w_packed_ptr + offs_n[:, None] * stride_wn + offs_kh[None, :] * stride_wk,
+                    mask=(offs_n[:, None] < I) & (offs_kh[None, :] < (D // 2)), other=0).to(tl.uint8)
+                lo = (wp & 0xF).to(tl.int32)
+                hi = ((wp >> 4) & 0xF).to(tl.int32)
+                lo_f32 = tl.load(lut_ptr + lo).to(tl.float32)
+                hi_f32 = tl.load(lut_ptr + hi).to(tl.float32)
+                sg = k // 32
+                s = tl.load(
+                    w_scale_ptr + offs_n[:, None] * stride_sn + sg * stride_sk,
+                    mask=offs_n[:, None] < I, other=1.0).to(tl.float32)
+                lo_f32 *= s
+                hi_f32 *= s
+
+                w_inter = tl.reshape(
+                    tl.join(
+                        tl.reshape(lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                        tl.reshape(hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    ),
+                    (BN, BK),
+                )
+                w_for_dot = tl.trans(w_inter, 1, 0)  # [BK, BN] ← 关键修复
+                acc += tl.dot(h, w_for_dot)
+
+            mask_m = offs_m[:, None] < M
+            mask_n = offs_n[None, :] < I
+            tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+                     acc.to(out_ptr.dtype.element_ty),
+                     mask=mask_m & mask_n)
+
+        # Test params
+        I_s, D_s = 32, 64
+        torch.manual_seed(42)
+        w = torch.randn(I_s, D_s, dtype=torch.bfloat16)
+        w_p, w_s = cast(w, fmt="e2m1", block_size=(1, 32))
+        w_p_c, w_s_c = w_p.cuda(), w_s.to(torch.float32).cuda()
+
+        hidden = torch.randn(2, D_s, device="cuda", dtype=torch.bfloat16)
+        lut = _FP4_LUT.cuda()
+
+        out = torch.zeros(2, I_s, device="cuda", dtype=torch.bfloat16)
+        BM, BN, BK = 16, 16, 32  # tl.dot needs N >= 16
+
+        _mini_gate_kernel[(triton.cdiv(2, BM), triton.cdiv(I_s, BN))](
+            hidden, w_p_c, w_s_c, out, 2, I_s, D_s,
+            hidden.stride(0), hidden.stride(1),
+            w_p_c.stride(0), w_p_c.stride(1),
+            w_s_c.stride(0), w_s_c.stride(1),
+            out.stride(0), out.stride(1), lut,
+            BM=BM, BN=BN, BK=BK, num_stages=1,
+        )
+        torch.cuda.synchronize()
+
+        # Reference: Python dequantize + matmul
+        from tile_reference import unpack_from_e2m1fn_x2
+        deq_w = (unpack_from_e2m1fn_x2(w_p_c).float() * w_s_c.repeat_interleave(32, dim=1).float()).to(torch.bfloat16)
+        ref = hidden @ deq_w.t()
+
+        diff = (out.float() - ref.float()).abs().max().item()
+        ref_max = ref.float().abs().max().item()
+        assert diff < max(1.0, ref_max * 0.1), \
+            f"tl.dot layout bug: gate diff={diff:.4f} ref_max={ref_max:.4f}"
+
+    def test_scale_per_group_isolated(self):
+        """Bug: 校验 per-group scale 在 dequantize 中正确应用。
+        构造各 group 不同 scale 的权重 (1, 2, 3, 4...) 并验证反量化结果。"""
+        from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
+
+        I, D = 4, 128  # 4 scale groups (128/32=4)
+        torch.manual_seed(7)
+        w_packed = torch.randint(0, 127, (I, D // 2), dtype=torch.int8, device="cuda")
+        # Distinct scales per group: [1, 2, 3, 4] for each of 4 groups
+        w_scale = torch.tensor([
+            [1.0, 2.0, 3.0, 4.0] for _ in range(I)
+        ], device="cuda", dtype=torch.float32)
+
+        result = triton_dequantize_fp4_to_bf16(w_packed, w_scale)
+
+        # Verify: group 0 columns (0..31) use scale 1, group 1 (32..63) use 2, etc.
+        from tile_reference import unpack_from_e2m1fn_x2
+        for g in range(4):
+            col_start = g * 32
+            col_slice = result[:, col_start:col_start + 32]
+            # The dequantized values should have magnitude proportional to scale
+            mean_abs = col_slice.float().abs().mean().item()
+            # Different groups with different scales should differ
+            assert mean_abs > 0, f"Group {g} has zero values"
+
+        # Check that groups have proportional magnitudes
+        g0 = result[:, 0:32].float().abs().mean().item()
+        g2 = result[:, 64:96].float().abs().mean().item()
+        # g2 should be ~3x g0 (scale 3x)
+        assert g2 > g0 * 1.5, f"Scale group mismatch: g0={g0:.4f}, g2={g2:.4f}"

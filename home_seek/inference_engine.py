@@ -8,11 +8,15 @@ from safetensors import safe_open
 from collections import defaultdict, OrderedDict
 
 import math
+from home_seek.utils import rms_norm
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
 from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache
 from home_seek.gpu_expert_store import AllExpertFP4Store
+from home_seek.compressor import Compressor as NewCompressor
+from home_seek.lightning_indexer import LightningIndexer
+from home_seek.hybrid_kv_cache import HybridKVCache, SWACache
 from tile_reference import unpack_from_e2m1fn_x2
 import tile_kernels
 
@@ -20,12 +24,6 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 _encoding_dir = os.path.join(_current_dir, '../weights/encoding')
 sys.path.insert(0, os.path.abspath(_encoding_dir))
 from encoding_dsv4 import encode_messages
-
-
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    x_normed = x.to(torch.float32) * torch.rsqrt(variance + eps)
-    return (weight.to(torch.float32) * x_normed).to(x.dtype)
 
 
 def precompute_freqs_cis(dim: int, seqlen: int, theta: float = 10000.0,
@@ -92,31 +90,6 @@ def load_fp4_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         sf = scale.repeat_interleave(block_size, dim=1) if scale.dim() == 2 else scale
         deq = deq.to(torch.float32) * sf.to(torch.float32)
     return deq.to(torch.bfloat16)
-
-
-class CompressedKVCache:
-    def __init__(self, compress_ratio: int, dim: int, device: str, idx_dim: int = 0):
-        self.compress_ratio = compress_ratio
-        self.dim = dim
-        self.device = torch.device(device)
-        self.cache = torch.zeros(0, dim, device=self.device, dtype=torch.bfloat16)
-        self.indexer_keys = torch.zeros(0, idx_dim, device=self.device, dtype=torch.bfloat16) if idx_dim > 0 else None
-
-    def append(self, compressed: torch.Tensor, idx_keys: torch.Tensor = None):
-        self.cache = torch.cat([self.cache, compressed], dim=0)
-        if idx_keys is not None and self.indexer_keys is not None:
-            self.indexer_keys = torch.cat([self.indexer_keys, idx_keys], dim=0)
-
-    def get(self):
-        return self.cache
-
-    def get_indexer_keys(self):
-        return self.indexer_keys
-
-    def clear(self):
-        self.cache = torch.zeros(0, self.dim, device=self.device, dtype=torch.bfloat16)
-        if self.indexer_keys is not None:
-            self.indexer_keys = torch.zeros(0, self.indexer_keys.shape[-1], device=self.device, dtype=torch.bfloat16)
 
 
 class WeightLoader:
@@ -200,7 +173,8 @@ class WeightLoader:
 class LayerState:
     def __init__(self, device: str = "cuda", active_window: int = 32768):
         self.kv_latent_cache = None
-        self.compressed_kv = None
+        self.compressed_kv_data = None   # [N, head_dim] flat tensor (was CompressedKVCache.cache)
+        self.compressed_kv_idx = None    # [N, idx_dim] flat tensor (was CompressedKVCache.indexer_keys)
         self.compressed_count = 0
         self.archived_kv = None
         self.archived_len = 0
@@ -358,6 +332,10 @@ class HomeSeekInferenceEngine:
         self.expert_cache = ExpertWeightCache(max_experts=512, device=device, hot_deq_size=0)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
+        self._compressors = {}       # per-layer Compressor instances (lazy)
+        self._indexers = {}          # per-layer LightningIndexer instances (lazy)
+        self._hybrid_kv = {}         # per-layer HybridKVCache instances (lazy)
+        self._global_pos = 0         # current global sequence position
         self._prefetch_worker = None
         self._load_global_weights()
         self._prefetch_enabled = True
@@ -497,6 +475,100 @@ class HomeSeekInferenceEngine:
                 lw[short_key] = present[full_key].to(self.device, non_blocking=True)
         return lw
 
+    def _get_compressor(self, layer_idx: int, lw: dict) -> NewCompressor | None:
+        if not hasattr(self, '_compressors'):
+            self._compressors = {}
+        if layer_idx in self._compressors:
+            return self._compressors[layer_idx]
+
+        compress_ratio = self.config.get_compress_ratio(layer_idx)
+        if compress_ratio == 0:
+            return None
+
+        c_wkv = lw.get("attn.compressor.wkv.weight")
+        c_wgate = lw.get("attn.compressor.wgate.weight")
+        c_ape = lw.get("attn.compressor.ape")
+        c_norm = lw.get("attn.compressor.norm.weight")
+
+        if c_wkv is None:
+            return None
+
+        # coff = 1 + overlap; overlap when compress_ratio == 4 (CSA)
+        overlap = compress_ratio == 4
+        coff = 2 if overlap else 1
+        head_dim = self.config.head_dim  # 512
+
+        # Handle weight dtypes
+        if c_wkv.dtype not in (torch.bfloat16, torch.float32):
+            c_wkv = c_wkv.to(torch.float32)
+        if c_wgate.dtype not in (torch.bfloat16, torch.float32):
+            c_wgate = c_wgate.to(torch.float32)
+        if c_ape is not None and c_ape.dtype != torch.float32:
+            c_ape = c_ape.to(torch.float32)
+
+        compressor = NewCompressor(
+            ratio=compress_ratio,
+            head_dim=coff * head_dim // coff,  # head_dim (512)
+            coff=coff,
+            ape=c_ape,
+            wkv=c_wkv.to(self.device) if c_wkv.device.type != self.device.type else c_wkv,
+            wgate=c_wgate.to(self.device) if c_wgate.device.type != self.device.type else c_wgate,
+            norm_w=c_norm,
+            device=str(self.device),
+        )
+        self._compressors[layer_idx] = compressor
+        return compressor
+
+    def _get_indexer(self, layer_idx: int, lw: dict) -> LightningIndexer | None:
+        if not hasattr(self, '_indexers'):
+            self._indexers = {}
+        if layer_idx in self._indexers:
+            return self._indexers[layer_idx]
+
+        compress_ratio = self.config.get_compress_ratio(layer_idx)
+        if compress_ratio != 4:
+            return None
+
+        idx_wq_b_data = lw.get("attn.indexer.wq_b.weight")
+        if idx_wq_b_data is None:
+            return None
+
+        idx_wq_b = self._deq("attn.indexer.wq_b.weight",
+                             idx_wq_b_data,
+                             lw.get("attn.indexer.wq_b.scale"), layer_idx)
+        weights_proj = lw.get("attn.indexer.weights_proj.weight")
+
+        idx_c_wkv = lw.get("attn.indexer.compressor.wkv.weight")
+        idx_c_wgate = lw.get("attn.indexer.compressor.wgate.weight")
+        idx_c_norm = lw.get("attn.indexer.compressor.norm.weight")
+        idx_c_ape = lw.get("attn.indexer.compressor.ape")
+
+        if idx_c_wkv is not None and idx_c_wkv.dtype not in (torch.bfloat16, torch.float32):
+            idx_c_wkv = idx_c_wkv.to(torch.float32)
+        if idx_c_wgate is not None and idx_c_wgate.dtype not in (torch.bfloat16, torch.float32):
+            idx_c_wgate = idx_c_wgate.to(torch.float32)
+        if idx_c_ape is not None and idx_c_ape.dtype != torch.float32:
+            idx_c_ape = idx_c_ape.to(torch.float32)
+
+        indexer = LightningIndexer(
+            index_n_heads=self.config.index_n_heads,
+            index_head_dim=self.config.index_head_dim,
+            index_topk=self.config.index_topk,
+            compress_ratio=compress_ratio,
+            q_lora_rank=self.config.q_lora_rank,
+            device=str(self.device),
+        )
+        indexer.set_weights(
+            wq_b=idx_wq_b.to(self.device) if idx_wq_b.device.type != self.device.type else idx_wq_b,
+            weights_proj=weights_proj.to(self.device) if weights_proj is not None and weights_proj.device.type != self.device.type else weights_proj,
+            compressor_wkv=idx_c_wkv.to(self.device) if idx_c_wkv is not None and idx_c_wkv.device.type != self.device.type else idx_c_wkv,
+            compressor_wgate=idx_c_wgate.to(self.device) if idx_c_wgate is not None and idx_c_wgate.device.type != self.device.type else idx_c_wgate,
+            compressor_norm=idx_c_norm,
+            compressor_ape=idx_c_ape.to(self.device) if idx_c_ape is not None and idx_c_ape.device.type != self.device.type else idx_c_ape,
+        )
+        self._indexers[layer_idx] = indexer
+        return indexer
+
     def _deq(self, name, data, scale, layer_idx=None):
         if data is None:
             return None
@@ -518,107 +590,69 @@ class HomeSeekInferenceEngine:
             self._deq_cache[cache_key] = result
         return result
 
-    def _compress_kv_overlapping(self, x: torch.Tensor, compress_ratio: int, dim: int) -> torch.Tensor:
-        B, T, D = x.shape
-        if T < compress_ratio:
-            return torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
-        overlap = compress_ratio // 2
-        stride = overlap
-        windows = []
-        for i in range(0, T - compress_ratio + 1, stride):
-            w = x[:, i:i + compress_ratio, :]
-            scores = torch.softmax((w.float() * (D ** -0.5)), dim=1)
-            combined = (scores * w.float()).sum(dim=1).to(x.dtype)
-            windows.append(combined)
-        if not windows:
-            return torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
-        result = torch.stack(windows, dim=1)
-        if x.shape[1] > i + compress_ratio:
-            tail = x[:, i + stride:, :]
-            if tail.shape[1] >= compress_ratio:
-                tail = tail[:, :tail.shape[1] // compress_ratio * compress_ratio, :]
-                tail_g = tail.view(B, -1, compress_ratio, D)
-                tail_a = torch.softmax(tail_g.float() * (D ** -0.5), dim=2)
-                tail_c = (tail_a * tail_g.float()).sum(dim=2).to(x.dtype)
-                result = torch.cat([result, tail_c], dim=1)
-        return result
-
     def _compress_kv(self, hidden: torch.Tensor, lw: dict, layer_idx: int, state: LayerState):
+        """Compress KV using the paper-aligned Compressor.
+
+        Stores compressed KV in both LayerState (flat tensors) and
+        HybridKVCache (Phase 2 paged cache).
+        """
         compress_ratio = self.config.get_compress_ratio(layer_idx)
         if compress_ratio == 0:
             return state
 
-        c_wkv = lw.get("attn.compressor.wkv.weight")
-        c_wgate = lw.get("attn.compressor.wgate.weight")
-        c_norm = lw.get("attn.compressor.norm.weight")
-        c_ape = lw.get("attn.compressor.ape")
-
-        if c_wkv is None:
+        compressor = self._get_compressor(layer_idx, lw)
+        if compressor is None:
             return state
 
-        B, T, D = hidden.shape
-        c_dim = c_wkv.shape[0]
+        start_pos = getattr(self, '_global_pos', 0)
+        compressed = compressor.compress(hidden, start_pos)
+        if compressed is None:
+            return state
 
-        c_hidden = torch.matmul(hidden.to(c_wkv.dtype), c_wkv.t())
-        c_gate = torch.matmul(hidden.to(c_wgate.dtype), c_wgate.t())
-        c_gate = torch.sigmoid(c_gate.float()).to(c_hidden.dtype)
-        c_hidden = c_hidden * c_gate
+        head_dim = self.config.head_dim
 
-        if c_hidden.shape[1] >= compress_ratio:
-            c_hidden = self._compress_kv_overlapping(c_hidden, compress_ratio, c_dim)
+        # Flat tensor storage on LayerState
+        if state.compressed_kv_data is None:
+            state.compressed_kv_data = compressed.squeeze(0)  # [num_blocks, head_dim]
         else:
-            c_hidden = torch.zeros(B, 0, c_dim, device=c_hidden.device, dtype=c_hidden.dtype)
+            state.compressed_kv_data = torch.cat(
+                [state.compressed_kv_data, compressed.squeeze(0)], dim=0)
 
-        if c_ape is not None and c_ape.shape[-1] == c_dim and c_hidden.shape[1] > 0:
-            ape_seq = min(c_ape.shape[0], c_hidden.shape[1])
-            c_hidden[:, :ape_seq, :] = c_hidden[:, :ape_seq, :] + c_ape[:ape_seq, :].to(c_hidden.dtype)
+        # Phase 2: HybridKVCache (paged, block-aligned)
+        hybrid = self._get_hybrid_kv(layer_idx)
+        for t in range(compressed.shape[1]):
+            entry = compressed[:, t:t + 1, :]
+            hybrid.append_compressed(entry.squeeze(0))
 
-        norm_dim = c_norm.shape[-1] if c_norm is not None else c_dim
-        if c_dim != norm_dim:
-            if c_hidden.shape[1] > 0:
-                c_hidden = c_hidden.view(B, -1, c_dim // norm_dim, norm_dim).mean(dim=2)
-            else:
-                c_hidden = torch.zeros(B, 0, norm_dim, device=c_hidden.device, dtype=c_hidden.dtype)
-            c_dim = norm_dim
-
-        if c_norm is not None and c_hidden.shape[1] > 0:
-            c_hidden = rms_norm(c_hidden, c_norm.to(torch.bfloat16))
-
-        attn_type = "csa" if compress_ratio == 4 else "hca"
-        idx_keys = None
-        if attn_type == "csa":
-            idx_c_wkv = lw.get("attn.indexer.compressor.wkv.weight")
-            idx_c_wgate = lw.get("attn.indexer.compressor.wgate.weight")
-            idx_c_norm = lw.get("attn.indexer.compressor.norm.weight")
-            idx_c_ape = lw.get("attn.indexer.compressor.ape")
-            idx_dim_out = idx_c_norm.shape[-1] if idx_c_norm is not None else 128
-            if idx_c_wkv is not None:
-                ik = torch.matmul(hidden.to(idx_c_wkv.dtype), idx_c_wkv.t())
-                if idx_c_wgate is not None:
-                    g = torch.matmul(hidden.to(idx_c_wgate.dtype), idx_c_wgate.t())
-                    g = torch.sigmoid(g.float()).to(ik.dtype)
-                    ik = ik * g
-                if ik.shape[1] >= compress_ratio:
-                    idx_dim_inner = ik.shape[-1]
-                    ik_tmp = self._compress_kv_overlapping(ik, compress_ratio, idx_dim_inner)
-                    if idx_c_ape is not None and ik_tmp.shape[1] > 0:
-                        ap = min(idx_c_ape.shape[0], ik_tmp.shape[1])
-                        ik_tmp[:, :ap, :] = ik_tmp[:, :ap, :] + idx_c_ape[:ap, :].to(ik_tmp.dtype)
-                    if ik_tmp.shape[-1] != idx_dim_out:
-                        ik_tmp = ik_tmp.view(B, -1, ik_tmp.shape[-1] // idx_dim_out, idx_dim_out).mean(dim=2)
-                    if idx_c_norm is not None and ik_tmp.shape[1] > 0:
-                        ik_tmp = rms_norm(ik_tmp, idx_c_norm.to(torch.bfloat16))
-                    idx_keys = ik_tmp.squeeze(0)
-
-        if state.compressed_kv is None:
-            idx_dim = idx_keys.shape[-1] if idx_keys is not None else 0
-            state.compressed_kv = CompressedKVCache(compress_ratio, c_dim, str(self.device), idx_dim=idx_dim)
-        state.compressed_kv.append(c_hidden.squeeze(0), idx_keys)
         return state
 
-    def _compute_indexer(self, q_latent: torch.Tensor, lw: dict, state: LayerState, layer_idx: int,
-                         use_lightning: bool = True):
-        compressed_kv = state.compressed_kv.get() if state.compressed_kv is not None else None
+    def _get_hybrid_kv(self, layer_idx: int) -> HybridKVCache:
+        if not hasattr(self, '_hybrid_kv'):
+            self._hybrid_kv = {}
+        if layer_idx not in self._hybrid_kv:
+            compress_ratio = self.config.get_compress_ratio(layer_idx)
+            indexer_dim = getattr(self.config, 'index_head_dim', 128) if compress_ratio == 4 else 0
+            self._hybrid_kv[layer_idx] = HybridKVCache(
+                compress_ratio=compress_ratio,
+                head_dim=self.config.head_dim,
+                indexer_dim=indexer_dim,
+                device=str(self.device),
+            )
+        return self._hybrid_kv[layer_idx]
+
+    def _compute_indexer(self, q_latent: torch.Tensor, hidden_states: torch.Tensor,
+                         lw: dict, state: LayerState, layer_idx: int) -> torch.Tensor:
+        """Compute top-k compressed KV indices using the LightningIndexer.
+
+        Falls back to old direct computation when indexer weights are incomplete.
+        Returns selected KV tensor [B, 1, k, head_dim] or None.
+        """
+        indexer = self._get_indexer(layer_idx, lw)
+        if indexer is not None:
+            return self._compute_indexer_lightning(q_latent, hidden_states, lw, state, layer_idx)
+
+        # Fallback: use old direct computation (backward compat for tests / partial weights)
+        compressed_kv = state.compressed_kv_data
         if compressed_kv is None or compressed_kv.shape[0] == 0:
             return None
 
@@ -634,24 +668,16 @@ class HomeSeekInferenceEngine:
         idx_q = idx_q.view(q_latent.shape[0], -1, self.config.index_n_heads, self.config.index_head_dim)
         idx_q = idx_q.transpose(1, 2)
 
-        idx_k = state.compressed_kv.get_indexer_keys()
+        idx_k = state.compressed_kv_idx
         if idx_k is None or idx_k.shape[0] == 0:
-            return self._get_compressed_attention_kv(state, lw)
+            return self._get_compressed_attention_kv(state)
 
         idx_k_4d = idx_k.unsqueeze(0).unsqueeze(0)
-
-        if use_lightning:
-            i_dim = self.config.index_head_dim
-            q_fp8 = idx_q.to(torch.float8_e4m3fn).float()
-            k_fp8 = idx_k_4d.to(torch.float8_e4m3fn).float()
-            scale = i_dim ** -0.5
-            scores = torch.matmul(q_fp8 * scale, k_fp8.transpose(-2, -1))
-        else:
-            scores = torch.matmul(
-                idx_q.float() * (self.config.index_head_dim ** -0.5),
-                idx_k_4d.float().transpose(-2, -1),
-            )
-
+        i_dim = self.config.index_head_dim
+        scores = torch.matmul(
+            idx_q.float() * (i_dim ** -0.5),
+            idx_k_4d.float().transpose(-2, -1),
+        )
         scores_pooled = scores[:, :, -1:, :].mean(dim=1).squeeze(1)
 
         k = min(self.config.index_topk, n_compressed)
@@ -659,7 +685,6 @@ class HomeSeekInferenceEngine:
         selected_indices = topk_indices if topk_indices.dim() == 2 else topk_indices.squeeze(0)
 
         selected_kv = compressed_kv[selected_indices[0]]
-
         h_dim = self.config.head_dim
         if c_dim != h_dim:
             if c_dim > h_dim:
@@ -667,11 +692,65 @@ class HomeSeekInferenceEngine:
             else:
                 pad = torch.zeros(k, h_dim - c_dim, device=selected_kv.device, dtype=selected_kv.dtype)
                 selected_kv = torch.cat([selected_kv, pad], dim=-1)
-
         return selected_kv.unsqueeze(0).unsqueeze(1).contiguous()
 
-    def _get_compressed_attention_kv(self, state: LayerState, lw: dict):
-        compressed_kv = state.compressed_kv.get() if state.compressed_kv is not None else None
+    def _compute_indexer_lightning(self, q_latent: torch.Tensor, hidden_states: torch.Tensor,
+                                    lw: dict, state: LayerState, layer_idx: int) -> torch.Tensor:
+        """Compute top-k compressed KV indices using the LightningIndexer.
+
+        Returns selected KV tensor [B, 1, k, head_dim] or None.
+        """
+        indexer = self._get_indexer(layer_idx, lw)
+        if indexer is None:
+            return self._get_compressed_attention_kv(state)
+
+        compressed_kv = state.compressed_kv_data
+        if compressed_kv is None or compressed_kv.shape[0] == 0:
+            return None
+
+        global_pos = getattr(self, '_global_pos', 0)
+        win = self.config.sliding_window
+        offset = hidden_states.shape[1] if global_pos == 0 else win
+
+        topk_idxs = indexer.compute_indexer(
+            hidden_states, q_latent, start_pos=global_pos, offset=offset)
+        if topk_idxs is None:
+            return self._get_compressed_attention_kv(state)
+
+        # topk_idxs: [B, T, k] with values into the full KV cache, or -1 for invalid
+        # For attention, we need to gather the compressed KV entries
+        B, T, k = topk_idxs.shape
+        h_dim = self.config.head_dim
+        c_dim = compressed_kv.shape[-1]
+
+        # Build selected KV: use the compressed KV cache directly
+        # topk_idxs values are positions in the full KV (SWA + compressed)
+        # For simplicity, gather from compressed KV by subtracting offset
+        selected = compressed_kv.unsqueeze(0).unsqueeze(0)  # [1, 1, N, c_dim]
+        n_comp = selected.shape[2]
+
+        adjusted_idxs = topk_idxs - offset  # Convert to compressed KV indices
+        adjusted_idxs = adjusted_idxs.clamp(0, n_comp - 1)
+
+        # For the last token position only (decode), gather selected KV
+        gather_idx = adjusted_idxs[0, -1:, :]  # [1, k]
+
+        result = compressed_kv[gather_idx[0].clamp(0, n_comp - 1)]  # [k, c_dim]
+        valid = (gather_idx[0] >= 0) & (gather_idx[0] < n_comp)
+        result[~valid] = 0
+
+        if c_dim != h_dim:
+            if c_dim > h_dim:
+                result = result.view(-1, c_dim // h_dim, h_dim).mean(dim=1)
+            else:
+                pad = torch.zeros(k, h_dim - c_dim, device=result.device, dtype=result.dtype)
+                result = torch.cat([result, pad], dim=-1)
+
+        return result.unsqueeze(0).unsqueeze(1).contiguous()
+
+    def _get_compressed_attention_kv(self, state: LayerState, lw=None) -> torch.Tensor | None:
+        """Get all compressed KV entries for attention (HCA fallback)."""
+        compressed_kv = state.compressed_kv_data
         if compressed_kv is None or compressed_kv.shape[0] == 0:
             return None
         c_dim = compressed_kv.shape[-1]
@@ -798,16 +877,16 @@ class HomeSeekInferenceEngine:
         k_sw, v_sw = self._expand_kv(kv_sw)
 
         if attn_type == "csa":
-            indexed_kv = self._compute_indexer(q_latent, lw, state, layer_idx)
+            indexed_kv = self._compute_indexer(q_latent, hidden_states, lw, state, layer_idx)
             if indexed_kv is None:
-                compressed_kv = self._get_compressed_attention_kv(state, lw)
+                compressed_kv = self._get_compressed_attention_kv(state)
             else:
                 compressed_kv = indexed_kv
         elif attn_type == "hca":
-            compressed_kv = self._get_compressed_attention_kv(state, lw)
+            compressed_kv = self._get_compressed_attention_kv(state)
         else:
             compressed_kv = None
-            state.compressed_kv = None
+            state.compressed_kv_data = None
 
         if compressed_kv is not None:
             if compressed_kv.dim() < k_sw.dim():
@@ -1311,7 +1390,8 @@ class HomeSeekInferenceEngine:
                 state_copy.kv_latent_cache = v.kv_latent_cache.clone()
                 state_copy.archived_kv = v.archived_kv
                 state_copy.archived_len = v.archived_len
-                state_copy.compressed_kv = v.compressed_kv
+                state_copy.compressed_kv_data = v.compressed_kv_data
+                state_copy.compressed_kv_idx = v.compressed_kv_idx
                 layer_states_bak[k] = state_copy
 
         self.layer_states = {}
@@ -1370,6 +1450,13 @@ class HomeSeekInferenceEngine:
         self._deq_cache.clear()
         self.expert_cache.clear()
         clear_deq_cache()
+        for compressor in self._compressors.values():
+            compressor.reset()
+        for indexer in self._indexers.values():
+            indexer.reset()
+        for hybrid in self._hybrid_kv.values():
+            hybrid.reset()
+        self._global_pos = 0
         if self._prefetch_worker is not None:
             self._prefetch_worker.clear()
         self._init_prefetch()
@@ -1422,8 +1509,9 @@ class HomeSeekInferenceEngine:
                                 with torch.cuda.stream(self._kv_offload_stream):
                                     self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
                                     self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
-                            if self.layer_states[li].compressed_kv is not None:
-                                self.layer_states[li].compressed_kv = None
+                            if self.layer_states[li].compressed_kv_data is not None:
+                                self.layer_states[li].compressed_kv_data = None
+                                self.layer_states[li].compressed_kv_idx = None
                     self.expert_cache.trim(64)
                     torch.cuda.empty_cache()
                     self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
@@ -1432,6 +1520,8 @@ class HomeSeekInferenceEngine:
         if self.norm_weight is not None:
             h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
         logits = torch.matmul(h_3d[:, -1:].to(self.lm_head.dtype), self.lm_head.t())
+
+        self._global_pos = T  # prefill done, advance position
 
         if temperature > 0:
             probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
@@ -1447,6 +1537,7 @@ class HomeSeekInferenceEngine:
 
         step = 0
         while step < max_new_tokens - 1:
+            self._global_pos = T + step
             h = self.embed[next_id].to(torch.bfloat16)
             h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):

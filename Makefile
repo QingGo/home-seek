@@ -1,36 +1,27 @@
-.PHONY: tests test unit-tests integration-tests lint typecheck clean
+.PHONY: install lint test-unit test-integration profile smoke clean
 
 SHELL := /bin/bash
-.PHONY: tests test unit-tests integration-tests lint typecheck clean
-
-tests:
-	@echo "=== Running ALL tests (unit + integration) ==="
-	source .venv/bin/activate && python -m pytest tests/ -v --tb=short --durations=10
-
-unit-tests:
-	@echo "=== Running fast unit tests ==="
-	source .venv/bin/activate && python -m pytest tests/ -m "not slow" -v --tb=short --durations=10
-
-integration-tests:
-	@echo "=== Running integration tests (weights required) ==="
-	source .venv/bin/activate && python -m pytest tests/integration/ -v --tb=short --durations=10
-
-lint:
-	@echo "=== Linting ==="
-	source .venv/bin/activate && ruff check home_seek/ tests/ --fix
-
-typecheck:
-	@echo "=== Type checking ==="
-	source .venv/bin/activate && python -m mypy home_seek/ --ignore-missing-imports
-
-clean:
-	@echo "=== Cleaning ==="
-	rm -rf __pycache__ .pytest_cache *.egg-info
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+UV := uv run
 
 install:
-	@echo "=== Installing ==="
 	uv sync
 
-test-run: unit-tests
-	@echo "Quick feedback loop complete."
+lint:
+	$(UV) ruff check home_seek/ tests/
+
+test-unit:
+	$(UV) python -m pytest tests/ --ignore=tests/integration -m "not slow" -q
+
+test-integration:
+	$(UV) python -m pytest tests/integration/ -q
+
+profile:
+	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 8
+
+smoke:
+	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 1
+
+clean:
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+	rm -rf home_seek.egg-info
