@@ -121,7 +121,7 @@ def validate_quantization(
     num_samples: int = 10,
     block_size: tuple = (1, 32),
 ):
-    print(f"[validate] Validating quantization quality...")
+    print("[validate] Validating quantization quality...")
 
     safetensors_files = sorted([f for f in os.listdir(weight_dir) if f.endswith(".safetensors")])
     expert_keys = []

@@ -29,3 +29,23 @@ include = ["home_seek*", "tile_reference*"]
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = [
+    "E402",   # sys.path hack for encoding_dsv4 forced
+    "E741",   # ambiguous 'I' variable (common in ML for intermediate size)
+    "E702",   # semicolons for compact tensor unpacking
+]
+select = ["F", "E", "W"]
+
+[tool.pytest.ini_options]
+markers = [
+    "fast: <1s unit tests",
+    "slow: >1s tests",
+    "integration: end-to-end tests",
+]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"

@@ -63,7 +63,7 @@ class ExpertMemoryManager:
                         self.shared_down_proj = f.get_tensor(key).to(torch.bfloat16)
                     elif "shared_expert.gate" in key:
                         self.shared_gate = f.get_tensor(key).to(torch.bfloat16)
-            print(f"[expert_manager] Shared weights loaded")
+            print("[expert_manager] Shared weights loaded")
         else:
             print(f"[expert_manager] WARNING: No shared weights found at {shared_path}")
 
@@ -104,7 +104,7 @@ class ExpertMemoryManager:
                             down_w = self._dequantize_fp4(down_data, down_sf)
 
                             return ExpertWeight(gate_w, up_w, down_w)
-                except Exception as e:
+                except Exception:
                     continue
 
         key_pattern = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"

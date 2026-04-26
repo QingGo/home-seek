@@ -8,7 +8,7 @@ class TestTileOps:
             pytest.skip("CUDA not available")
 
     def test_cast_to_fp4_and_back(self):
-        from tile_reference import cast, cast_back, unpack_from_e2m1fn_x2
+        from tile_reference import cast, unpack_from_e2m1fn_x2
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         quantized, sf = cast(x, fmt="e2m1", block_size=(1, 32))

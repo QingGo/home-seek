@@ -1,6 +1,4 @@
 import os
-import json
-import torch
 from safetensors import safe_open
 
 

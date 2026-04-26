@@ -1,7 +1,5 @@
-import os
 import json
 import torch
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -65,7 +63,7 @@ def run_stress_test(weight_dir: str, quantized_dir: str, output_png: str = "memo
 
     with open("stress_test_results.json", "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved to stress_test_results.json")
+    print("\nResults saved to stress_test_results.json")
 
     successful = [r for r in results if r["success"]]
     if successful:

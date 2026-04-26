@@ -11,7 +11,8 @@ import math
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
-from tile_reference import cast_back, unpack_from_e2m1fn_x2, swiglu_forward
+from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN
+from tile_reference import unpack_from_e2m1fn_x2
 import tile_kernels
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -241,8 +242,9 @@ class LayerState:
 
 
 class ExpertWeightCache:
-    def __init__(self, max_experts: int = 128):
+    def __init__(self, max_experts: int = 512, device: str = "cuda"):
         self.max_experts = max_experts
+        self.device = torch.device(device)
         self.cache = OrderedDict()
         self.pinned = set()
 
@@ -265,24 +267,31 @@ class ExpertWeightCache:
             return None
 
         raw_w1, raw_w3, raw_w2 = entry
-        w1 = self._dequantize_entry(raw_w1)
-        w3 = self._dequantize_entry(raw_w3)
-        w2 = self._dequantize_entry(raw_w2)
+        w1 = self._dequantize_entry(raw_w1, self.device)
+        w3 = self._dequantize_entry(raw_w3, self.device)
+        w2 = self._dequantize_entry(raw_w2, self.device)
 
         self._hot_deq[key] = (w1, w3, w2)
         if len(self._hot_deq) > self._max_hot_deq:
             self._hot_deq.popitem(last=False)
         return (w1, w3, w2)
 
-    def _dequantize_entry(self, entry):
+    def _dequantize_entry(self, entry, device=None):
         if entry is None:
             return None
         data, scale, fmt = entry
+        dev = device if device is not None else data.device
         if fmt == "bf16":
             return data
         if fmt == "fp8":
+            if str(data.device) != str(dev):
+                data = data.to(dev, non_blocking=True)
+                scale = scale.to(dev, non_blocking=True) if scale is not None else None
             return load_fp8_weight(data, scale)
         if fmt == "fp4":
+            if str(data.device) != str(dev):
+                data = data.to(dev, non_blocking=True)
+                scale = scale.to(dev, non_blocking=True) if scale is not None else None
             return load_fp4_weight(data, scale)
         return data.to(torch.bfloat16)
 
@@ -335,7 +344,7 @@ class HomeSeekInferenceEngine:
         self.device = torch.device(device)
         self.verbose = verbose
         self.loader = WeightLoader(weight_dir, device)
-        self.expert_cache = ExpertWeightCache(max_experts=128)
+        self.expert_cache = ExpertWeightCache(max_experts=512, device=device)
         self.layer_states = {}
         self._deq_cache = OrderedDict()
         self._prefetch_worker = None
@@ -348,6 +357,29 @@ class HomeSeekInferenceEngine:
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+        self._shared_expert_weights = {}
+        self._shared_experts_loaded = False
+        self._mtp_weights = {}
+        self._mtp_loaded = False
+        self._warmed_up = False
+
+        self._fused_moe = FusedMoEFFN(
+            num_experts=self.config.n_routed_experts,
+            intermediate_size=self.config.moe_intermediate_size,
+            hidden_size=self.config.hidden_size,
+            swiglu_limit=self.config.swiglu_limit,
+            use_triton=True,
+        )
+        self._shared_ffn = SharedExpertFFN(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.shared_expert_intermediate_size,
+            swiglu_limit=self.config.swiglu_limit,
+        )
+
+        self._load_shared_experts_gpu()
+        self._load_mtp_weights()
+        self._warmup()
 
     def _log(self, msg):
         if getattr(self, 'verbose', False):
@@ -380,14 +412,18 @@ class HomeSeekInferenceEngine:
         self.embed = self.embed.to(torch.bfloat16) if self.embed is not None else None
         self._log(f"embed.weight: {self.embed.shape if self.embed is not None else 'missing'}")
 
-        head = safe("head.weight")
-        output = safe("output.weight")
-        if head is not None:
-            self.lm_head = head.to(torch.bfloat16)
-        elif output is not None:
-            self.lm_head = output.to(torch.bfloat16)
-        else:
+        if self.config.tie_word_embeddings and self.embed is not None:
             self.lm_head = self.embed
+            self._log("lm_head: tied to embed.weight (shared)")
+        else:
+            head = safe("head.weight")
+            output = safe("output.weight")
+            if head is not None:
+                self.lm_head = head.to(torch.bfloat16)
+            elif output is not None:
+                self.lm_head = output.to(torch.bfloat16)
+            else:
+                self.lm_head = self.embed
         self._log(f"lm_head: {self.lm_head.shape if self.lm_head is not None else 'missing'}")
 
         norm = safe("norm.weight")
@@ -458,11 +494,34 @@ class HomeSeekInferenceEngine:
         else:
             result = load_fp8_weight(data, scale)
         if layer_idx is not None:
-            if len(self._deq_cache) >= 4:
-                for k in list(self._deq_cache.keys()):
-                    del self._deq_cache[k]
-                    break
+            if len(self._deq_cache) >= 16:
+                self._deq_cache.popitem(last=False)
             self._deq_cache[cache_key] = result
+        return result
+
+    def _compress_kv_overlapping(self, x: torch.Tensor, compress_ratio: int, dim: int) -> torch.Tensor:
+        B, T, D = x.shape
+        if T < compress_ratio:
+            return torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
+        overlap = compress_ratio // 2
+        stride = overlap
+        windows = []
+        for i in range(0, T - compress_ratio + 1, stride):
+            w = x[:, i:i + compress_ratio, :]
+            scores = torch.softmax((w.float() * (D ** -0.5)), dim=1)
+            combined = (scores * w.float()).sum(dim=1).to(x.dtype)
+            windows.append(combined)
+        if not windows:
+            return torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
+        result = torch.stack(windows, dim=1)
+        if x.shape[1] > i + compress_ratio:
+            tail = x[:, i + stride:, :]
+            if tail.shape[1] >= compress_ratio:
+                tail = tail[:, :tail.shape[1] // compress_ratio * compress_ratio, :]
+                tail_g = tail.view(B, -1, compress_ratio, D)
+                tail_a = torch.softmax(tail_g.float() * (D ** -0.5), dim=2)
+                tail_c = (tail_a * tail_g.float()).sum(dim=2).to(x.dtype)
+                result = torch.cat([result, tail_c], dim=1)
         return result
 
     def _compress_kv(self, hidden: torch.Tensor, lw: dict, layer_idx: int, state: LayerState):
@@ -487,10 +546,7 @@ class HomeSeekInferenceEngine:
         c_hidden = c_hidden * c_gate
 
         if c_hidden.shape[1] >= compress_ratio:
-            c_hidden = c_hidden[:, :c_hidden.shape[1] // compress_ratio * compress_ratio, :]
-            c_grouped = c_hidden.view(B, -1, compress_ratio, c_dim)
-            c_attn = torch.softmax(c_grouped.float() * (c_dim ** -0.5), dim=2)
-            c_hidden = (c_attn * c_grouped.float()).sum(dim=2).to(c_hidden.dtype)
+            c_hidden = self._compress_kv_overlapping(c_hidden, compress_ratio, c_dim)
         else:
             c_hidden = torch.zeros(B, 0, c_dim, device=c_hidden.device, dtype=c_hidden.dtype)
 
@@ -524,8 +580,8 @@ class HomeSeekInferenceEngine:
                     g = torch.sigmoid(g.float()).to(ik.dtype)
                     ik = ik * g
                 if ik.shape[1] >= compress_ratio:
-                    ik_tmp = ik[:, :ik.shape[1] // compress_ratio * compress_ratio, :]
-                    ik_tmp = ik_tmp.view(B, -1, compress_ratio, ik.shape[-1]).mean(dim=2)
+                    idx_dim_inner = ik.shape[-1]
+                    ik_tmp = self._compress_kv_overlapping(ik, compress_ratio, idx_dim_inner)
                     if idx_c_ape is not None and ik_tmp.shape[1] > 0:
                         ap = min(idx_c_ape.shape[0], ik_tmp.shape[1])
                         ik_tmp[:, :ap, :] = ik_tmp[:, :ap, :] + idx_c_ape[:ap, :].to(ik_tmp.dtype)
@@ -541,7 +597,8 @@ class HomeSeekInferenceEngine:
         state.compressed_kv.append(c_hidden.squeeze(0), idx_keys)
         return state
 
-    def _compute_indexer(self, q_latent: torch.Tensor, lw: dict, state: LayerState, layer_idx: int):
+    def _compute_indexer(self, q_latent: torch.Tensor, lw: dict, state: LayerState, layer_idx: int,
+                         use_lightning: bool = True):
         compressed_kv = state.compressed_kv.get() if state.compressed_kv is not None else None
         if compressed_kv is None or compressed_kv.shape[0] == 0:
             return None
@@ -562,8 +619,20 @@ class HomeSeekInferenceEngine:
         if idx_k is None or idx_k.shape[0] == 0:
             return self._get_compressed_attention_kv(state, lw)
 
-        idx_k = idx_k.unsqueeze(0).unsqueeze(0)
-        scores = torch.matmul(idx_q.float() * (self.config.index_head_dim ** -0.5), idx_k.float().transpose(-2, -1))
+        idx_k_4d = idx_k.unsqueeze(0).unsqueeze(0)
+
+        if use_lightning:
+            i_dim = self.config.index_head_dim
+            q_fp8 = idx_q.to(torch.float8_e4m3fn).float()
+            k_fp8 = idx_k_4d.to(torch.float8_e4m3fn).float()
+            scale = i_dim ** -0.5
+            scores = torch.matmul(q_fp8 * scale, k_fp8.transpose(-2, -1))
+        else:
+            scores = torch.matmul(
+                idx_q.float() * (self.config.index_head_dim ** -0.5),
+                idx_k_4d.float().transpose(-2, -1),
+            )
+
         scores_pooled = scores[:, :, -1:, :].mean(dim=1).squeeze(1)
 
         k = min(self.config.index_topk, n_compressed)
@@ -736,25 +805,17 @@ class HomeSeekInferenceEngine:
         n_groups = self.config.num_attention_heads // n_kv
         scale_f = self.config.head_dim ** -0.5
 
-        attn = torch.zeros(B, self.config.num_attention_heads, T, k_all.shape[-2],
-                           device=q.device, dtype=torch.float32)
-        for g in range(n_groups):
-            q_g = q[:, g * n_kv:(g + 1) * n_kv]
-            with torch.no_grad():
-                scores = torch.matmul(q_g.float() * scale_f, k_all.float().transpose(-2, -1))
-            attn[:, g * n_kv:(g + 1) * n_kv] = scores
+        k_expanded = k_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k_all.shape[-2], k_all.shape[-1])
+        v_expanded = v_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, v_all.shape[-2], v_all.shape[-1])
+
+        attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
 
         if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
             sw_len = k_sw.shape[-2]
-            for h in range(self.config.num_attention_heads):
-                attn[:, h, :, sw_len - 1:sw_len] = attn[:, h, :, sw_len - 1:sw_len] + attn_sink[h]
+            attn[:, :, :, sw_len - 1:sw_len] = attn[:, :, :, sw_len - 1:sw_len] + attn_sink.view(1, -1, 1, 1)
 
-        attn_p = F.softmax(attn, dim=-1).to(v_all.dtype)
-        out = torch.zeros(B, self.config.num_attention_heads, T, self.config.head_dim,
-                          device=q.device, dtype=v_all.dtype)
-        for g in range(n_groups):
-            a_g = attn_p[:, g * n_kv:(g + 1) * n_kv]
-            out[:, g * n_kv:(g + 1) * n_kv] = torch.matmul(a_g, v_all)
+        attn_p = F.softmax(attn, dim=-1).to(v_expanded.dtype)
+        out = torch.matmul(attn_p, v_expanded)
 
         out = apply_rotary_emb(out, freqs_cis, rd=self.config.qk_rope_head_dim, inverse=True)
 
@@ -763,11 +824,8 @@ class HomeSeekInferenceEngine:
         if wo_a is not None and wo_b is not None:
             out_g = out.view(B, T, self.config.o_groups, -1)
             wo_a_g = wo_a.view(self.config.o_groups, self.config.o_lora_rank, self.config.hidden_size)
-            projected_parts = []
-            for g in range(self.config.o_groups):
-                part = torch.matmul(out_g[:, :, g, :].to(wo_a_g.dtype), wo_a_g[g].t())
-                projected_parts.append(part)
-            out_combined = torch.cat(projected_parts, dim=-1)
+            out_combined = torch.einsum('btgd,grd->btgr', out_g.to(wo_a_g.dtype), wo_a_g)
+            out_combined = out_combined.reshape(B, T, -1)
             out = torch.matmul(out_combined.to(wo_b.dtype), wo_b.t())
         else:
             out = out.view(B, T, self.config.num_attention_heads * self.config.head_dim)
@@ -793,19 +851,19 @@ class HomeSeekInferenceEngine:
     def _make_raw_entry(self, data, scale):
         if data is None:
             return None
-        dev = self.device
-        data = data.to(dev, non_blocking=True)
-        if scale is not None:
-            scale = scale.to(torch.float32).to(dev, non_blocking=True) if scale.dtype != torch.float32 else scale.to(dev, non_blocking=True)
-        if data.dtype == torch.bfloat16:
+        if data.dtype == torch.bfloat16 or data.dtype == torch.float32:
+            data = data.to(self.device, non_blocking=True)
             return (data, None, "bf16")
-        if data.dtype == torch.int8:
-            return (data, scale, "fp4")
         if data.dtype == torch.float8_e4m3fn:
-            return (data, scale, "fp8")
+            data = data.to(self.device, non_blocking=True)
+            sf = scale.to(torch.float32).to(self.device, non_blocking=True) if scale is not None else None
+            return (data, sf, "fp8")
+        keep_cpu = data.dtype == torch.int8
+        dev = self.device if not keep_cpu else "cpu"
+        data = data.to(dev, non_blocking=not keep_cpu)
         if scale is not None:
-            return (data, scale, "fp8")
-        return (data, None, "bf16")
+            scale = scale.to(torch.float32).to(dev, non_blocking=not keep_cpu) if scale.dtype != torch.float32 else scale.to(dev, non_blocking=not keep_cpu)
+        return (data, scale, "fp4")
 
     def _load_expert_weights(self, layer_idx, eid):
         cache_key = f"{layer_idx}_{eid}"
@@ -843,6 +901,18 @@ class HomeSeekInferenceEngine:
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
         return self.expert_cache.get(cache_key)
 
+    def _load_expert_deq(self, layer_idx, eid):
+        raw = self._load_expert_weights(layer_idx, eid)
+        if raw is None:
+            if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
+                raw = self._cpu_ffn_fallback(layer_idx, eid)
+            if raw is None:
+                return None
+        deq = self.expert_cache.deq(f"{layer_idx}_{eid}")
+        if deq is None:
+            deq = raw
+        return deq
+
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
         gate_bias = lw.get("ffn.gate.bias")
@@ -864,72 +934,49 @@ class HomeSeekInferenceEngine:
         flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
         flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
 
-        for k in range(self.config.num_experts_per_tok):
-            expert_ids = flat_topk_idx[:, k]
-            weights = flat_topk_w[:, k]
-            unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
-            for eid_idx in range(unique_eids.shape[0]):
-                eid = unique_eids[eid_idx].item()
-                if eid < 0:
-                    continue
-                used_experts.add(eid)
-                token_mask = inverse == eid_idx
-                if not token_mask.any():
-                    continue
-                raw_entry = self._load_expert_weights(layer_idx, eid)
-                if raw_entry is None:
-                    if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
-                        raw_entry = self._cpu_ffn_fallback(layer_idx, eid)
-                    if raw_entry is None:
+        try:
+            result = self._fused_moe.forward(
+                flat_hidden, flat_topk_idx, flat_topk_w,
+                lambda layer, eid: self._load_expert_deq(layer, eid),
+                layer_idx,
+            )
+            ffn_out = result.reshape(B, T, D)
+        except Exception as _e:
+            if self.verbose:
+                self._log(f"FusedMoE fallback at layer {layer_idx}: {type(_e).__name__}")
+            for k in range(self.config.num_experts_per_tok):
+                expert_ids = flat_topk_idx[:, k]
+                weights = flat_topk_w[:, k]
+                unique_eids, inverse = torch.unique(expert_ids, return_inverse=True)
+                for eid_idx in range(unique_eids.shape[0]):
+                    eid = unique_eids[eid_idx].item()
+                    if eid < 0:
                         continue
-                deq_triple = self.expert_cache.deq(f"{layer_idx}_{eid}")
-                if deq_triple is None:
-                    deq_triple = raw_entry
-                w1_d, w3_d, w2_d = deq_triple
-                if w1_d is None:
-                    continue
-                h_batch = flat_hidden[token_mask].to(w1_d.dtype)
-                gate_out = torch.matmul(h_batch, w1_d.t())
-                up_out = torch.matmul(h_batch, w3_d.t())
-                x = torch.cat([gate_out, up_out], dim=-1)
-                activated = swiglu_forward(x.contiguous(), swiglu_clamp_value=self.config.swiglu_limit)
-                out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
-                ffn_out.reshape(total_tokens, D)[token_mask] += out * weights[token_mask].unsqueeze(-1)
+                    used_experts.add(eid)
+                    token_mask = inverse == eid_idx
+                    if not token_mask.any():
+                        continue
+                    deq_triple = self._load_expert_deq(layer_idx, eid)
+                    if deq_triple is None:
+                        continue
+                    w1_d, w3_d, w2_d = deq_triple
+                    if w1_d is None:
+                        continue
+                    h_batch = flat_hidden[token_mask].to(w1_d.dtype)
+                    gate_out = torch.matmul(h_batch, w1_d.t())
+                    up_out = torch.matmul(h_batch, w3_d.t())
+                    g = gate_out.float().clamp(max=self.config.swiglu_limit)
+                    u = up_out.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+                    activated = (g * g.sigmoid() * u).to(w1_d.dtype)
+                    out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                    ffn_out.reshape(total_tokens, D)[token_mask] += out * weights[token_mask].unsqueeze(-1)
 
-        shared_prefix = f"layers.{layer_idx}.ffn.shared_experts"
-        shared_keys = [f"{shared_prefix}.w1.weight", f"{shared_prefix}.w1.scale",
-                       f"{shared_prefix}.w3.weight", f"{shared_prefix}.w3.scale",
-                       f"{shared_prefix}.w2.weight", f"{shared_prefix}.w2.scale"]
-        shared_tensors = self.loader.get_weights(*shared_keys)
-        shared_w1 = shared_tensors.get(shared_keys[0])
-        if shared_w1 is not None:
-            dev = self.device
-            def _load_w(data, scale):
-                if data is None:
-                    return None
-                if data.dtype == torch.int8:
-                    return load_fp4_weight(data.to(dev), scale.to(dev) if scale is not None else None)
-                return load_fp8_weight(data.to(dev), scale.to(dev) if scale is not None else None)
-
-            s1 = shared_tensors.get(shared_keys[1])
-            w3 = shared_tensors.get(shared_keys[2])
-            s3 = shared_tensors.get(shared_keys[3])
-            w2 = shared_tensors.get(shared_keys[4])
-            s2 = shared_tensors.get(shared_keys[5])
-            w1_d = _load_w(shared_w1.to(dev), s1)
-            w3_d = _load_w(w3, s3)
-            w2_d = _load_w(w2, s2)
-
-            if w3_d is not None and w2_d is not None:
-                h = hidden_states.to(w1_d.dtype)
-                gate_out = torch.matmul(h, w1_d.t())
-                up_out = torch.matmul(h, w3_d.t())
-                x = torch.cat([gate_out, up_out], dim=-1)
-                x_2d = x.view(-1, x.shape[-1]).contiguous()
-                activated = swiglu_forward(x_2d, swiglu_clamp_value=self.config.swiglu_limit)
-                activated = activated.view(*x.shape[:-1], -1)
-                out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
-                ffn_out = ffn_out + out
+        shared_w = self._get_shared_expert(layer_idx)
+        if shared_w is not None:
+            w1_d, w3_d, w2_d = shared_w
+            shared_out = self._shared_ffn.forward(
+                hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
+            ffn_out = ffn_out + shared_out
 
         return ffn_out, used_experts
 
@@ -984,6 +1031,185 @@ class HomeSeekInferenceEngine:
             _, topk_idx = torch.topk(scores, self.config.num_experts_per_tok + 4, dim=-1)
             predicted_ids = topk_idx[0].tolist()
             self._prefetch_worker.prefetch(next_idx, predicted_ids)
+
+    def _load_shared_experts_gpu(self):
+        self._shared_experts_loaded = True
+        self._log("Shared expert lazy loading enabled (loaded on first use)")
+
+    def _get_shared_expert(self, layer_idx: int):
+        if layer_idx in self._shared_expert_weights:
+            return self._shared_expert_weights[layer_idx]
+        shared_prefix = f"layers.{layer_idx}.ffn.shared_experts"
+        shared_keys = [f"{shared_prefix}.w1.weight", f"{shared_prefix}.w1.scale",
+                       f"{shared_prefix}.w3.weight", f"{shared_prefix}.w3.scale",
+                       f"{shared_prefix}.w2.weight", f"{shared_prefix}.w2.scale"]
+        tensors = self.loader.get_weights(*shared_keys)
+        w1 = tensors.get(shared_keys[0])
+        if w1 is None:
+            self._shared_expert_weights[layer_idx] = None
+            return None
+        def _load_w(data, scale):
+            if data is None:
+                return None
+            dev = self.device
+            if data.dtype == torch.int8:
+                return load_fp4_weight(data.to(dev), scale.to(dev) if scale is not None else None)
+            return load_fp8_weight(data.to(dev), scale.to(dev) if scale is not None else None)
+        s1 = tensors.get(shared_keys[1])
+        w3_t = tensors.get(shared_keys[2])
+        s3 = tensors.get(shared_keys[3])
+        w2_t = tensors.get(shared_keys[4])
+        s2 = tensors.get(shared_keys[5])
+        w1_d = _load_w(w1, s1)
+        w3_d = _load_w(w3_t, s3) if w3_t is not None else None
+        w2_d = _load_w(w2_t, s2) if w2_t is not None else None
+        if w1_d is not None and w3_d is not None and w2_d is not None:
+            weights = (w1_d, w3_d, w2_d)
+            self._shared_expert_weights[layer_idx] = weights
+            return weights
+        self._shared_expert_weights[layer_idx] = None
+        return None
+
+    def _load_mtp_weights(self):
+        self._mtp_loaded = True
+        self._log("MTP lazy loading enabled")
+
+    def _get_mtp_weight(self, key: str):
+        if key in self._mtp_weights:
+            return self._mtp_weights[key]
+        w = self.loader.get_weight(key, device=str(self.device))
+        if w is not None:
+            w = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
+            self._mtp_weights[key] = w
+        return w
+
+    def _warmup(self):
+        if self._warmed_up:
+            return
+        self._log("Warming up kernels...")
+        try:
+            dummy = torch.zeros(1, 1, device=self.device, dtype=torch.bfloat16)
+            _ = tile_kernels.quant.cast_back(
+                (dummy, torch.ones(1, 1, device=self.device)),
+                'bf16', (128, 128))
+        except Exception:
+            pass
+        try:
+            from tile_kernels.moe import get_fused_mapping, expand_to_fused, reduce_fused
+            from tile_kernels.torch.moe import inplace_unique_group_indices
+            dw = torch.randn(16, 4096, device=self.device, dtype=torch.bfloat16)
+            ti = torch.randint(0, 256, (16, 6), device=self.device, dtype=torch.int64)
+            inplace_unique_group_indices(ti, 256)
+            m = get_fused_mapping(ti, 256, 4096, 32)
+            ex = expand_to_fused(dw, m[3], m[0])
+            tw = torch.randn(16, 6, device=self.device, dtype=torch.float32)
+            _ = reduce_fused(ex, tw, m[3])
+            torch.cuda.synchronize(self.device)
+            self._log("MoE kernels warmed")
+        except Exception as e:
+            self._log(f"MoE warmup: {e}")
+        self._warmed_up = True
+        self._log("Warmup complete")
+
+    @torch.no_grad()
+    def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6):
+        device = self.device
+        mtp_embed = self._get_mtp_weight("mtp.0.embed.weight")
+        mtp_norm = self._get_mtp_weight("mtp.0.norm.weight")
+        mtp_head = self._get_mtp_weight("mtp.0.head.weight")
+        if mtp_head is None:
+            mtp_head = self.lm_head
+        mtp_head_norm = self._get_mtp_weight("mtp.0.head_norm.weight")
+        if mtp_embed is None:
+            return None, 0
+
+        draft_tokens = []
+        h = last_hidden
+        for step in range(num_draft):
+            h_flat = h[:, -1:, :]
+            if mtp_norm is not None:
+                h_flat = rms_norm(h_flat, mtp_norm.to(torch.bfloat16))
+            logits = h_flat.to(mtp_head.dtype) @ mtp_head.t()
+            if mtp_head_norm is not None:
+                logits = rms_norm(logits, mtp_head_norm.to(torch.bfloat16))
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1].float() / temperature, dim=-1)
+                next_id = torch.multinomial(probs, 1)
+            else:
+                next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+            draft_tokens.append(next_id)
+
+            next_embed = mtp_embed[next_id].to(torch.bfloat16)
+            h = torch.cat([h, next_embed], dim=1)
+
+        draft_ids = torch.cat(draft_tokens, dim=-1)
+        return draft_ids, len(draft_tokens)
+
+    @torch.no_grad()
+    def _mtp_accept_drafts(self, input_ids, draft_ids, temperature=0.6):
+        if draft_ids is None or draft_ids.shape[1] == 0:
+            return 0, None
+
+        full_ids = torch.cat([input_ids, draft_ids], dim=-1)
+        B, T_full = full_ids.shape
+
+        h = self.embed[full_ids].to(torch.bfloat16)
+        h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+        layer_states_bak = {}
+        for k, v in self.layer_states.items():
+            if v.kv_latent_cache is not None:
+                state_copy = LayerState(device=str(self.device))
+                state_copy.kv_latent_cache = v.kv_latent_cache.clone()
+                state_copy.archived_kv = v.archived_kv
+                state_copy.archived_len = v.archived_len
+                state_copy.compressed_kv = v.compressed_kv
+                layer_states_bak[k] = state_copy
+
+        self.layer_states = {}
+        try:
+            for layer_idx in range(self.config.num_hidden_layers):
+                lw = self._get_layer_weights(layer_idx)
+
+                residual_attn = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                if lw.get("attn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                else:
+                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+                residual = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                if lw.get("ffn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                ffn_out, _ = self._forward_ffn(h_pre, lw, layer_idx, full_ids)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(ffn_out, residual, post, comb)
+                else:
+                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+            if self.norm_weight is not None:
+                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+
+            all_logits = h_3d.to(self.lm_head.dtype) @ self.lm_head.t()
+            draft_len = draft_ids.shape[1]
+
+            n_accept = 0
+            for i in range(draft_len):
+                expected = draft_ids[:, i]
+                pred_logits = all_logits[:, input_ids.shape[1] + i - 1, :]
+                pred_id = pred_logits.argmax(dim=-1)
+                if pred_id.item() == expected.item():
+                    n_accept += 1
+                else:
+                    break
+            return n_accept, all_logits[:, input_ids.shape[1] - 1 + n_accept, :]
+        finally:
+            self.layer_states = layer_states_bak
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=50, temperature=0.6):
@@ -1065,7 +1291,13 @@ class HomeSeekInferenceEngine:
             next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
 
         generated = [next_id]
-        for step in range(max_new_tokens - 1):
+
+        mtp_num_draft = 3 if self._mtp_loaded else 0
+        verify_extra_seen = 0
+        last_h_for_mtp = None
+
+        step = 0
+        while step < max_new_tokens - 1:
             h = self.embed[next_id].to(torch.bfloat16)
             h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):
@@ -1101,6 +1333,9 @@ class HomeSeekInferenceEngine:
                                         self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
                                         self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
 
+            if layer_idx == self.config.num_hidden_layers - 1:
+                last_h_for_mtp = h
+
             h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
             if self.norm_weight is not None:
                 h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
@@ -1112,6 +1347,35 @@ class HomeSeekInferenceEngine:
             else:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
             generated.append(next_id)
+            step += 1
+
+            if mtp_num_draft > 0 and step < max_new_tokens - 1:
+                all_inputs = torch.cat(
+                    [input_ids] + generated, dim=-1)
+                draft_ids, n_draft = self._mtp_generate_draft(
+                    last_h_for_mtp, mtp_num_draft, temperature)
+                if draft_ids is not None and n_draft > 0:
+                    n_acc, verify_logits = self._mtp_accept_drafts(
+                        all_inputs, draft_ids, temperature)
+                    if n_acc > 0:
+                        accepted_ids = draft_ids[:, :n_acc]
+                        for i in range(n_acc):
+                            generated.append(accepted_ids[:, i:i+1])
+                            step += 1
+                            if step >= max_new_tokens - 1:
+                                break
+                        if step < max_new_tokens - 1:
+                            if n_acc < n_draft and verify_logits is not None and verify_logits.dim() >= 1:
+                                if temperature > 0:
+                                    new_probs = F.softmax(verify_logits.float() / temperature, dim=-1)
+                                    next_id = torch.multinomial(new_probs, 1)
+                                else:
+                                    next_id = verify_logits.argmax(dim=-1, keepdim=True)
+                                generated.append(next_id)
+                                step += 1
+                            elif n_acc == n_draft:
+                                next_id = accepted_ids[:, -1:]
+                        continue
 
         total_time = time.time() - start
         all_tokens = torch.cat([input_ids] + generated, dim=-1)
