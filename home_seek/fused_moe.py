@@ -291,6 +291,16 @@ def fused_expert_ffn_triton(
         return fused_expert_ffn_pt(hidden, w1, w3, w2, swiglu_limit)
 
     M = hidden.shape[0]
+
+    # M <= 8: cuBLAS is 8x faster than Triton (15/16 SM idle).
+    # Benefits MTP batch verify (M=3), small-batch decode, and shared expert.
+    if M <= 8:
+        if (_is_fp4_packed(w1) and _is_fp4_packed(w3) and _is_fp4_packed(w2)
+                and w1_scale is not None and w3_scale is not None and w2_scale is not None):
+            w1_bf, w3_bf, w2_bf = _dequantize_fp4_to_bf16(w1, w1_scale, w3, w3_scale, w2, w2_scale)
+            return fused_expert_ffn_pt(hidden, w1_bf, w3_bf, w2_bf, swiglu_limit)
+        return fused_expert_ffn_pt(hidden, w1, w3, w2, swiglu_limit)
+
     H = hidden.shape[1]
 
     # Fused FP4 path: dequantize + GEMM in single kernel, no intermediate BF16 tensor

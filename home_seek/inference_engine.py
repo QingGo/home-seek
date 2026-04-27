@@ -464,6 +464,7 @@ class HomeSeekInferenceEngine:
         if self._hot_expert_ids:
             self._preload_hot_experts_cpu_cache()
             self._preload_gpu_hot_experts()
+        self._stop_token_ids = self._load_stop_token_ids()
         if preload_all:
             self._preload_all_experts()
         warmup_ok = self._warmup()
@@ -498,6 +499,23 @@ class HomeSeekInferenceEngine:
         self._hash_expert_ids = hash_ids[:18] if len(hash_ids) > 18 else hash_ids
         self._log(f"Hot experts: {len(self._hot_expert_ids)} IDs ({len(self._hot_expert_set_by_layer)} layers), "
                   f"Hash experts: {len(self._hash_expert_ids)} IDs")
+
+    def _load_stop_token_ids(self) -> set[int]:
+        tok_path = os.path.join(self.weight_dir, 'tokenizer.json')
+        if not os.path.exists(tok_path):
+            raise FileNotFoundError(
+                f"Tokenizer file not found at {tok_path}. "
+                "Please download the model weights to the correct location."
+            )
+        with open(tok_path) as f:
+            data = json.load(f)
+        for t in data.get('added_tokens', []):
+            if t.get('content') == '<｜end▁of▁sentence｜>':
+                return {t['id']}
+        raise ValueError(
+            "Stop token not found in tokenizer.json. "
+            "Expected an added_token with content '<｜end▁of▁sentence｜>'."
+        )
 
     def _preload_gpu_hot_experts(self):
         if not self._hot_expert_ids:
@@ -1314,17 +1332,14 @@ class HomeSeekInferenceEngine:
     def _forward_ffn_hot_batched(self, flat_hidden, flat_topk_idx, flat_topk_w, layer_idx):
         B, D = flat_hidden.shape
         num_topk = flat_topk_idx.shape[1]
-        all_eids = set()
-        for b in range(B):
-            for k in range(num_topk):
-                eid = int(flat_topk_idx[b, k].item())
-                if eid >= 0:
-                    all_eids.add(eid)
-        if not all_eids:
+        valid_mask = flat_topk_idx >= 0
+        valid_eids = flat_topk_idx[valid_mask]
+        if valid_eids.numel() == 0:
             return torch.zeros_like(flat_hidden)
+        all_eids = sorted(set(int(x) for x in valid_eids.tolist()))
         loaded = {}
         I_dim = None
-        for eid in sorted(all_eids):
+        for eid in all_eids:
             weights = self._load_gpu_hot_expert_bf16(layer_idx, eid)
             if weights is None:
                 return None
@@ -1333,7 +1348,6 @@ class HomeSeekInferenceEngine:
                 I_dim = w1.shape[0]
             loaded[eid] = (w1, w3, w2)
         loaded_eids = sorted(loaded.keys())
-        eid_to_idx = {eid: i for i, eid in enumerate(loaded_eids)}
         num_e = len(loaded_eids)
         w1 = torch.cat([loaded[eid][0] for eid in loaded_eids], dim=0)
         w3 = torch.cat([loaded[eid][1] for eid in loaded_eids], dim=0)
@@ -1343,16 +1357,19 @@ class HomeSeekInferenceEngine:
         g = gate.float().clamp(max=self.config.swiglu_limit)
         u = up.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
         activated = (g * g.sigmoid() * u).to(torch.bfloat16)
-        routing = torch.zeros(B, num_e * I_dim, device=flat_hidden.device, dtype=torch.bfloat16)
-        for b in range(B):
-            for k in range(num_topk):
-                eid = int(flat_topk_idx[b, k].item())
-                if eid < 0:
-                    continue
-                idx = eid_to_idx.get(eid)
-                if idx is None:
-                    continue
-                routing[b, idx * I_dim:(idx + 1) * I_dim] = flat_topk_w[b, k]
+        # Vectorized routing scatter (no Python loop)
+        expert_weights = torch.zeros(B, num_e, device=flat_hidden.device, dtype=torch.bfloat16)
+        max_eid = max(loaded_eids)
+        eid_to_idx_t = torch.full((max_eid + 1,), -1, device=flat_hidden.device, dtype=torch.int64)
+        for i, eid in enumerate(loaded_eids):
+            eid_to_idx_t[eid] = i
+        clamped = flat_topk_idx.clamp(min=0).long()
+        mapped = eid_to_idx_t[clamped]
+        v = valid_mask & (mapped >= 0)
+        b_idx = torch.arange(B, device=flat_hidden.device).unsqueeze(1).expand(-1, num_topk)
+        if v.any():
+            expert_weights[b_idx[v], mapped[v]] = flat_topk_w[v].to(torch.bfloat16)
+        routing = expert_weights.unsqueeze(-1).expand(-1, -1, I_dim).reshape(B, -1)
         activated_weighted = activated * routing
         return activated_weighted.to(w2.dtype) @ w2.T
 
@@ -2646,6 +2663,8 @@ class HomeSeekInferenceEngine:
             if stream_callback is not None:
                 stream_callback(next_id.item())
             step += 1
+            if next_id.item() in self._stop_token_ids:
+                break
 
             if mtp_num_draft > 0 and step < max_new_tokens - 1:
                 all_inputs = torch.cat(
@@ -2660,22 +2679,32 @@ class HomeSeekInferenceEngine:
                             if stream_callback is not None:
                                 stream_callback(draft_ids[:, i:i+1].item())
                             step += 1
+                            if draft_ids[:, i:i+1].item() in self._stop_token_ids:
+                                break
                             if step >= max_new_tokens - 1:
                                 break
-                        if step < max_new_tokens - 1:
-                            next_id = draft_ids[:, -1:]
-                        continue
+                        else:
+                            if step < max_new_tokens - 1:
+                                next_id = draft_ids[:, -1:]
+                            continue
+                        break
                     n_acc, bonus_logits = self._mtp_verify_batched(
                         draft_ids, temperature, main_pred_id=next_id)
                     if n_acc > 0:
                         accepted_ids = draft_ids[:, :n_acc]
+                        eos_hit = False
                         for i in range(n_acc):
                             generated.append(accepted_ids[:, i:i+1])
                             if stream_callback is not None:
                                 stream_callback(accepted_ids[:, i:i+1].item())
                             step += 1
+                            if accepted_ids[:, i:i+1].item() in self._stop_token_ids:
+                                eos_hit = True
+                                break
                             if step >= max_new_tokens - 1:
                                 break
+                        if eos_hit:
+                            break
                         if step < max_new_tokens - 1:
                             if n_acc < n_draft and bonus_logits is not None and bonus_logits.dim() >= 1:
                                 if temperature > 0:
@@ -2687,6 +2716,8 @@ class HomeSeekInferenceEngine:
                                 if stream_callback is not None:
                                     stream_callback(next_id.item())
                                 step += 1
+                                if next_id.item() in self._stop_token_ids:
+                                    break
                             elif n_acc == n_draft:
                                 next_id = accepted_ids[:, -1:]
                         continue
@@ -2694,6 +2725,8 @@ class HomeSeekInferenceEngine:
         total_time = time.time() - start
         prefill_time = prefill_end - start
         decode_time = total_time - prefill_time
+        if generated and generated[-1][0].item() in self._stop_token_ids:
+            generated = generated[:-1]
         all_tokens = torch.cat([input_ids] + generated, dim=-1)
         result = {
             "tokens": all_tokens,

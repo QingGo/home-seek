@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V18+ — Shared expert cuBLAS + MTP batch verify + causal mask.
+DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V19 — Stop token fix + FusedMoEFFN cuBLAS dispatch for small M.
 
 ## 纪律
 
@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V18+ — Shared expert cuBLAS +
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (174 pass, <15s)
+make test-unit         # 单元测试 (176 pass, <30s)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 性能分析: 5+20 tok, temp=0
 make smoke             # 最小冒烟
@@ -31,7 +31,7 @@ uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --t
 - 热专家: `hot_experts.json`; 架构设计: `docs/arch_design.md`
 - 实施记录: `docs/implementation_notes.md`
 - 里程碑记忆: `.agent_memory.md` (基线+瓶颈+下一步)
-- 主引擎: `home_seek/inference_engine.py` (~2750 行)
+- 主引擎: `home_seek/inference_engine.py` (~2770 行)
 - MoE FFN: `home_seek/fused_moe.py` (Triton FP4 dequant + cuBLAS)
 - KV 压缩: `home_seek/compressor.py` (支持 T>1 decode)
 - 路由: `home_seek/router.py` (softplus+sqrt+stable_topk)
@@ -74,6 +74,8 @@ MTP 模块:
 
 ## 已知陷阱 (gotchas)
 
+- **模型真正的结束标记是 token 1 (`</｜end▁of▁sentence｜>`)**, 不是 EOS 128000. `_load_stop_token_ids()` 从 `weights/tokenizer.json` 读取. 找不到文件直接报错.
+- **FusedMoEFFN cuBLAS 小 M**: `fused_expert_ffn_triton` 在 M<=8 时走 cuBLAS, 避免 Triton 15/16 SM 空转. `fused_moe.py:297`.
 - `ExpertWeightCache.clear()` 保留 pinned 条目 (V17 修复)
 - 共享 RAID 多线程读盘反效果, prefetch 默认禁用
 - `tl.load/store` 必须有行列掩码; `tl.dot` M,N,K≥16

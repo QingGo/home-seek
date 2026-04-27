@@ -464,3 +464,36 @@ class TestTokenizerSpecialTokens:
         )
         assert 'stream_callback' in sig.parameters
         assert sig.parameters['stream_callback'].default is None
+
+
+class TestStopToken:
+    """Verify engine stops at </｜end▁of▁sentence｜> (token 1) from tokenizer.json."""
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_load_stop_token_ids_from_json(self):
+        """_load_stop_token_ids reads weights/tokenizer.json and returns {1}."""
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.weight_dir = "weights"
+        eng._log = lambda msg: None
+        ids = eng._load_stop_token_ids()
+        assert ids == {1}, f"Expected {{1}}, got {ids}"
+
+    def test_stop_token_stops_generation_and_is_excluded(self):
+        """When model generates </｜end▁of▁sentence｜>, generation stops and token 1 is excluded."""
+        from home_seek.inference_engine import HomeSeekInferenceEngine as H
+        from transformers import PreTrainedTokenizerFast
+        from encoding_dsv4 import encode_messages
+        tok = PreTrainedTokenizerFast(tokenizer_file='weights/tokenizer.json')
+        tok.eos_token_id = 128000
+        eng = H('weights', hot_experts_path='hot_experts.json')
+        p = encode_messages([{'role': 'user', 'content': 'Hi'}], thinking_mode='chat')
+        ids = tok.encode(p, return_tensors='pt').to('cuda')
+        r = eng.generate(ids, max_new_tokens=20, temperature=0.0)
+        gen = r['tokens'][0].tolist()[5:]
+        text = tok.decode(r['tokens'][0], skip_special_tokens=True)
+        assert 1 not in gen, f"Token 1 should be stripped from output, got {gen}"
+        assert 'Hello! How can I help you today?' in text
+        assert len(gen) < 20, "Should have stopped early (not hit max_new_tokens)"
