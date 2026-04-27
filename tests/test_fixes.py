@@ -79,6 +79,7 @@ class TestMHC:
     def test_mhc_pre_post(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.verbose = False
+        eng._use_triton = True
         eng.config = type('obj', (object,), {
             'hc_mult': 4, 'hc_sinkhorn_iters': 5, 'hc_eps': 1e-6, 'rms_norm_eps': 1e-6,
             'num_attention_heads': 64, 'num_key_value_heads': 1,

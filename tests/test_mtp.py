@@ -109,6 +109,7 @@ def _make_mock_engine():
     eng._mtp_loaded = True
     eng.loader = None
     eng._gpu_expert_store = None
+    eng._use_triton = True
 
     from home_seek.inference_engine import ExpertWeightCache
     eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")

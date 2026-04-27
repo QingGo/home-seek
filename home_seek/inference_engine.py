@@ -60,9 +60,61 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int = 64, inv
     return torch.cat([x_pass, x_rope_complex.to(x.dtype)], dim=-1)
 
 
+def _fp8_simulate(x, block_size=64):
+    """In-place FP8 quantize+dequantize simulation (QAT). Matches demo act_quant."""
+    orig_dtype = x.dtype
+    x_f32 = x.float()
+    *front, N = x_f32.shape
+    x_flat = x_f32.reshape(-1, N)
+    M = x_flat.shape[0]
+    num_blocks = (N + block_size - 1) // block_size
+    if N % block_size != 0:
+        pad = block_size - N % block_size
+        x_flat = F.pad(x_flat, (0, pad))
+    x_blocks = x_flat.reshape(M, num_blocks, block_size)
+    amax = x_blocks.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-4)
+    scale = 2 ** torch.ceil(torch.log2(amax / 448.0))
+    x_q = (x_blocks / scale).clamp(-448.0, 448.0)
+    x_dq = x_q * scale
+    x_flat.copy_(x_dq.view_as(x_flat)[:, :N])
+    x.copy_(x_f32.to(orig_dtype))
+    return x
+
+
+def _fp4_simulate(x, block_size=32):
+    """In-place FP4 quantize+dequantize simulation (QAT)."""
+    orig_dtype = x.dtype
+    x_f32 = x.float()
+    *front, N = x_f32.shape
+    x_flat = x_f32.reshape(-1, N)
+    M = x_flat.shape[0]
+    pad_n = (block_size - N % block_size) % block_size
+    if pad_n:
+        x_flat = F.pad(x_flat, (0, pad_n))
+    x_blocks = x_flat.reshape(M, -1, block_size)
+    amax = x_blocks.abs().max(dim=-1, keepdim=True).values.clamp(min=6e-38)
+    scale = 2 ** torch.ceil(torch.log2(amax / 6.0))
+    x_q = (x_blocks / scale).clamp(-6.0, 6.0)
+    x_dq = x_q * scale
+    x_flat.copy_(x_dq.reshape(M, -1)[:, :N])
+    x.copy_(x_f32.to(orig_dtype))
+    return x
+
+
+def _hadamard_transform(x):
+    """Fast Walsh-Hadamard transform along last dim."""
+    n = x.shape[-1]
+    h = 1
+    x_f = x.float()
+    while h < n:
+        a = x_f[..., :h]
+        b = x_f[..., h:2*h]
+        x_f = torch.cat([a + b, a - b], dim=-1)
+        h *= 2
+    return x_f.to(x.dtype) * (n ** -0.5)
+
+
 def _ue8m0_to_f32(sf: torch.Tensor) -> torch.Tensor:
-    if sf.dtype == torch.float32:
-        return sf
     if sf.element_size() != 1:
         return sf.to(torch.float32)
     sf_u8 = sf.view(torch.uint8)
@@ -335,7 +387,7 @@ class ExpertWeightCache:
 class HomeSeekInferenceEngine:
     def __init__(self, weight_dir: str = "weights", device: str = "cuda", verbose: bool = False,
                  hot_experts_path: str = "hot_experts.json", preload_all: bool = False,
-                 reprobe: bool = False):
+                 reprobe: bool = False, use_triton: bool = True):
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig(config_path)
         self.weight_dir = weight_dir
@@ -357,6 +409,7 @@ class HomeSeekInferenceEngine:
         self._prefetch_worker = None
         self._load_global_weights()
         self._prefetch_enabled = False  # async prefetch adds GIL contention on shared disk
+        self._use_triton = use_triton
         from home_seek.expert_predictor import RecordingPredictor, HeuristicPredictor
         self.predictor = RecordingPredictor(
             HeuristicPredictor(self.config.num_hidden_layers, self.config.num_experts_per_tok))
@@ -399,8 +452,9 @@ class HomeSeekInferenceEngine:
         )
         self._shared_ffn = SharedExpertFFN(
             hidden_size=self.config.hidden_size,
-            intermediate_size=self.config.shared_expert_intermediate_size,
+            intermediate_size=self.config.moe_intermediate_size,
             swiglu_limit=self.config.swiglu_limit,
+            use_triton=self._use_triton,
         )
 
         self._load_shared_experts_gpu()
@@ -884,34 +938,38 @@ class HomeSeekInferenceEngine:
         hc_fn = hc_fn.to(dev)
         hc_base = hc_base.to(dev)
         hc_scale = hc_scale.to(dev)
-        try:
-            hidden_contig = hidden_4d.contiguous()
-            post_mix, comb_mix, layer_input = tile_kernels.modeling.mhc.ops.mhc_pre_big_fuse(
-                hidden_contig, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
-                self.config.rms_norm_eps, self.config.hc_eps, self.config.hc_eps,
-                2.0, self.config.hc_sinkhorn_iters)
-            if apply_pre:
-                hidden = layer_input.to(hidden_4d.dtype)
-            else:
-                hidden = hidden_4d.sum(dim=2)
-            post = post_mix.squeeze(-1)
-            comb = comb_mix
-            return hidden, post, comb
-        except Exception as e:
-            self._log(f"mHC kernel fallback (not critical): {type(e).__name__}")
-            hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
-            rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-            mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
-            pre, post, comb = mhc_split_sinkhorn(
-                mixes, hc_scale.to(torch.float32), hc_base.to(torch.float32),
-                hc_mult=hc_mult, sinkhorn_iters=self.config.hc_sinkhorn_iters, eps=self.config.hc_eps,
-            )
-            if apply_pre:
-                scaled = hidden_4d * pre.unsqueeze(-1)
-                hidden = scaled.sum(dim=2)
-            else:
-                hidden = hidden_4d.sum(dim=2)
-            return hidden, post, comb
+        
+        if self._use_triton:
+            try:
+                hidden_contig = hidden_4d.contiguous()
+                post_mix, comb_mix, layer_input = tile_kernels.modeling.mhc.ops.mhc_pre_big_fuse(
+                    hidden_contig, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
+                    self.config.rms_norm_eps, self.config.hc_eps, self.config.hc_eps,
+                    2.0, self.config.hc_sinkhorn_iters)
+                if apply_pre:
+                    hidden = layer_input.to(hidden_4d.dtype)
+                else:
+                    hidden = hidden_4d.sum(dim=2)
+                post = post_mix.squeeze(-1)
+                comb = comb_mix
+                return hidden, post, comb
+            except Exception as e:
+                self._log(f"mHC kernel fallback (not critical): {type(e).__name__}")
+        
+        # PyTorch fallback
+        hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
+        rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
+        pre, post, comb = mhc_split_sinkhorn(
+            mixes, hc_scale.to(torch.float32), hc_base.to(torch.float32),
+            hc_mult=hc_mult, sinkhorn_iters=self.config.hc_sinkhorn_iters, eps=self.config.hc_eps,
+        )
+        if apply_pre:
+            scaled = hidden_4d * pre.unsqueeze(-1)
+            hidden = scaled.sum(dim=2)
+        else:
+            hidden = hidden_4d.sum(dim=2)
+        return hidden.to(hidden_4d.dtype), post, comb
 
     def _forward_attn(self, hidden_states, lw, layer_idx):
         B, T, D = hidden_states.shape
@@ -962,6 +1020,10 @@ class HomeSeekInferenceEngine:
         freqs_cis = precompute_freqs_cis(rope_dim, T, theta=rope_theta, original_seq_len=rope_original_seq_len, factor=rope_factor, beta_fast=rope_beta_fast, beta_slow=rope_beta_slow).to(q.device)
         q = apply_rotary_emb(q, freqs_cis, rd=self.config.qk_rope_head_dim)
         kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=self.config.qk_rope_head_dim)
+
+        # FP8 simulation on non-RoPE KV dims (QAT, matches demo act_quant)
+        if kv_latent.shape[-1] > rope_dim:
+            _fp8_simulate(kv_latent[..., :-rope_dim], block_size=64)
 
         state = self.layer_states.setdefault(layer_idx, LayerState(device=str(self.device)))
         state.append_kv(kv_latent)
