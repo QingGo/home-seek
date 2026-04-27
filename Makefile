@@ -16,10 +16,10 @@ test-integration:
 	$(UV) python -m pytest tests/integration/ -q
 
 profile:
-	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 8
+	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0
 
 smoke:
-	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 1
+	$(UV) python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

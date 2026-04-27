@@ -12,7 +12,7 @@ from home_seek.utils import rms_norm
 from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
-from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache
+from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache, triton_dequantize_fp4_all
 from home_seek.gpu_expert_store import AllExpertFP4Store
 from home_seek.compressor import Compressor as NewCompressor
 from home_seek.lightning_indexer import LightningIndexer
@@ -330,13 +330,18 @@ class ExpertWeightCache:
 
 class HomeSeekInferenceEngine:
     def __init__(self, weight_dir: str = "weights", device: str = "cuda", verbose: bool = False,
-                 hot_experts_path: str = "hot_experts.json", preload_all: bool = False):
+                 hot_experts_path: str = "hot_experts.json", preload_all: bool = False,
+                 reprobe: bool = False):
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig(config_path)
         self.weight_dir = weight_dir
         self.device = torch.device(device)
         self.verbose = verbose
         self.loader = WeightLoader(weight_dir, device)
+        from home_seek.hw_profile import probe_hardware, load_profile
+        self.hw_profile = probe_hardware(force=reprobe, weight_dir=weight_dir) if reprobe else load_profile()
+        if self.hw_profile is None:
+            self.hw_profile = probe_hardware(force=True, weight_dir=weight_dir)
         cache_size = 5120
         self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
         self.layer_states = {}
@@ -348,13 +353,19 @@ class HomeSeekInferenceEngine:
         self._prefetch_worker = None
         self._load_global_weights()
         self._prefetch_enabled = False  # async prefetch adds GIL contention on shared disk
+        from home_seek.expert_predictor import RecordingPredictor, HeuristicPredictor
+        self.predictor = RecordingPredictor(
+            HeuristicPredictor(self.config.num_hidden_layers, self.config.num_experts_per_tok))
+        self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._cpu_fallback_enabled = True
         self._cpu_fallback_layers = set(range(min(3, self.config.num_hidden_layers))) | set(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
         self._hot_expert_ids = []
         self._hash_expert_ids = []
         self._hot_expert_set = set()
         self._gpu_hot_experts = {}
-        self._max_hot_experts = 16
+        _vram_free = max(self.hw_profile.vram_free_gb, 8.0)
+        _expert_bf16_gb = 48.0 / 1024
+        self._max_hot_experts = max(16, min(int((_vram_free - 4) * 0.2 / _expert_bf16_gb), 64))
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -1138,13 +1149,11 @@ class HomeSeekInferenceEngine:
                         else w2_scale)
 
         if eid in self._hot_expert_set:
-            w1_b = load_fp4_weight(w1_data, w1_scale).to(torch.bfloat16).to(self.device)
-            w3_b = load_fp4_weight(w3_data, w3_scale).to(torch.bfloat16).to(self.device)
-            w2_b = load_fp4_weight(w2_data, w2_scale).to(torch.bfloat16).to(self.device)
+            w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
+                w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
             if len(self._gpu_hot_experts) >= self._max_hot_experts:
                 self._gpu_hot_experts.pop(next(iter(self._gpu_hot_experts)))
             self._gpu_hot_experts[hot_key] = (w1_b, w3_b, w2_b)
-            self._log(f"Cached hot expert ({layer_idx},{eid}) as BF16 on GPU")
             return (w1_b, w3_b, w2_b)
 
         return (w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
@@ -1317,6 +1326,9 @@ class HomeSeekInferenceEngine:
                 hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
             ffn_out = ffn_out + shared_out
 
+        if hasattr(self, 'predictor'):
+            self.predictor.collect(layer_idx, flat_hidden, flat_topk_idx)
+
         return ffn_out, used_experts
 
     def _process_mhc_layer(self, hidden_4d, lw, prefix: str):
@@ -1383,6 +1395,22 @@ class HomeSeekInferenceEngine:
                     scores, self.config.num_experts_per_tok + 16, dim=-1)
                 predicted_ids = topk_idx[0].tolist()
             self._prefetch_worker.prefetch(next_idx, predicted_ids)
+
+    def _predict_and_prefetch_next(self, layer_idx, hidden_states, input_ids):
+        if not self._prefetch_enabled:
+            return
+        if not hasattr(self, 'predictor'):
+            return
+        next_idx = layer_idx + 1
+        if next_idx >= self.config.num_hidden_layers:
+            return
+        h_flat = hidden_states.reshape(-1, self.config.hidden_size)
+        pred = self.predictor.predict(h_flat, input_ids, layer_idx)
+        if pred.expert_ids and len(pred.expert_ids) > 0:
+            if self._prefetch_stream is not None:
+                with torch.cuda.stream(self._prefetch_stream):
+                    for eid in pred.expert_ids[:8]:
+                        self._load_expert_raw(next_idx, eid)
 
     def _load_shared_experts_gpu(self):
         self._shared_experts_loaded = True
@@ -1800,6 +1828,7 @@ class HomeSeekInferenceEngine:
             else:
                 h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
+            self._predict_and_prefetch_next(layer_idx, h_pre, input_ids)
             if self._prefetch_worker is not None:
                 self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
 
@@ -1866,6 +1895,7 @@ class HomeSeekInferenceEngine:
                 else:
                     h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
+                self._predict_and_prefetch_next(layer_idx, h_pre, next_id)
                 if self._prefetch_worker is not None:
                     self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
 
@@ -1965,8 +1995,11 @@ def main():
     parser.add_argument("--use-mtp", action="store_true", help="Enable MTP speculative decoding")
     parser.add_argument("--mtp-eager", action="store_true",
                         help="Eager MTP: accept all drafts without verification (fast, risky)")
+    parser.add_argument("--reprobe", action="store_true",
+                        help="Force re-probe hardware profile, overwrite hw_profile.json")
     args = parser.parse_args()
-    engine = HomeSeekInferenceEngine(args.weight_dir, verbose=args.verbose, hot_experts_path=args.hot_experts)
+    engine = HomeSeekInferenceEngine(args.weight_dir, verbose=args.verbose,
+                                     hot_experts_path=args.hot_experts, reprobe=args.reprobe)
     if args.prefetch:
         engine._prefetch_enabled = True
     if args.no_fallback:

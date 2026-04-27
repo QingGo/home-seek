@@ -179,6 +179,101 @@ def deq_cache_stats() -> tuple[int, int]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Fused SwiGLU + routing + down-projection kernel (eliminates Python routing loop)
+# ──────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def _triton_swiglu_routedown_kernel(
+    gate_ptr, up_ptr, w2_ptr, expert_w_ptr,
+    out_ptr,
+    B, D, I, I_total, num_e, swiglu_limit,
+    stride_gate_b, stride_gate_i,
+    stride_up_b, stride_up_i,
+    stride_w2_d, stride_w2_i,
+    stride_ew_b, stride_ew_e,
+    stride_out_b, stride_out_d,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+
+    out_acc = tl.zeros([BM, BN], dtype=tl.float32)
+
+    for k in range(0, I_total, BK):
+        offs_k = k + tl.arange(0, BK)
+
+        mask_m = offs_m < B
+        mask_k = offs_k < I_total
+
+        gate_ptrs = gate_ptr + offs_m[:, None] * stride_gate_b + offs_k[None, :] * stride_gate_i
+        gate_tile = tl.load(gate_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        up_ptrs = up_ptr + offs_m[:, None] * stride_up_b + offs_k[None, :] * stride_up_i
+        up_tile = tl.load(up_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        gate_f32 = gate_tile.to(tl.float32)
+        up_f32 = up_tile.to(tl.float32)
+        gate_f32 = tl.minimum(gate_f32, swiglu_limit)
+        up_f32 = tl.minimum(tl.maximum(up_f32, -swiglu_limit), swiglu_limit)
+        activated = gate_f32 * tl.sigmoid(gate_f32.to(tl.float32)) * up_f32
+
+        expert_idx = k // I
+        ew_ptrs = expert_w_ptr + offs_m * stride_ew_b + expert_idx * stride_ew_e
+        weight = tl.load(ew_ptrs, mask=offs_m < B, other=0.0).to(tl.float32)
+        activated = activated * weight[:, None]
+
+        activated_bf16 = activated.to(tl.bfloat16)
+
+        w2_ptrs = w2_ptr + offs_k[:, None] * stride_w2_i + offs_n[None, :] * stride_w2_d
+        w2_tile = tl.load(w2_ptrs, mask=(offs_k[:, None] < I_total) & (offs_n[None, :] < D), other=0.0).to(tl.bfloat16)
+
+        out_acc += tl.dot(activated_bf16, w2_tile)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_out_b + offs_n[None, :] * stride_out_d
+    _out_dtype = out_ptr.dtype.element_ty
+    tl.store(out_ptrs, out_acc.to(_out_dtype), mask=(offs_m[:, None] < B) & (offs_n[None, :] < D))
+
+
+def _triton_batched_swiglu_routedown(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    w2: torch.Tensor,
+    expert_weights: torch.Tensor,
+    I: int,
+    swiglu_limit: float = 10.0,
+) -> torch.Tensor:
+    B, I_total = gate.shape
+    num_e = expert_weights.shape[1]
+    D = w2.shape[0]
+
+    out = torch.empty(B, D, device=gate.device, dtype=torch.bfloat16)
+
+    BM, BN, BK = _tune_blocks(gate.device)
+
+    grid_m = triton.cdiv(B, BM)
+    grid_n = triton.cdiv(D, BN)
+
+    _triton_swiglu_routedown_kernel[(grid_m, grid_n)](
+        gate, up, w2, expert_weights,
+        out,
+        B, D, I, I_total, num_e, swiglu_limit,
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        w2.stride(0), w2.stride(1),
+        expert_weights.stride(0), expert_weights.stride(1),
+        out.stride(0), out.stride(1),
+        BM=BM, BN=BN, BK=BK,
+        num_stages=1,
+    )
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────
 
@@ -463,7 +558,6 @@ class FusedMoEFFN:
 
         I = I_inferred
         loaded_eids = sorted(loaded.keys())
-        eid_to_idx = {eid: i for i, eid in enumerate(loaded_eids)}
         num_e = len(loaded_eids)
 
         w1 = torch.cat([loaded[eid][0] for eid in loaded_eids], dim=0)  # [num_e*I, D]
@@ -473,23 +567,31 @@ class FusedMoEFFN:
         gate = hidden_states @ w1.T  # [B, num_e*I]
         up = hidden_states @ w3.T
 
+        # Build per-expert routing weights via scatter (no Python loop)
+        expert_weights = torch.zeros(B, num_e, device=hidden_states.device, dtype=torch.bfloat16)
+        max_eid = max(loaded_eids) if loaded_eids else 255
+        eid_to_idx_t = torch.full((max_eid + 1,), -1, device=hidden_states.device, dtype=torch.int64)
+        for i, eid in enumerate(loaded_eids):
+            eid_to_idx_t[eid] = i
+
+        valid = topk_idx >= 0
+        clamped = topk_idx.clamp(min=0).long()
+        mapped = eid_to_idx_t[clamped]
+        valid = valid & (mapped >= 0)
+        b_idx = torch.arange(B, device=hidden_states.device).unsqueeze(1).expand(-1, num_topk)
+        if valid.any():
+            expert_weights[b_idx[valid], mapped[valid]] = topk_weights[valid].to(torch.bfloat16)
+
+        if self.use_triton and torch.cuda.is_available() and B >= 16:
+            return _triton_batched_swiglu_routedown(
+                gate, up, w2, expert_weights, I, self.swiglu_limit)
+        # cuBLAS path (optimal for M=1 decode; scatter handles routing without Python loop)
         g = gate.float().clamp(max=self.swiglu_limit)
         u = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         activated = (g * g.sigmoid() * u).to(torch.bfloat16)
-
-        routing = torch.zeros(B, num_e * I, device=hidden_states.device, dtype=torch.bfloat16)
-        for b in range(B):
-            for k in range(num_topk):
-                eid = int(topk_idx[b, k].item())
-                if eid < 0:
-                    continue
-                idx = eid_to_idx.get(eid)
-                if idx is None:
-                    continue
-                routing[b, idx * I:(idx + 1) * I] = topk_weights[b, k]
-
-        activated_weighted = activated * routing
-        return activated_weighted @ w2.T  # [B, D]
+        activated_3d = activated.view(B, num_e, I)
+        weighted = activated_3d * expert_weights.unsqueeze(-1)
+        return weighted.reshape(B, num_e * I) @ w2.T
 
     def _swiglu(self, h, w1, w3):
         gate = h @ w1.t()
