@@ -1558,7 +1558,78 @@ class HomeSeekInferenceEngine:
         return None
 
     def _load_mtp_weights(self):
-        self._log("MTP weights lazily pre-loaded; call enable_mtp() to activate")
+        """Preload full MTP module weights (attention, projections, gate, experts, MHC)."""
+        if not hasattr(self, 'loader') or self.loader is None:
+            return
+        mtp_keys = []
+        # Attention
+        for n in ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]:
+            mtp_keys.append(f"mtp.0.attn.{n}.weight")
+            mtp_keys.append(f"mtp.0.attn.{n}.scale")
+        for n in ["q_norm", "kv_norm"]:
+            mtp_keys.append(f"mtp.0.attn.{n}.weight")
+        mtp_keys.append("mtp.0.attn.attn_sink")
+        # Norms
+        for n in ["attn_norm", "ffn_norm", "norm", "enorm", "hnorm"]:
+            mtp_keys.append(f"mtp.0.{n}.weight")
+        # Projections
+        for n in ["e_proj", "h_proj"]:
+            mtp_keys.append(f"mtp.0.{n}.weight")
+            mtp_keys.append(f"mtp.0.{n}.scale")
+        # FFN gate
+        mtp_keys.append("mtp.0.ffn.gate.weight")
+        mtp_keys.append("mtp.0.ffn.gate.bias")
+        # MHC
+        for prefix in ["hc_attn", "hc_ffn", "hc_head"]:
+            for suffix in ["base", "fn", "scale"]:
+                mtp_keys.append(f"mtp.0.{prefix}_{suffix}")
+
+        loader = self.loader
+        tensors = loader.get_weights(*mtp_keys)
+        weight_count = 0
+        for full_key in mtp_keys:
+            if full_key in tensors and tensors[full_key] is not None:
+                t = tensors[full_key]
+                scale_key = full_key.replace(".weight", ".scale")
+                scale_t = tensors.get(scale_key)
+                dev = self.device
+                if t.dtype == torch.bfloat16 or t.dtype == torch.float32:
+                    t_loaded = t.to(dev, non_blocking=True)
+                elif t.dtype == torch.float8_e4m3fn:
+                    t_dev = t.to(dev, non_blocking=True)
+                    s_dev = scale_t.to(dev, non_blocking=True) if scale_t is not None else None
+                    t_loaded = load_fp8_weight(t_dev, s_dev)
+                elif t.dtype == torch.int8:
+                    t_loaded = t.to(torch.bfloat16).to(dev, non_blocking=True)
+                else:
+                    t_loaded = t.to(dev, non_blocking=True)
+                self._mtp_weights[full_key] = t_loaded
+                weight_count += 1
+
+        # Preload all 256 MTP experts into CPU ExpertWeightCache (pinned)
+        expert_count = 0
+        for eid in range(self.config.n_routed_experts):
+            cache_key = f"mtp_0_{eid}"
+            if self.expert_cache.get(cache_key) is not None:
+                continue
+            prefix = f"mtp.0.ffn.experts.{eid}"
+            keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
+                    f"{prefix}.w3.weight", f"{prefix}.w3.scale",
+                    f"{prefix}.w2.weight", f"{prefix}.w2.scale"]
+            tensors = loader.get_weights(*keys)
+            w1 = tensors.get(keys[0]); s1 = tensors.get(keys[1])
+            w3 = tensors.get(keys[2]); s3 = tensors.get(keys[3])
+            w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
+            if w1 is None:
+                continue
+            w1_entry = (w1.to("cpu"), s1.to(torch.float32).to("cpu") if s1 is not None else None, "fp4")
+            w3_entry = (w3.to("cpu"), s3.to(torch.float32).to("cpu") if s3 is not None else None, "fp4")
+            w2_entry = (w2.to("cpu"), s2.to(torch.float32).to("cpu") if s2 is not None else None, "fp4")
+            self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
+            expert_count += 1
+
+        if weight_count > 0 or expert_count > 0:
+            self._log(f"MTP: {weight_count} layer weights + {expert_count} experts preloaded")
 
     def _get_mtp_weight(self, key: str):
         if key in self._mtp_weights:
@@ -1571,6 +1642,179 @@ class HomeSeekInferenceEngine:
             w = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
             self._mtp_weights[key] = w
         return w
+
+    def _mtp_load_expert(self, eid: int):
+        cache_key = f"mtp_0_{eid}"
+        cached = self.expert_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        loader = getattr(self, 'loader', None)
+        if loader is None:
+            return None
+        prefix = f"mtp.0.ffn.experts.{eid}"
+        keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
+                f"{prefix}.w3.weight", f"{prefix}.w3.scale",
+                f"{prefix}.w2.weight", f"{prefix}.w2.scale"]
+        tensors = loader.get_weights(*keys)
+        w1 = tensors.get(keys[0]); s1 = tensors.get(keys[1])
+        w3 = tensors.get(keys[2]); s3 = tensors.get(keys[3])
+        w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
+        if w1 is None:
+            return None
+        gpu_store = getattr(self, '_gpu_expert_store', None)
+        if gpu_store is not None:
+            gpu_store.cache_on_gpu(-1, eid, w1, s1, w3, s3, w2, s2)
+        w1_entry = (w1.to("cpu"), s1.to(torch.float32).to("cpu") if s1 is not None else None, "fp4")
+        w3_entry = (w3.to("cpu"), s3.to(torch.float32).to("cpu") if s3 is not None else None, "fp4")
+        w2_entry = (w2.to("cpu"), s2.to(torch.float32).to("cpu") if s2 is not None else None, "fp4")
+        self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
+        return self.expert_cache.get(cache_key)
+
+    def _mtp_attn_1tok(self, h, w):
+        """MLA self-attention for 1 token — simplified (no KV cache needed)."""
+        B, T, D = h.shape
+        wq_a = w["mtp.0.attn.wq_a.weight"]; wq_b = w["mtp.0.attn.wq_b.weight"]
+        wkv = w["mtp.0.attn.wkv.weight"]
+        wo_a = w["mtp.0.attn.wo_a.weight"]; wo_b = w["mtp.0.attn.wo_b.weight"]
+        q_norm = w.get("mtp.0.attn.q_norm.weight")
+        kv_norm = w.get("mtp.0.attn.kv_norm.weight")
+
+        q_latent = h.to(wq_a.dtype) @ wq_a.t()
+        if q_norm is not None:
+            q_latent = rms_norm(q_latent, q_norm.to(torch.bfloat16), self.config.rms_norm_eps)
+        q = q_latent @ wq_b.t()
+        q = q.view(B, T, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+
+        kv_latent = h.to(wkv.dtype) @ wkv.t()
+        if kv_norm is not None:
+            kv_latent = rms_norm(kv_latent, kv_norm.to(torch.bfloat16), self.config.rms_norm_eps)
+
+        rope_dim = self.config.qk_rope_head_dim
+        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=self.config.rope_theta).to(h.device)
+        q = apply_rotary_emb(q, freqs_cis, rd=rope_dim)
+        kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=rope_dim)
+
+        n_kv = self.config.num_key_value_heads
+        n_groups = self.config.num_attention_heads // n_kv
+        k = kv_latent.unsqueeze(2).transpose(1, 2)
+        k_exp = k.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k.shape[-2], k.shape[-1])
+        v_exp = k_exp
+
+        scale_f = self.config.head_dim ** -0.5
+        attn = torch.matmul(q.float() * scale_f, k_exp.float().transpose(-2, -1))
+        attn_p = torch.softmax(attn, dim=-1).to(v_exp.dtype)
+        out = torch.matmul(attn_p, v_exp)
+
+        out = apply_rotary_emb(out, freqs_cis, rd=rope_dim, inverse=True)
+        out = out.transpose(1, 2).contiguous()
+
+        if wo_a is not None and wo_b is not None:
+            out_g = out.view(B, T, self.config.o_groups, -1)
+            wo_a_g = wo_a.view(self.config.o_groups, self.config.o_lora_rank, -1)
+            out_comb = torch.einsum('btgd,grd->btgr', out_g.to(wo_a_g.dtype), wo_a_g)
+            out_comb = out_comb.reshape(B, T, -1)
+            out = out_comb.to(wo_b.dtype) @ wo_b.t()
+        else:
+            out = out.view(B, T, -1)
+        return out.to(h.dtype)
+
+    def _mtp_forward_draft(self, h_4d, input_ids=None):
+        """Full MTP transformer layer forward pass for 1 token.
+
+        h_4d: [B=1, T=1, hc_mult=4, D=4096]
+        Returns: [B, 1, hc_mult, D] hidden after MTP layer
+        """
+        w = self._mtp_weights
+        B, T, hc, D = h_4d.shape
+
+        lw_mtp = {
+            "hc_attn_base": w.get("mtp.0.hc_attn_base"),
+            "hc_attn_fn": w.get("mtp.0.hc_attn_fn"),
+            "hc_attn_scale": w.get("mtp.0.hc_attn_scale"),
+            "hc_ffn_base": w.get("mtp.0.hc_ffn_base"),
+            "hc_ffn_fn": w.get("mtp.0.hc_ffn_fn"),
+            "hc_ffn_scale": w.get("mtp.0.hc_ffn_scale"),
+        }
+
+        h_pre, post, comb = self._process_mhc_layer(h_4d, lw_mtp, "hc_attn")
+        if w.get("mtp.0.attn_norm.weight") is not None:
+            h_pre = rms_norm(h_pre, w["mtp.0.attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+
+        attn_out = self._mtp_attn_1tok(h_pre, w)
+
+        if post is not None and comb is not None:
+            h = self._process_mhc_post(attn_out, h_4d, post, comb)
+        else:
+            h = h_4d + attn_out.unsqueeze(2).expand(-1, -1, hc, -1)
+
+        residual = h
+        h_pre, post, comb = self._process_mhc_layer(h, lw_mtp, "hc_ffn")
+        if w.get("mtp.0.ffn_norm.weight") is not None:
+            h_pre = rms_norm(h_pre, w["mtp.0.ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+
+        gate_w = w.get("mtp.0.ffn.gate.weight")
+        gate_bias = w.get("mtp.0.ffn.gate.bias")
+        if gate_w is not None:
+            def mtp_load(layer_idx, eid):
+                raw = self._mtp_load_expert(eid)
+                if raw is None:
+                    return None
+                w1_e, w3_e, w2_e = raw
+                if w1_e is None:
+                    return None
+                w1_data, w1_s, w1_fmt = w1_e
+                w3_data, w3_s, w3_fmt = w3_e
+                w2_data, w2_s, w2_fmt = w2_e
+                dev = self.device
+                w1_b = (w1_data.to(dev, non_blocking=True) if w1_data.device.type != dev.type else w1_data)
+                w3_b = (w3_data.to(dev, non_blocking=True) if w3_data.device.type != dev.type else w3_data)
+                w2_b = (w2_data.to(dev, non_blocking=True) if w2_data.device.type != dev.type else w2_data)
+                if w1_fmt == "fp4":
+                    w1_s_gpu = (w1_s.to(dev, non_blocking=True) if w1_s is not None else None)
+                    w3_s_gpu = (w3_s.to(dev, non_blocking=True) if w3_s is not None else None)
+                    w2_s_gpu = (w2_s.to(dev, non_blocking=True) if w2_s is not None else None)
+                    return (w1_b, w1_s_gpu, w3_b, w3_s_gpu, w2_b, w2_s_gpu)
+                return (w1_b, w3_b, w2_b)
+
+            h_2d = h_pre.reshape(B * T, D)
+            topk_idx, topk_w = self._compute_routing_experts(h_2d, gate_w, gate_bias)
+            ffn_result = self._fused_moe.forward(h_2d, topk_idx, topk_w, mtp_load, -1)
+            ffn_out = ffn_result.reshape(B, T, D)
+        else:
+            ffn_out = torch.zeros_like(h_pre.reshape(B, T, D))
+
+        if post is not None and comb is not None:
+            h = self._process_mhc_post(ffn_out, residual, post, comb)
+        else:
+            h = residual + ffn_out.unsqueeze(2).expand(-1, -1, hc, -1)
+
+        return h
+
+    def _mtp_finalize(self, h_4d):
+        """Apply sigmoid HC head + norm to get 2D hidden from MTP output.
+
+        Matches reference ParallelHead.hc_head:
+          pre = sigmoid(mixes * hc_scale + hc_base) + eps
+          y = sum(pre * original_4D, dim=2)
+        """
+        hc_fn = self._mtp_weights.get("mtp.0.hc_head_fn")
+        hc_base = self._mtp_weights.get("mtp.0.hc_head_base")
+        hc_scale = self._mtp_weights.get("mtp.0.hc_head_scale")
+        if all(x is not None for x in [hc_fn, hc_base, hc_scale]):
+            B, T, hc, D = h_4d.shape
+            x = h_4d.reshape(B, T, hc * D).float()
+            rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+            mixes = x @ hc_fn.t() * rsqrt
+            pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.config.hc_eps
+            h_3d = (pre.unsqueeze(-1) * h_4d.float()).sum(dim=2).to(torch.bfloat16)
+        else:
+            h_3d = h_4d.sum(dim=2)
+
+        norm_w = self._mtp_weights.get("mtp.0.norm.weight")
+        if norm_w is not None:
+            h_3d = rms_norm(h_3d, norm_w.to(torch.bfloat16), self.config.rms_norm_eps)
+        return h_3d
 
     def _warmup_page_cache(self):
         """Sequentially read all safetensors to warm the Linux page cache.
@@ -1700,62 +1944,76 @@ class HomeSeekInferenceEngine:
         return all_ok
 
     @torch.no_grad()
-    def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6):
+    def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6,
+                            last_token_id: torch.Tensor | None = None):
+        """Generate draft tokens using the full MTP module (attention + MoE FFN + MHC).
 
+        Implements MTPBlock.forward from the reference:
+          x = hnorm(x)                     # RMSNorm on 4D
+          e = enorm(embed(input_ids))      # RMSNorm on 2D embedding
+          x = e_proj(e).unsqueeze(2) + h_proj(x)   # Combine, preserve hc_mult
+          x = Block.forward(x, ...)        # MHC_attn → attn → MHC_ffn → FFN
+          logits = head(x, hc_head_fn, hc_head_scale, hc_head_base, norm)
+
+        last_hidden: [B=1, 1, hc_mult, D] — main model's last hidden state.
+        last_token_id: [B=1, 1] — the token ID at current position.
+        Returns (draft_ids, n_draft) or (None, 0).
+        """
         embed = self.embed
         lm_head = self.lm_head
         if embed is None or lm_head is None:
             return None, 0
-
-        e_proj = self._get_mtp_weight("mtp.0.e_proj.weight")
-        e_proj_scale = self._get_mtp_weight("mtp.0.e_proj.scale")
-        enorm = self._get_mtp_weight("mtp.0.enorm.weight")
-        h_proj = self._get_mtp_weight("mtp.0.h_proj.weight")
-        h_proj_scale = self._get_mtp_weight("mtp.0.h_proj.scale")
-        hnorm = self._get_mtp_weight("mtp.0.hnorm.weight")
-
-        if e_proj is None:
+        if not self._mtp_weights:
             return None, 0
 
-        if e_proj_scale is not None:
-            e_proj_bf16 = load_fp8_weight(e_proj, e_proj_scale)
-        else:
-            e_proj_bf16 = e_proj.to(torch.bfloat16)
+        e_proj = self._mtp_weights.get("mtp.0.e_proj.weight")
+        h_proj = self._mtp_weights.get("mtp.0.h_proj.weight")
+        if e_proj is None or h_proj is None:
+            return None, 0
 
-        if h_proj_scale is not None:
-            h_proj_bf16 = load_fp8_weight(h_proj, h_proj_scale)
-        else:
-            h_proj_bf16 = h_proj.to(torch.bfloat16)
+        B, _, hc, D = last_hidden.shape
 
-        if last_hidden.dim() == 4:
-            if self.hc_head_fn is not None:
-                h_main = self._hc_head(last_hidden)
-            else:
-                h_main = last_hidden.sum(dim=2)
-        else:
-            h_main = last_hidden
+        def _bf16(t):
+            return t.to(torch.bfloat16) if t is not None and t.dtype != torch.bfloat16 else t
+
+        hnorm_w = _bf16(self._mtp_weights.get("mtp.0.hnorm.weight"))
+        h_proj_bf16 = _bf16(h_proj)
+        e_proj_bf16 = _bf16(e_proj)
+        enorm_w = _bf16(self._mtp_weights.get("mtp.0.enorm.weight"))
+
+        # h_main = hnorm(last_hidden) → h_proj  (preserves hc_mult)
+        h_main_normed = rms_norm(last_hidden, hnorm_w, self.config.rms_norm_eps) if hnorm_w is not None else last_hidden
+        h_main_proj_4d = F.linear(h_main_normed.to(h_proj_bf16.dtype), h_proj_bf16)
 
         draft_tokens = []
-
         for step in range(num_draft):
-            if step == 0:
-                h_in = h_main
+            if step == 0 and last_token_id is not None:
+                tok_ids = last_token_id
+            elif step > 0:
+                tok_ids = draft_tokens[-1]
             else:
-                prev_id = draft_tokens[-1]
-                h_in = embed[prev_id].to(torch.bfloat16)
+                tok_ids = None
 
-            h = h_in.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
+            if tok_ids is not None:
+                tok_emb = embed[tok_ids].to(torch.bfloat16)
+            else:
+                tok_emb = torch.zeros(B, 1, D, device=last_hidden.device, dtype=torch.bfloat16)
 
-            if enorm is not None:
-                h = rms_norm(h, enorm.to(torch.bfloat16), self.config.rms_norm_eps)
+            # enorm → e_proj (2D → 2D) → unsqueeze to 4D
+            if enorm_w is not None:
+                tok_emb = rms_norm(tok_emb, enorm_w, self.config.rms_norm_eps)
+            emb_proj_2d = tok_emb.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
+            emb_proj_4d = emb_proj_2d.unsqueeze(2)  # [B,1,1,D] broadcasts with [B,1,hc,D]
 
-            h = h.to(h_proj_bf16.dtype) @ h_proj_bf16.t()
+            h_combined_4d = h_main_proj_4d + emb_proj_4d
 
-            if hnorm is not None:
-                h = rms_norm(h, hnorm.to(torch.bfloat16), self.config.rms_norm_eps)
+            # Full MTP Block forward: MHC_attn → attn → MHC_ffn → FFN
+            h_mtp_out = self._mtp_forward_draft(h_combined_4d)
 
-            logits = h.to(lm_head.dtype) @ lm_head.t()
+            # hc_head → norm → lm_head
+            h_3d = self._mtp_finalize(h_mtp_out)
 
+            logits = h_3d.to(lm_head.dtype) @ lm_head.t()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1].float() / temperature, dim=-1)
                 next_id = torch.multinomial(probs, 1)
@@ -1768,17 +2026,19 @@ class HomeSeekInferenceEngine:
 
     @torch.no_grad()
     def _mtp_accept_drafts(self, input_ids, draft_ids, temperature=0.6):
-        """Verify draft tokens by sequentially processing them through the model,
-        extending the existing KV cache.  If a draft is rejected, the KV cache
-        is rolled back to the pre-verification state.
+        """Verify all draft tokens in ONE batched forward pass.
 
-        This incremental approach avoids re-running the full prefill forward
-        pass (O(T²) attention) and re-loading all expert weights from disk.
+        Each draft token is processed sequentially one-by-one (not batched),
+        because MHC kernels and compressor state only support T=1.
+
+        Returns (n_accepted, bonus_logits) matching the main model's trajectory.
         """
         if draft_ids is None or draft_ids.shape[1] == 0:
             return 0, None
 
         T_draft = draft_ids.shape[1]
+        n_accept = 0
+        bonus_logits = None
 
         kv_snapshots = {}
         for layer_idx, state in self.layer_states.items():
@@ -1793,9 +2053,6 @@ class HomeSeekInferenceEngine:
                     comp.score_state.clone() if comp.score_state is not None else None)
 
         pos_bak = self._global_pos
-
-        n_accept = 0
-        bonus_logits = None
 
         try:
             for i in range(T_draft):
@@ -1845,7 +2102,6 @@ class HomeSeekInferenceEngine:
                 else:
                     n_accept += 1
 
-            # Roll back KV cache and compressors for rejected positions
             if n_accept < T_draft:
                 for layer_idx in kv_snapshots:
                     state = self.layer_states.get(layer_idx)
@@ -1862,9 +2118,8 @@ class HomeSeekInferenceEngine:
                         comp.accumulated = acc
                         comp.kv_state = kv_s
                         comp.score_state = sc_s
-
         finally:
-            self._global_pos = pos_bak
+            self._global_pos = pos_bak + n_accept
             if n_accept == 0:
                 for layer_idx, saved_kv in kv_snapshots.items():
                     state = self.layer_states.get(layer_idx)
@@ -1972,7 +2227,7 @@ class HomeSeekInferenceEngine:
         generated = [next_id]
         prefill_end = time.time()
 
-        mtp_num_draft = 1 if self._mtp_loaded else 0
+        mtp_num_draft = 3 if self._mtp_loaded else 0
 
         self._phase = "decode"
         step = 0
@@ -2035,8 +2290,9 @@ class HomeSeekInferenceEngine:
             if mtp_num_draft > 0 and step < max_new_tokens - 1:
                 all_inputs = torch.cat(
                     [input_ids] + generated, dim=-1)
+                last_token = all_inputs[:, -1:]
                 draft_ids, n_draft = self._mtp_generate_draft(
-                    last_h_for_mtp, mtp_num_draft, temperature)
+                    last_h_for_mtp, mtp_num_draft, temperature, last_token_id=last_token)
                 if draft_ids is not None and n_draft > 0:
                     if self._mtp_eager:
                         for i in range(n_draft):

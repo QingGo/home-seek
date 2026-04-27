@@ -50,6 +50,9 @@ def _make_mock_engine():
     eng.config.qk_rope_head_dim = 32
     eng.config.qk_nope_head_dim = 32
     eng.config.v_head_dim = 64
+    eng.config.rope_theta = 10000.0
+    eng.config.hc_eps = 1e-6
+    eng.config.hc_sinkhorn_iters = 20
     eng.config.sliding_window = 32
     eng.config.max_position_embeddings = 1024
 
@@ -58,12 +61,40 @@ def _make_mock_engine():
     eng.lm_head = torch.randn(_V, _HS, device="cuda", dtype=torch.bfloat16)
     eng.norm_weight = torch.randn(_HS, device="cuda", dtype=torch.bfloat16)
 
-    # MTP weights — e_proj and h_proj are square [hidden, hidden] per weight file
+    # MTP weights — full module (attention, FFN, projections, MHC)
+    q_lora = _HS // 2
+    n_heads_head_dim = eng.config.num_attention_heads * eng.config.head_dim  # 8*256=2048
+    o_dim = eng.config.o_groups * eng.config.o_lora_rank  # 2*128=256
     eng._mtp_weights = {
         "mtp.0.enorm.weight": torch.randn(_HS, device="cuda", dtype=torch.bfloat16),
         "mtp.0.e_proj.weight": torch.randn(_HS, _HS, device="cuda", dtype=torch.bfloat16),
         "mtp.0.hnorm.weight": torch.randn(_HS, device="cuda", dtype=torch.bfloat16),
         "mtp.0.h_proj.weight": torch.randn(_HS, _HS, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.norm.weight": torch.randn(_HS, device="cuda", dtype=torch.bfloat16),
+        # Attention
+        "mtp.0.attn.wq_a.weight": torch.randn(q_lora, _HS, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.wq_b.weight": torch.randn(n_heads_head_dim, q_lora, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.wkv.weight": torch.randn(eng.config.head_dim, _HS, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.wo_a.weight": torch.randn(o_dim, n_heads_head_dim // eng.config.o_groups, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.wo_b.weight": torch.randn(_HS, o_dim, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.q_norm.weight": torch.randn(q_lora, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.kv_norm.weight": torch.randn(eng.config.head_dim, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn_norm.weight": torch.randn(_HS, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.ffn_norm.weight": torch.randn(_HS, device="cuda", dtype=torch.bfloat16),
+        # FFN gate
+        "mtp.0.ffn.gate.weight": torch.randn(_N_EXPERTS, _HS, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.ffn.gate.bias": torch.randn(_N_EXPERTS, device="cuda", dtype=torch.bfloat16),
+        # MHC
+        "mtp.0.hc_attn_fn": torch.randn(24, _HC * _HS, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_attn_base": torch.randn(24, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_attn_scale": torch.randn(3, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_ffn_fn": torch.randn(24, _HC * _HS, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_ffn_base": torch.randn(24, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_ffn_scale": torch.randn(3, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_head_fn": torch.randn(_HC, _HC * _HS, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_head_base": torch.randn(_HC, device="cuda", dtype=torch.float32),
+        "mtp.0.hc_head_scale": torch.randn(1, device="cuda", dtype=torch.float32),
+        # Shared expert for MTP (needed by fused_moe)
     }
     eng._mtp_loaded = True
 
@@ -75,6 +106,21 @@ def _make_mock_engine():
 
     eng._layer_weight_cache = {}
     eng._log = lambda msg: None
+    eng._mtp_loaded = True
+    eng.loader = None
+    eng._gpu_expert_store = None
+
+    from home_seek.inference_engine import ExpertWeightCache
+    eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")
+
+    from home_seek.fused_moe import FusedMoEFFN
+    eng._fused_moe = FusedMoEFFN(
+        num_experts=_N_EXPERTS,
+        intermediate_size=_IM,
+        hidden_size=_HS,
+        swiglu_limit=10.0,
+        use_triton=True,
+    )
     return eng
 
 
