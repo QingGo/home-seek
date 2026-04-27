@@ -78,21 +78,22 @@ class Compressor:
         self.score_state.fill_(float("-inf"))
         self.accumulated = 0
 
-    def overlap_transform(self, tensor: torch.Tensor) -> torch.Tensor:
+    def overlap_transform(self, tensor: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
         """Transform blocks for overlapping CSA compression.
 
         Converts [B, num_blocks, ratio, 2*d] → [B, num_blocks, 2*ratio, d]
         where:
           positions ratio:2*ratio = current block's stream B (second half)
           positions 0:ratio (for i>0) = previous block's stream A (first half)
-        First block gets zeros / -inf for the overlap part.
+        First block gets `fill_value` for the overlap part.
+        Use fill_value=0 for KV data, fill_value=-inf for score data.
         """
         B, num_blocks, _, dim2d = tensor.shape
         d = self.head_dim
         # Reshape ratio dim into 2 streams
         # tensor: [B, num_blocks, ratio, 2*d] → [B, num_blocks, ratio, 2, d]
         t = tensor.view(B, num_blocks, self.ratio, 2, d)
-        new_t = tensor.new_full((B, num_blocks, 2 * self.ratio, d), 0.0)
+        new_t = tensor.new_full((B, num_blocks, 2 * self.ratio, d), fill_value)
         # Positions ratio:2*ratio ← current block stream B (t[:, :, :, 1, :])
         new_t[:, :, self.ratio:] = t[:, :, :, 1, :]
         # Positions 0:ratio ← previous block stream A (t[:, 0:-1, :, 0, :])
@@ -153,8 +154,9 @@ class Compressor:
 
         if self.overlap:
             # CSA: overlap transform
-            kv = self.overlap_transform(kv)       # [B, num_blocks, 2*ratio, d]
-            score = self.overlap_transform(score)  # [B, num_blocks, 2*ratio, d]
+            # KV padding uses 0 (no contribution), score padding uses -inf (zero softmax weight)
+            kv = self.overlap_transform(kv, fill_value=0.0)
+            score = self.overlap_transform(score, fill_value=float("-inf"))
             # Softmax over the 2*ratio entries
             kv = (kv * score.softmax(dim=2)).sum(dim=2)  # [B, num_blocks, d]
         else:

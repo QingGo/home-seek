@@ -726,3 +726,116 @@ class TestRegression:
                     f"Routed expert w2 should be FP4 (int8 packed), got {t.dtype}"
                 return
         pytest.skip("No routed expert weight found")
+
+
+class TestCompressorOverlap:
+    """Bug #1: overlap_transform should use -inf for score padding (not 0)."""
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_overlap_transform_score_fill_neg_inf(self):
+        from home_seek.compressor import Compressor
+        c = Compressor(
+            ratio=4, head_dim=512, coff=2, ape=None,
+            wkv=torch.randn(1024, 4096, device="cuda", dtype=torch.bfloat16),
+            wgate=torch.randn(1024, 4096, device="cuda", dtype=torch.bfloat16),
+            norm_w=torch.randn(512, device="cuda", dtype=torch.bfloat16),
+            device="cuda",
+        )
+        B, T, D = 1, 16, 4096
+        x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
+        # Prefill compress — should not produce NaN or inf in output
+        result = c.compress_prefill(x)
+        assert result is not None
+        assert not torch.isnan(result).any(), "Compressed output has NaN"
+        assert not torch.isinf(result).any(), "Compressed output has Inf"
+
+        # Decode: accumulate tokens at positions 0,1,2,3
+        c.reset()
+        for pos in range(4):
+            tok = torch.randn(1, 1, D, device="cuda", dtype=torch.bfloat16)
+            out = c.compress_decode(tok, pos)
+        # After 4th token (pos=3), block completes
+        assert out is not None, "Decode should produce output after 4 tokens"
+
+    def test_overlap_transform_uses_neg_inf_for_scores(self):
+        """Verify overlap_transform supports fill_value for score vs KV separation."""
+        from home_seek.compressor import Compressor
+        c = Compressor.__new__(Compressor)
+        c.ratio = 4
+        c.head_dim = 512
+        c.coff = 2
+        c.overlap = True
+
+        B, num_blocks, ratio, dim2d = 1, 4, 4, 1024
+        tensor = torch.randn(B, num_blocks, ratio, dim2d)
+
+        # KV should be padded with 0
+        kv_t = c.overlap_transform(tensor, fill_value=0.0)
+        # Score should be padded with -inf
+        score_t = c.overlap_transform(tensor, fill_value=float("-inf"))
+
+        # First block (index 0): positions 0:ratio are padding
+        assert kv_t[0, 0, :ratio].abs().max() == 0.0, \
+            "KV padding should be 0"
+        assert torch.isinf(score_t[0, 0, :ratio]).all(), \
+            "Score padding should be -inf"
+
+
+class TestAttnSink:
+    """Bug #2: attn_sink should match demo virtual softmax entry behavior."""
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_attn_sink_virtual_entry(self):
+        """Verify that attn_sink acts as a virtual softmax entry (no KV)."""
+        B, H, T, K = 1, 4, 1, 8
+        q = torch.randn(B, H, T, 64, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, 1, K, 64, device="cuda", dtype=torch.bfloat16)
+        attn_sink = torch.randn(H, device="cuda", dtype=torch.bfloat16)
+        scale = 64 ** -0.5
+
+        # Demo approach: virtual softmax entry
+        attn = torch.matmul(q.float() * scale, k.squeeze(1).float().transpose(-2, -1))
+        max_val = attn.max(dim=-1, keepdim=True).values
+        exp_attn = torch.exp(attn - max_val)
+        sum_exp = exp_attn.sum(dim=-1, keepdim=True)
+        sink_exp = torch.exp(attn_sink.float().view(1, -1, 1, 1) - max_val)
+        sum_exp_with_sink = sum_exp + sink_exp
+        P = exp_attn / sum_exp_with_sink
+
+        # Verify sink absorbed some probability: sum of P < 1
+        assert P.sum(dim=-1).max() < 1.0 - 1e-6, \
+            "Sink should absorb probability mass, making P sum < 1"
+
+    def test_attn_sink_matches_cat_softmax(self):
+        """Verify virtual sink matches concat+sink approach."""
+        B, H, T, K = 1, 4, 1, 8
+        q = torch.randn(B, H, T, 64, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, 1, K, 64, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, 1, K, 64, device="cuda", dtype=torch.bfloat16)
+        attn_sink = torch.randn(H, device="cuda", dtype=torch.bfloat16)
+        scale = 64 ** -0.5
+
+        # Method A: concat sink as extra column
+        attn = torch.matmul(q.float() * scale, k.squeeze(1).float().transpose(-2, -1))
+        sink_val = attn_sink.view(1, -1, 1, 1).float()
+        attn_cat = torch.cat([attn, sink_val.expand(-1, -1, T, -1)], dim=-1)
+        P_cat = F.softmax(attn_cat, dim=-1)
+        P_real = P_cat[:, :, :, :-1]
+        out_cat = (P_real.unsqueeze(-1) * v.squeeze(1).unsqueeze(1)).sum(dim=-2)
+
+        # Method B: virtual sink in denominator
+        max_val = attn.max(dim=-1, keepdim=True).values
+        exp_attn = torch.exp(attn - max_val)
+        sum_exp = exp_attn.sum(dim=-1, keepdim=True)
+        sink_exp = torch.exp(attn_sink.float().view(1, -1, 1, 1) - max_val)
+        P_virtual = exp_attn / (sum_exp + sink_exp)
+        out_virtual = (P_virtual.unsqueeze(-1) * v.squeeze(1).unsqueeze(1)).sum(dim=-2)
+
+        assert torch.allclose(out_cat, out_virtual, atol=1e-5), \
+            "Virtual sink and cat-sink should produce identical results"

@@ -53,6 +53,7 @@ def _make_engine_stub():
     eng._shared_ffn.forward.return_value = torch.zeros(1, 1, _HS, device="cuda", dtype=torch.bfloat16)
     eng._get_shared_expert = MagicMock(return_value=None)
     eng._hot_expert_ids = []
+    eng._hot_expert_set_by_layer = {}
     eng._gpu_expert_store = MagicMock()
     eng._gpu_expert_store.get_cache_key.return_value = None
     eng._log = lambda msg: None

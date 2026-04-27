@@ -16,7 +16,7 @@ from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache, t
 from home_seek.gpu_expert_store import AllExpertFP4Store
 from home_seek.compressor import Compressor as NewCompressor
 from home_seek.lightning_indexer import LightningIndexer
-from home_seek.hybrid_kv_cache import HybridKVCache, SWACache
+from home_seek.hybrid_kv_cache import HybridKVCache
 from tile_reference import unpack_from_e2m1fn_x2
 import tile_kernels
 
@@ -712,8 +712,6 @@ class HomeSeekInferenceEngine:
         if compressed is None:
             return state
 
-        head_dim = self.config.head_dim
-
         # Flat tensor storage on LayerState
         if state.compressed_kv_data is None:
             state.compressed_kv_data = compressed.squeeze(0)  # [num_blocks, head_dim]
@@ -1013,10 +1011,16 @@ class HomeSeekInferenceEngine:
         attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
 
         if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
-            sw_len = k_sw.shape[-2]
-            attn[:, :, :, sw_len - 1:sw_len] = attn[:, :, :, sw_len - 1:sw_len] + attn_sink.view(1, -1, 1, 1)
-
-        attn_p = F.softmax(attn, dim=-1).to(v_expanded.dtype)
+            # Virtual softmax entry: attn_sink absorbs probability mass without KV
+            # Matches official demo's sparse_attn kernel behavior:
+            #   sum_exp += exp(attn_sink - running_max)
+            sink_val = attn_sink.view(1, -1, 1, 1).to(attn.dtype)
+            attn_with_sink = torch.cat(
+                [attn, sink_val.expand(-1, -1, T, -1)], dim=-1)
+            P_all = F.softmax(attn_with_sink, dim=-1)
+            attn_p = P_all[:, :, :, :-1].to(v_expanded.dtype)
+        else:
+            attn_p = F.softmax(attn, dim=-1).to(v_expanded.dtype)
         out = torch.matmul(attn_p, v_expanded)
 
         out = apply_rotary_emb(out, freqs_cis, rd=self.config.qk_rope_head_dim, inverse=True)
@@ -1041,14 +1045,12 @@ class HomeSeekInferenceEngine:
         return eids, weights
 
     def _compute_routing_experts(self, hidden_states, gate_w, gate_bias):
-        scores = torch.matmul(hidden_states.to(gate_w.dtype), gate_w.t())
-        if gate_bias is not None:
-            scores = scores + gate_bias.to(scores.dtype)
-        scores = F.softplus(scores).sqrt()
-        topk_w, topk_idx = torch.topk(scores, self.config.num_experts_per_tok, dim=-1)
-        topk_sum = topk_w.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-        topk_w = topk_w / topk_sum * self.config.routed_scaling_factor
-        return topk_idx, topk_w
+        from home_seek.router import compute_expert_affinity_with_bias
+        return compute_expert_affinity_with_bias(
+            hidden_states, gate_w, gate_bias,
+            top_k=self.config.num_experts_per_tok,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+        )
 
     def _make_raw_entry(self, data, scale):
         if data is None:
@@ -1306,16 +1308,17 @@ class HomeSeekInferenceEngine:
         if gate_w is None:
             return torch.zeros_like(hidden_states), set()
 
-        if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
-            topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
-        else:
-            topk_idx, topk_w = self._compute_routing_experts(hidden_states, gate_w, gate_bias)
-
-        used_experts = set()
-        ffn_out = torch.zeros_like(hidden_states)
         B, T, D = hidden_states.shape
         total_tokens = B * T
         flat_hidden = hidden_states.reshape(total_tokens, D)
+
+        if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
+            topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
+        else:
+            topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
+
+        used_experts = set()
+        ffn_out = torch.zeros_like(hidden_states)
         flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
         flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
 
@@ -1418,7 +1421,6 @@ class HomeSeekInferenceEngine:
         except Exception as e:
             self._log(f"mHC post kernel fallback (not critical): {type(e).__name__}")
             B, S, D = hidden.shape
-            hc = comb.shape[-1]
             x_expanded = hidden.unsqueeze(2)
             term1 = post.unsqueeze(-1) * x_expanded
             residual_expanded = residual.unsqueeze(3)
