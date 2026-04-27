@@ -28,7 +28,8 @@ from encoding_dsv4 import encode_messages
 
 def precompute_freqs_cis(dim: int, seqlen: int, theta: float = 10000.0,
                          original_seq_len: int = 0, factor: float = 1.0,
-                         beta_fast: int = 32, beta_slow: int = 1) -> torch.Tensor:
+                         beta_fast: int = 32, beta_slow: int = 1,
+                         start_pos: int = 0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if original_seq_len > 0 and factor > 1.0:
         low = math.floor(dim * math.log(original_seq_len / (beta_fast * 2 * math.pi)) / (2 * math.log(theta)))
@@ -38,7 +39,7 @@ def precompute_freqs_cis(dim: int, seqlen: int, theta: float = 10000.0,
         ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low + 1e-3)).clamp(0, 1)
         smooth = 1.0 - ramp
         freqs = freqs / factor * (1.0 - smooth) + freqs * smooth
-    t = torch.arange(seqlen, dtype=torch.float32)
+    t = torch.arange(start_pos, start_pos + seqlen, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
 
@@ -123,9 +124,13 @@ def _ue8m0_to_f32(sf: torch.Tensor) -> torch.Tensor:
 
 
 def load_fp8_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if data is None:
+        return None
     if data.dtype == torch.bfloat16 or data.dtype == torch.float32:
         return data.to(torch.bfloat16)
     if data.dtype == torch.float8_e4m3fn:
+        if scale is None:
+            return data.to(torch.bfloat16)
         sf = (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32) if scale.element_size() == 1 else scale
         return tile_kernels.quant.cast_back((data, sf), 'bf16', (128, 128))
     return data.to(torch.bfloat16)
@@ -735,12 +740,14 @@ class HomeSeekInferenceEngine:
             if cached is not None:
                 self._deq_cache.move_to_end(cache_key)
                 return cached
-        if scale is None:
-            result = data.to(torch.bfloat16)
+        if data.dtype == torch.bfloat16:
+            result = data
+        elif data.dtype == torch.float8_e4m3fn:
+            result = load_fp8_weight(data, scale)
         elif data.dtype == torch.int8:
             result = load_fp4_weight(data, scale)
         else:
-            result = load_fp8_weight(data, scale)
+            result = data.to(torch.bfloat16)
         if layer_idx is not None:
             if len(self._deq_cache) >= 16:
                 self._deq_cache.popitem(last=False)
@@ -1017,7 +1024,8 @@ class HomeSeekInferenceEngine:
             rope_beta_fast = 32
             rope_beta_slow = 1
         rope_dim = self.config.qk_rope_head_dim
-        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=rope_theta, original_seq_len=rope_original_seq_len, factor=rope_factor, beta_fast=rope_beta_fast, beta_slow=rope_beta_slow).to(q.device)
+        start_pos = getattr(self, '_global_pos', 0)
+        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=rope_theta, original_seq_len=rope_original_seq_len, factor=rope_factor, beta_fast=rope_beta_fast, beta_slow=rope_beta_slow, start_pos=start_pos).to(q.device)
         q = apply_rotary_emb(q, freqs_cis, rd=self.config.qk_rope_head_dim)
         kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=self.config.qk_rope_head_dim)
 
@@ -1354,11 +1362,12 @@ class HomeSeekInferenceEngine:
         activated_weighted = activated * routing
         return activated_weighted.to(w2.dtype) @ w2.T
 
-    def _all_routed_are_hot(self, topk_idx) -> bool:
+    def _all_routed_are_hot(self, topk_idx, layer_idx: int = 0) -> bool:
+        layer_set = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
         for b in range(topk_idx.shape[0]):
             for k in range(topk_idx.shape[1]):
                 eid = int(topk_idx[b, k].item())
-                if eid >= 0 and eid not in self._hot_expert_set:
+                if eid >= 0 and eid not in layer_set:
                     return False
         return True
 
@@ -1386,7 +1395,7 @@ class HomeSeekInferenceEngine:
 
         if self._hot_expert_set and total_tokens > 0:
             try:
-                if self._all_routed_are_hot(flat_topk_idx):
+                if self._all_routed_are_hot(flat_topk_idx, layer_idx):
                     hot_result = self._forward_ffn_hot_batched(
                         flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
                     if hot_result is not None:
@@ -1734,8 +1743,7 @@ class HomeSeekInferenceEngine:
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
         return self.expert_cache.get(cache_key)
 
-    def _mtp_attn_1tok(self, h, w):
-        """MLA self-attention for 1 token — simplified (no KV cache needed)."""
+    def _mtp_attn_1tok(self, h, w, start_pos: int = 0):
         B, T, D = h.shape
         wq_a = w["mtp.0.attn.wq_a.weight"]; wq_b = w["mtp.0.attn.wq_b.weight"]
         wkv = w["mtp.0.attn.wkv.weight"]
@@ -1755,7 +1763,7 @@ class HomeSeekInferenceEngine:
             kv_latent = rms_norm(kv_latent, kv_norm.to(torch.bfloat16), self.config.rms_norm_eps)
 
         rope_dim = self.config.qk_rope_head_dim
-        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=self.config.rope_theta).to(h.device)
+        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=self.config.rope_theta, start_pos=start_pos).to(h.device)
         q = apply_rotary_emb(q, freqs_cis, rd=rope_dim)
         kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=rope_dim)
 
@@ -1783,10 +1791,11 @@ class HomeSeekInferenceEngine:
             out = out.view(B, T, -1)
         return out.to(h.dtype)
 
-    def _mtp_forward_draft(self, h_4d, input_ids=None):
+    def _mtp_forward_draft(self, h_4d, input_ids=None, start_pos: int = 0):
         """Full MTP transformer layer forward pass for 1 token.
 
         h_4d: [B=1, T=1, hc_mult=4, D=4096]
+        start_pos: global position for RoPE computation
         Returns: [B, 1, hc_mult, D] hidden after MTP layer
         """
         w = self._mtp_weights
@@ -1805,7 +1814,7 @@ class HomeSeekInferenceEngine:
         if w.get("mtp.0.attn_norm.weight") is not None:
             h_pre = rms_norm(h_pre, w["mtp.0.attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
 
-        attn_out = self._mtp_attn_1tok(h_pre, w)
+        attn_out = self._mtp_attn_1tok(h_pre, w, start_pos)
 
         if post is not None and comb is not None:
             h = self._process_mhc_post(attn_out, h_4d, post, comb)
@@ -2072,7 +2081,8 @@ class HomeSeekInferenceEngine:
             h_combined_4d = h_main_proj_4d + emb_proj_4d
 
             # Full MTP Block forward: MHC_attn → attn → MHC_ffn → FFN
-            h_mtp_out = self._mtp_forward_draft(h_combined_4d)
+            mtp_pos = getattr(self, '_global_pos', 0) + step + 1
+            h_mtp_out = self._mtp_forward_draft(h_combined_4d, start_pos=mtp_pos)
 
             # hc_head → norm → lm_head
             h_3d = self._mtp_finalize(h_mtp_out)
@@ -2199,7 +2209,7 @@ class HomeSeekInferenceEngine:
         return n_accept, bonus_logits
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=50, temperature=0.6):
+    def generate(self, input_ids, max_new_tokens=50, temperature=0.6, stream_callback=None):
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         B, T = input_ids.shape
@@ -2289,6 +2299,8 @@ class HomeSeekInferenceEngine:
             next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
 
         generated = [next_id]
+        if stream_callback is not None:
+            stream_callback(next_id.item())
         prefill_end = time.time()
 
         mtp_num_draft = 3 if self._mtp_loaded else 0
@@ -2349,6 +2361,8 @@ class HomeSeekInferenceEngine:
             else:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
             generated.append(next_id)
+            if stream_callback is not None:
+                stream_callback(next_id.item())
             step += 1
 
             if mtp_num_draft > 0 and step < max_new_tokens - 1:
@@ -2361,6 +2375,8 @@ class HomeSeekInferenceEngine:
                     if self._mtp_eager:
                         for i in range(n_draft):
                             generated.append(draft_ids[:, i:i+1])
+                            if stream_callback is not None:
+                                stream_callback(draft_ids[:, i:i+1].item())
                             step += 1
                             if step >= max_new_tokens - 1:
                                 break
@@ -2373,6 +2389,8 @@ class HomeSeekInferenceEngine:
                         accepted_ids = draft_ids[:, :n_acc]
                         for i in range(n_acc):
                             generated.append(accepted_ids[:, i:i+1])
+                            if stream_callback is not None:
+                                stream_callback(accepted_ids[:, i:i+1].item())
                             step += 1
                             if step >= max_new_tokens - 1:
                                 break
@@ -2384,6 +2402,8 @@ class HomeSeekInferenceEngine:
                                 else:
                                     next_id = bonus_logits.argmax(dim=-1, keepdim=True)
                                 generated.append(next_id)
+                                if stream_callback is not None:
+                                    stream_callback(next_id.item())
                                 step += 1
                             elif n_acc == n_draft:
                                 next_id = accepted_ids[:, -1:]
