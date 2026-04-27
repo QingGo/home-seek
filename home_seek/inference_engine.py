@@ -366,6 +366,9 @@ class HomeSeekInferenceEngine:
         _vram_free = max(self.hw_profile.vram_free_gb, 8.0)
         _expert_bf16_gb = 48.0 / 1024
         self._max_hot_experts = max(16, min(int((_vram_free - 4) * 0.2 / _expert_bf16_gb), 64))
+        self._gpu_bf16_cache = OrderedDict()
+        _bf16_budget = max(1, _vram_free - 3)
+        self._max_bf16_cache = max(16, min(int(_bf16_budget * 0.8 / _expert_bf16_gb), 100))
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -1104,6 +1107,10 @@ class HomeSeekInferenceEngine:
         if hot_key in self._gpu_hot_experts:
             return self._gpu_hot_experts[hot_key]
 
+        if hot_key in self._gpu_bf16_cache:
+            self._gpu_bf16_cache.move_to_end(hot_key)
+            return self._gpu_bf16_cache[hot_key]
+
         raw = self._load_expert_raw(layer_idx, eid)
         if raw is None:
             return None
@@ -1148,15 +1155,19 @@ class HomeSeekInferenceEngine:
                         if w2_scale.dtype != torch.float32
                         else w2_scale)
 
+        w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
+            w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
+
         if eid in self._hot_expert_set:
-            w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
-                w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
             if len(self._gpu_hot_experts) >= self._max_hot_experts:
                 self._gpu_hot_experts.pop(next(iter(self._gpu_hot_experts)))
             self._gpu_hot_experts[hot_key] = (w1_b, w3_b, w2_b)
-            return (w1_b, w3_b, w2_b)
+        else:
+            if len(self._gpu_bf16_cache) >= self._max_bf16_cache:
+                self._gpu_bf16_cache.pop(next(iter(self._gpu_bf16_cache)))
+            self._gpu_bf16_cache[hot_key] = (w1_b, w3_b, w2_b)
 
-        return (w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
+        return (w1_b, w3_b, w2_b)
 
     def _load_gpu_hot_expert_bf16(self, layer: int, eid: int):
         key = (layer, eid)

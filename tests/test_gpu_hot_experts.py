@@ -12,6 +12,7 @@ Tests:
 
 import torch
 import pytest
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 _HS = 256
@@ -45,6 +46,8 @@ def _make_engine_stub():
     eng._hot_expert_set = set()
     eng._gpu_hot_experts = {}
     eng._max_hot_experts = 16
+    eng._gpu_bf16_cache = OrderedDict()
+    eng._max_bf16_cache = 16
     eng._shared_expert_weights = {}
     eng._shared_ffn = MagicMock()
     eng._shared_ffn.forward.return_value = torch.zeros(1, 1, _HS, device="cuda", dtype=torch.bfloat16)
@@ -389,3 +392,110 @@ class TestFfnHotPathRouting:
             ffn_out, used = eng._forward_ffn(hidden, lw, 0)
         except Exception:
             pass
+
+
+@pytest.mark.fast
+class TestGpuBf16LruCache:
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+
+    def _make_fp4_raw_mock(self):
+        from tile_reference import cast
+        w1 = torch.randn(_IM, _HS, dtype=torch.bfloat16)
+        w3 = torch.randn(_IM, _HS, dtype=torch.bfloat16)
+        w2 = torch.randn(_HS, _IM, dtype=torch.bfloat16)
+        w1p, w1s = cast(w1.cpu(), fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(w3.cpu(), fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(w2.cpu(), fmt="e2m1", block_size=(1, 32))
+        return MagicMock(return_value=(
+            (w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4")))
+
+    def test_non_hot_returns_3tuple(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 4
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+
+        result = eng._load_expert_fp4_raw(0, 99)
+        assert result is not None
+        assert len(result) == 3
+        for w in result:
+            assert w.dtype == torch.bfloat16
+            assert w.device.type == "cuda"
+        assert (0, 99) in eng._gpu_bf16_cache
+        assert (0, 99) not in eng._gpu_hot_experts
+
+    def test_lru_hit_skips_load_raw(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 4
+        raw_mock = self._make_fp4_raw_mock()
+        eng._load_expert_raw = raw_mock
+
+        r1 = eng._load_expert_fp4_raw(0, 99)
+        assert r1 is not None
+
+        raw_mock.reset_mock()
+        r2 = eng._load_expert_fp4_raw(0, 99)
+        assert r2 is not None
+        raw_mock.assert_not_called()
+        for a, b in zip(r1, r2):
+            assert torch.equal(a, b)
+
+    def test_lru_eviction(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 2
+
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+        eng._load_expert_fp4_raw(0, 10)
+        assert (0, 10) in eng._gpu_bf16_cache
+
+        eng._load_expert_fp4_raw(0, 20)
+        assert (0, 20) in eng._gpu_bf16_cache
+        assert len(eng._gpu_bf16_cache) == 2
+
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+        eng._load_expert_fp4_raw(0, 30)
+        assert (0, 10) not in eng._gpu_bf16_cache
+        assert (0, 20) in eng._gpu_bf16_cache
+        assert (0, 30) in eng._gpu_bf16_cache
+        assert len(eng._gpu_bf16_cache) == 2
+
+    def test_lru_reorder_on_hit(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 2
+
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+        eng._load_expert_fp4_raw(0, 1)
+        eng._load_expert_fp4_raw(0, 2)
+
+        eng._load_expert_raw.reset_mock()
+        r = eng._load_expert_fp4_raw(0, 1)
+        eng._load_expert_raw.assert_not_called()
+        assert r is not None
+
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+        eng._load_expert_fp4_raw(0, 3)
+        assert (0, 2) not in eng._gpu_bf16_cache
+        assert (0, 1) in eng._gpu_bf16_cache
+        assert (0, 3) in eng._gpu_bf16_cache
+
+    def test_hot_expert_still_goes_to_hot_cache(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 4
+        eng._hot_expert_set = {5}
+        eng._load_expert_raw = self._make_fp4_raw_mock()
+
+        result = eng._load_expert_fp4_raw(0, 5)
+        assert result is not None
+        assert (0, 5) in eng._gpu_hot_experts
+        assert (0, 5) not in eng._gpu_bf16_cache
+
+    def test_non_fp4_returns_none(self):
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 4
+        eng._load_expert_raw = MagicMock(return_value=(
+            (None, None, "bf16"), (None, None, "bf16"), (None, None, "bf16")))
+        result = eng._load_expert_fp4_raw(0, 99)
+        assert result is None
