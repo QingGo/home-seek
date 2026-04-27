@@ -613,7 +613,9 @@ class SharedExpertFFN:
                 dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         B, T, D = hidden_states.shape
         h_2d = hidden_states.reshape(-1, D)
-        if self.use_triton:
+        M = h_2d.shape[0]
+        # M=1 decode: cuBLAS is 8x faster than Triton (15/16 SM idle)
+        if self.use_triton and M > 1:
             out = fused_expert_ffn_triton(h_2d, w1, w3, w2, self.swiglu_limit)
         else:
             out = fused_expert_ffn_pt(h_2d, w1, w3, w2, self.swiglu_limit)

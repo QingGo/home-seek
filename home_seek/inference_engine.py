@@ -627,7 +627,11 @@ class HomeSeekInferenceEngine:
         for full_key in keys_needed:
             short_key = full_key.replace(f"layers.{layer_idx}.", "")
             if full_key in present and present[full_key] is not None:
-                lw[short_key] = present[full_key].to(self.device, non_blocking=True)
+                t = present[full_key].to(self.device, non_blocking=True)
+                # Pre-cast norm weights to BF16 to avoid repeated .to() in hot loop
+                if short_key in ("attn_norm.weight", "ffn_norm.weight") and t.dtype != torch.bfloat16:
+                    t = t.to(torch.bfloat16)
+                lw[short_key] = t
         self._layer_weight_cache[layer_idx] = lw
         return lw
 
@@ -1074,6 +1078,17 @@ class HomeSeekInferenceEngine:
 
         attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
 
+        # Causal mask for batched verify (T>1): prevent attending to future batch positions.
+        # The new batch tokens are the last T positions of kv_sw (sliding window).
+        if T > 1 and not (attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads):
+            k_sw_len = k_sw.shape[-2]
+            new_start = k_sw_len - T
+            if new_start >= 0:
+                triu = torch.triu(torch.full((T, T), float('-inf'), device=q.device, dtype=attn.dtype), diagonal=1)
+                mask = torch.zeros(T, k_all.shape[-2], device=q.device, dtype=attn.dtype)
+                mask[:, new_start:k_sw_len] = triu
+                attn = attn + mask
+
         if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
             # Virtual softmax entry: attn_sink absorbs probability mass without KV
             # Matches official demo's sparse_attn kernel behavior:
@@ -1343,12 +1358,8 @@ class HomeSeekInferenceEngine:
 
     def _all_routed_are_hot(self, topk_idx, layer_idx: int = 0) -> bool:
         layer_set = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
-        for b in range(topk_idx.shape[0]):
-            for k in range(topk_idx.shape[1]):
-                eid = int(topk_idx[b, k].item())
-                if eid >= 0 and eid not in layer_set:
-                    return False
-        return True
+        flat = topk_idx.flatten().tolist()
+        return all(eid < 0 or eid in layer_set for eid in flat)
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
@@ -1367,7 +1378,6 @@ class HomeSeekInferenceEngine:
         else:
             topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
 
-        used_experts = set()
         ffn_out = torch.zeros_like(hidden_states)
         flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
         flat_topk_w = topk_w.reshape(total_tokens, self.config.num_experts_per_tok)
@@ -1385,7 +1395,7 @@ class HomeSeekInferenceEngine:
                             shared_out = self._shared_ffn.forward(
                                 hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
                             ffn_out = ffn_out + shared_out
-                        return ffn_out, used_experts
+                        return ffn_out, set()
             except Exception:
                 pass
 
@@ -1412,6 +1422,7 @@ class HomeSeekInferenceEngine:
             except Exception as _e2:
                 if self.verbose:
                     self._log(f"FusedMoE fallback at layer {layer_idx}: {type(_e2).__name__}")
+                used_experts = set()
                 for k in range(self.config.num_experts_per_tok):
                     expert_ids = flat_topk_idx[:, k]
                     weights = flat_topk_w[:, k]
@@ -1449,7 +1460,7 @@ class HomeSeekInferenceEngine:
         if hasattr(self, 'predictor'):
             self.predictor.collect(layer_idx, flat_hidden, flat_topk_idx)
 
-        return ffn_out, used_experts
+        return ffn_out, set()
 
     def _process_mhc_layer(self, hidden_4d, lw, prefix: str):
         hc_base = lw.get(f"{prefix}_base")
@@ -1464,26 +1475,14 @@ class HomeSeekInferenceEngine:
         if post is None or comb is None:
             return hidden
         B, S, D = hidden.shape
-        if S > 1:
-            # PyTorch fallback handles arbitrary sequence length (T>1)
-            x_expanded = hidden.unsqueeze(2)
-            term1 = post.unsqueeze(-1) * x_expanded
-            residual_expanded = residual.unsqueeze(3)
-            term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
-            return (term1 + term2).to(hidden.dtype)
-        try:
-            post_4d = post.unsqueeze(-1) if post.dim() == 3 else post
-            result = tile_kernels.modeling.mhc.ops.mhc_post(
-                hidden.float(), residual.float(), post_4d.float(), comb.float())
-            return result.to(hidden.dtype)
-        except Exception as e:
-            self._log(f"mHC post kernel fallback: {type(e).__name__}")
-            x_expanded = hidden.unsqueeze(2)
-            term1 = post.unsqueeze(-1) * x_expanded
-            residual_expanded = residual.unsqueeze(3)
-            term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
-            y = term1 + term2
-            return y.to(hidden.dtype)
+        # Use the same PyTorch path for all S (Triton mhc_post kernel always
+        # fails with AssertionError in practice). Sequential T=1 verification
+        # (used by MTP verify) ensures correct autoregressive causality.
+        x_expanded = hidden.unsqueeze(2)
+        term1 = post.unsqueeze(-1) * x_expanded
+        residual_expanded = residual.unsqueeze(3)
+        term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
+        return (term1 + term2).to(hidden.dtype)
 
     def _hc_head(self, hidden_4d):
         B, T, hc_mult, D = hidden_4d.shape
@@ -2192,15 +2191,12 @@ class HomeSeekInferenceEngine:
         return n_accept, bonus_logits
 
     @torch.no_grad()
-    def _mtp_verify_batched(self, draft_ids, temperature=0.6):
-        """Verify all draft tokens in ONE batched forward pass.
+    def _mtp_verify_batched(self, draft_ids, temperature=0.6, main_pred_id=None):
+        """Verify all draft tokens in a single batched forward pass.
 
-        Unlike _mtp_accept_drafts (sequential per-token), this processes all
-        draft tokens through the 43 layers in a single batch forward. This
-        enables M>1 in FFN matmuls for higher GPU utilization.
-
-        Clones state, runs batch forward, compares predicted vs actual tokens.
-        Rolls back compressor/KV state on mismatch.
+        Uses causal mask in _forward_attn (added when T>1) to prevent future
+        token leakage. The first draft token (d_0) is verified against the main
+        model's prediction via a separate T=1 forward with main_pred_id.
         """
         if not isinstance(draft_ids, torch.Tensor) or draft_ids.shape[1] == 0:
             return 0, None
@@ -2208,9 +2204,14 @@ class HomeSeekInferenceEngine:
         T_draft = draft_ids.shape[1]
 
         kv_snapshots = {}
+        compressed_data_bak = {}
         for layer_idx, state in self.layer_states.items():
             if state.kv_latent_cache is not None:
                 kv_snapshots[layer_idx] = state.kv_latent_cache.clone()
+                compressed_data_bak[layer_idx] = (
+                    state.compressed_kv_data.clone() if state.compressed_kv_data is not None else None,
+                    state.compressed_kv_idx.clone() if state.compressed_kv_idx is not None else None,
+                )
 
         compressor_bak = {}
         for layer_idx, comp in self._compressors.items():
@@ -2221,55 +2222,111 @@ class HomeSeekInferenceEngine:
 
         pos_bak = self._global_pos
 
+        n_accept = 0
+        bonus_logits = None
         try:
-            # Embed all draft tokens as a batch
-            h = self.embed[draft_ids].to(torch.bfloat16)  # [B, T_draft, D]
-            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            # Step 1: verify d_0 via a single T=1 forward with main_pred_id
+            if main_pred_id is not None:
+                self._global_pos = pos_bak + 1
+                self._phase = "verify"
+                h = self.embed[main_pred_id].to(torch.bfloat16)
+                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                for layer_idx in range(self.config.num_hidden_layers):
+                    lw = self._get_layer_weights(layer_idx)
+                    residual_attn = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                    if lw.get("attn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                    attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                    else:
+                        h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                    residual = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                    if lw.get("ffn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                    ffn_out, _ = self._forward_ffn(h_pre, lw, layer_idx, main_pred_id)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(ffn_out, residual, post, comb)
+                    else:
+                        h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+                if self.norm_weight is not None:
+                    h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+                logits_d0 = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
 
-            for layer_idx in range(self.config.num_hidden_layers):
-                lw = self._get_layer_weights(layer_idx)
+                pred_next = logits_d0[:, -1].argmax(dim=-1)
+                if pred_next.item() != draft_ids[:, 0].item():
+                    self._global_pos = pos_bak
+                    for layer_idx, saved_kv in kv_snapshots.items():
+                        state = self.layer_states.get(layer_idx)
+                        if state is not None:
+                            state.kv_latent_cache = saved_kv
+                    for layer_idx, (data, idx) in compressed_data_bak.items():
+                        state = self.layer_states.get(layer_idx)
+                        if state is not None:
+                            state.compressed_kv_data = data
+                            state.compressed_kv_idx = idx
+                    for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
+                        comp = self._compressors.get(layer_idx)
+                        if comp is not None:
+                            comp.accumulated = acc
+                            comp.kv_state = kv_s
+                            comp.score_state = sc_s
+                    return 0, None
+                n_accept = 1
+                bonus_logits = logits_d0[:, -1, :]
+            else:
+                n_accept = 1
 
-                residual_attn = h
-                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
-                if lw.get("attn_norm.weight") is not None:
-                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-                attn_out = self._forward_attn(h_pre, lw, layer_idx)
-                if post is not None and comb is not None:
-                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
-                else:
-                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            # Step 2: batched forward through all draft tokens (T_draft > 1)
+            # Causal mask in _forward_attn prevents future token leakage
+            if n_accept == 1 and T_draft >= 1:
+                self._global_pos = pos_bak + 1
+                h = self.embed[draft_ids].to(torch.bfloat16)
+                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                for layer_idx in range(self.config.num_hidden_layers):
+                    lw = self._get_layer_weights(layer_idx)
+                    residual_attn = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                    if lw.get("attn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                    attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                    else:
+                        h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                    residual = h
+                    h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                    if lw.get("ffn_norm.weight") is not None:
+                        h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                    ffn_out, _ = self._forward_ffn(h_pre, lw, layer_idx, draft_ids)
+                    if post is not None and comb is not None:
+                        h = self._process_mhc_post(ffn_out, residual, post, comb)
+                    else:
+                        h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+                if self.norm_weight is not None:
+                    h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+                logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
 
-                residual = h
-                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-                if lw.get("ffn_norm.weight") is not None:
-                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-                ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, draft_ids)
-                if post is not None and comb is not None:
-                    h = self._process_mhc_post(ffn_out, residual, post, comb)
-                else:
-                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                # Check consecutive draft token matches
+                bonus_logits = None
+                for i in range(T_draft):
+                    expected_next = draft_ids[:, i + 1] if i + 1 < T_draft else None
+                    pred_next = logits[:, i].argmax(dim=-1)
+                    if expected_next is None:
+                        n_accept += 1
+                        bonus_logits = logits[:, i, :]
+                    elif pred_next.item() == expected_next.item():
+                        n_accept += 1
+                    else:
+                        bonus_logits = logits[:, i, :]
+                        break
 
-            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-            if self.norm_weight is not None:
-                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
-            logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
-
-            n_accept = 0
-            bonus_logits = None
-            for i in range(T_draft):
-                expected_next = draft_ids[:, i + 1] if i + 1 < T_draft else None
-                pred_next = logits[:, i].argmax(dim=-1)
-
-                if expected_next is None:
-                    n_accept += 1
-                    bonus_logits = logits[:, i, :]
-                elif pred_next.item() == expected_next.item():
-                    n_accept += 1
-                else:
-                    bonus_logits = logits[:, i, :]
-                    break
-
-            if n_accept < T_draft:
+            # Step 3: trim state if partial rejection
+            if n_accept < T_draft + 1:
                 for layer_idx in kv_snapshots:
                     state = self.layer_states.get(layer_idx)
                     if state is not None and state.kv_latent_cache is not None:
@@ -2279,6 +2336,11 @@ class HomeSeekInferenceEngine:
                             state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :, :].contiguous()
                         else:
                             state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :].contiguous()
+                for layer_idx, (data, idx) in compressed_data_bak.items():
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None:
+                        state.compressed_kv_data = data
+                        state.compressed_kv_idx = idx
                 for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
                     comp = self._compressors.get(layer_idx)
                     if comp is not None:
@@ -2292,6 +2354,11 @@ class HomeSeekInferenceEngine:
                     state = self.layer_states.get(layer_idx)
                     if state is not None:
                         state.kv_latent_cache = saved_kv
+                for layer_idx, (data, idx) in compressed_data_bak.items():
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None:
+                        state.compressed_kv_data = data
+                        state.compressed_kv_idx = idx
                 for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
                     comp = self._compressors.get(layer_idx)
                     if comp is not None:
@@ -2599,7 +2666,7 @@ class HomeSeekInferenceEngine:
                             next_id = draft_ids[:, -1:]
                         continue
                     n_acc, bonus_logits = self._mtp_verify_batched(
-                        draft_ids, temperature)
+                        draft_ids, temperature, main_pred_id=next_id)
                     if n_acc > 0:
                         accepted_ids = draft_ids[:, :n_acc]
                         for i in range(n_acc):
