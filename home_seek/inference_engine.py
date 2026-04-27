@@ -13,7 +13,6 @@ from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.prefetch_worker import AsyncPrefetchWorker
 from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache, triton_dequantize_fp4_all
-from home_seek.gpu_expert_store import AllExpertFP4Store
 from home_seek.compressor import Compressor as NewCompressor
 from home_seek.lightning_indexer import LightningIndexer
 from home_seek.hybrid_kv_cache import HybridKVCache
@@ -445,9 +444,6 @@ class HomeSeekInferenceEngine:
         self._layer_weight_cache = {}
         self._phase = "idle"
 
-        self._gpu_expert_store = AllExpertFP4Store(
-            weight_dir, self.config, str(self.device), max_experts=128)
-
         self._fused_moe = FusedMoEFFN(
             num_experts=self.config.n_routed_experts,
             intermediate_size=self.config.moe_intermediate_size,
@@ -541,8 +537,6 @@ class HomeSeekInferenceEngine:
                 w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
                 if w1 is None:
                     continue
-                self._gpu_expert_store.cache_on_gpu(
-                    layer_idx, eid, w1, s1, w3, s3, w2, s2)
                 w1_entry = self._make_raw_entry(w1, s1)
                 w3_entry = self._make_raw_entry(w3, s3)
                 w2_entry = self._make_raw_entry(w2, s2)
@@ -1153,17 +1147,6 @@ class HomeSeekInferenceEngine:
         if cached is not None:
             return cached
 
-        gpu_cached = self._gpu_expert_store.get_cache_key(layer_idx, eid)
-        if gpu_cached is not None:
-            gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale = gpu_cached
-            w1_entry = self._make_raw_entry(gate_packed, gate_scale)
-            w3_entry = self._make_raw_entry(up_packed, up_scale)
-            w2_entry = self._make_raw_entry(down_packed, down_scale)
-            layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
-            pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
-            self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
-            return self.expert_cache.get(cache_key)
-
         # Check async prefetch cache before blocking disk read
         if getattr(self, '_prefetch_worker', None) is not None:
             prefetched = self._prefetch_worker.get(layer_idx, eid)
@@ -1175,8 +1158,6 @@ class HomeSeekInferenceEngine:
                 w2 = prefetched.get(("w2", "data"))
                 s2 = prefetched.get(("w2", "scale"))
                 if w1 is not None:
-                    self._gpu_expert_store.cache_on_gpu(
-                        layer_idx, eid, w1, s1, w3, s3, w2, s2)
                     w1_entry = self._make_raw_entry(w1, s1)
                     w3_entry = self._make_raw_entry(w3, s3)
                     w2_entry = self._make_raw_entry(w2, s2)
@@ -1197,8 +1178,6 @@ class HomeSeekInferenceEngine:
         if w1 is None:
             return None
 
-        self._gpu_expert_store.cache_on_gpu(
-            layer_idx, eid, w1, s1, w3, s3, w2, s2)
         w1_entry = self._make_raw_entry(w1, s1)
         w3_entry = self._make_raw_entry(w3, s3)
         w2_entry = self._make_raw_entry(w2, s2)
@@ -1484,14 +1463,21 @@ class HomeSeekInferenceEngine:
     def _process_mhc_post(self, hidden, residual, post, comb):
         if post is None or comb is None:
             return hidden
+        B, S, D = hidden.shape
+        if S > 1:
+            # PyTorch fallback handles arbitrary sequence length (T>1)
+            x_expanded = hidden.unsqueeze(2)
+            term1 = post.unsqueeze(-1) * x_expanded
+            residual_expanded = residual.unsqueeze(3)
+            term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
+            return (term1 + term2).to(hidden.dtype)
         try:
             post_4d = post.unsqueeze(-1) if post.dim() == 3 else post
             result = tile_kernels.modeling.mhc.ops.mhc_post(
                 hidden.float(), residual.float(), post_4d.float(), comb.float())
             return result.to(hidden.dtype)
         except Exception as e:
-            self._log(f"mHC post kernel fallback (not critical): {type(e).__name__}")
-            B, S, D = hidden.shape
+            self._log(f"mHC post kernel fallback: {type(e).__name__}")
             x_expanded = hidden.unsqueeze(2)
             term1 = post.unsqueeze(-1) * x_expanded
             residual_expanded = residual.unsqueeze(3)
@@ -1734,9 +1720,6 @@ class HomeSeekInferenceEngine:
         w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
         if w1 is None:
             return None
-        gpu_store = getattr(self, '_gpu_expert_store', None)
-        if gpu_store is not None:
-            gpu_store.cache_on_gpu(-1, eid, w1, s1, w3, s3, w2, s2)
         w1_entry = (w1.to("cpu"), s1.to(torch.float32).to("cpu") if s1 is not None else None, "fp4")
         w3_entry = (w3.to("cpu"), s3.to(torch.float32).to("cpu") if s3 is not None else None, "fp4")
         w2_entry = (w2.to("cpu"), s2.to(torch.float32).to("cpu") if s2 is not None else None, "fp4")
@@ -2209,24 +2192,249 @@ class HomeSeekInferenceEngine:
         return n_accept, bonus_logits
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=50, temperature=0.6, stream_callback=None):
+    def _mtp_verify_batched(self, draft_ids, temperature=0.6):
+        """Verify all draft tokens in ONE batched forward pass.
+
+        Unlike _mtp_accept_drafts (sequential per-token), this processes all
+        draft tokens through the 43 layers in a single batch forward. This
+        enables M>1 in FFN matmuls for higher GPU utilization.
+
+        Clones state, runs batch forward, compares predicted vs actual tokens.
+        Rolls back compressor/KV state on mismatch.
+        """
+        if not isinstance(draft_ids, torch.Tensor) or draft_ids.shape[1] == 0:
+            return 0, None
+
+        T_draft = draft_ids.shape[1]
+
+        kv_snapshots = {}
+        for layer_idx, state in self.layer_states.items():
+            if state.kv_latent_cache is not None:
+                kv_snapshots[layer_idx] = state.kv_latent_cache.clone()
+
+        compressor_bak = {}
+        for layer_idx, comp in self._compressors.items():
+            if comp is not None:
+                compressor_bak[layer_idx] = (comp.accumulated,
+                    comp.kv_state.clone() if comp.kv_state is not None else None,
+                    comp.score_state.clone() if comp.score_state is not None else None)
+
+        pos_bak = self._global_pos
+
+        try:
+            # Embed all draft tokens as a batch
+            h = self.embed[draft_ids].to(torch.bfloat16)  # [B, T_draft, D]
+            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+            for layer_idx in range(self.config.num_hidden_layers):
+                lw = self._get_layer_weights(layer_idx)
+
+                residual_attn = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                if lw.get("attn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                else:
+                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+                residual = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                if lw.get("ffn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, draft_ids)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(ffn_out, residual, post, comb)
+                else:
+                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+            if self.norm_weight is not None:
+                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+            logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
+
+            n_accept = 0
+            bonus_logits = None
+            for i in range(T_draft):
+                expected_next = draft_ids[:, i + 1] if i + 1 < T_draft else None
+                pred_next = logits[:, i].argmax(dim=-1)
+
+                if expected_next is None:
+                    n_accept += 1
+                    bonus_logits = logits[:, i, :]
+                elif pred_next.item() == expected_next.item():
+                    n_accept += 1
+                else:
+                    bonus_logits = logits[:, i, :]
+                    break
+
+            if n_accept < T_draft:
+                for layer_idx in kv_snapshots:
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None and state.kv_latent_cache is not None:
+                        orig_len = kv_snapshots[layer_idx].shape[1]
+                        keep_len = orig_len + n_accept
+                        if state.kv_latent_cache.dim() == 4:
+                            state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :, :].contiguous()
+                        else:
+                            state.kv_latent_cache = state.kv_latent_cache[:, :keep_len, :].contiguous()
+                for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
+                    comp = self._compressors.get(layer_idx)
+                    if comp is not None:
+                        comp.accumulated = acc
+                        comp.kv_state = kv_s
+                        comp.score_state = sc_s
+        finally:
+            self._global_pos = pos_bak + n_accept
+            if n_accept == 0:
+                for layer_idx, saved_kv in kv_snapshots.items():
+                    state = self.layer_states.get(layer_idx)
+                    if state is not None:
+                        state.kv_latent_cache = saved_kv
+                for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
+                    comp = self._compressors.get(layer_idx)
+                    if comp is not None:
+                        comp.accumulated = acc
+                        comp.kv_state = kv_s
+                        comp.score_state = sc_s
+
+        return n_accept, bonus_logits
+
+    def save_session(self, session_id: str, session_dir: str = "sessions"):
+        os.makedirs(session_dir, exist_ok=True)
+        sdir = os.path.join(session_dir, session_id)
+        os.makedirs(sdir, exist_ok=True)
+
+        state = {"global_pos": self._global_pos}
+        torch.save(state, os.path.join(sdir, "state.pt"))
+
+        for layer_idx, ls in self.layer_states.items():
+            ldir = os.path.join(sdir, f"layer_{layer_idx}")
+            os.makedirs(ldir, exist_ok=True)
+            if ls.kv_latent_cache is not None:
+                torch.save(ls.kv_latent_cache.cpu(), os.path.join(ldir, "kv_latent.pt"))
+            if ls.compressed_kv_data is not None:
+                torch.save(ls.compressed_kv_data.cpu(), os.path.join(ldir, "compressed_data.pt"))
+            if ls.compressed_kv_idx is not None:
+                torch.save(ls.compressed_kv_idx.cpu(), os.path.join(ldir, "compressed_idx.pt"))
+            cstate = {"compressed_count": ls.compressed_count,
+                      "archived_len": ls.archived_len}
+            torch.save(cstate, os.path.join(ldir, "counts.pt"))
+            if ls.archived_kv is not None:
+                torch.save(ls.archived_kv.cpu(), os.path.join(ldir, "archived_kv.pt"))
+
+        for layer_idx, comp in self._compressors.items():
+            if comp is None:
+                continue
+            cdir = os.path.join(sdir, f"compressor_{layer_idx}")
+            os.makedirs(cdir, exist_ok=True)
+            torch.save({"accumulated": comp.accumulated}, os.path.join(cdir, "state.pt"))
+            if comp.kv_state is not None:
+                torch.save(comp.kv_state.cpu(), os.path.join(cdir, "kv_state.pt"))
+            if comp.score_state is not None:
+                torch.save(comp.score_state.cpu(), os.path.join(cdir, "score_state.pt"))
+
+        for layer_idx, hybrid in self._hybrid_kv.items():
+            hdir = os.path.join(sdir, f"hybrid_{layer_idx}")
+            os.makedirs(hdir, exist_ok=True)
+            torch.save({"write_pos": hybrid.swa._write_pos,
+                        "num_entries": hybrid.swa._num_entries},
+                       os.path.join(hdir, "swa_state.pt"))
+            torch.save(hybrid.swa.k_cache.cpu(), os.path.join(hdir, "k_cache.pt"))
+            torch.save(hybrid.swa.v_cache.cpu(), os.path.join(hdir, "v_cache.pt"))
+
+    def load_session(self, session_id: str, session_dir: str = "sessions"):
+        sdir = os.path.join(session_dir, session_id)
+        state = torch.load(os.path.join(sdir, "state.pt"), map_location="cpu", weights_only=True)
+        self._global_pos = state["global_pos"]
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            ldir = os.path.join(sdir, f"layer_{layer_idx}")
+            if not os.path.isdir(ldir):
+                continue
+            ls = LayerState(device=str(self.device))
+            kv_path = os.path.join(ldir, "kv_latent.pt")
+            if os.path.exists(kv_path):
+                ls.kv_latent_cache = torch.load(kv_path, map_location=self.device, weights_only=True)
+            cd_path = os.path.join(ldir, "compressed_data.pt")
+            if os.path.exists(cd_path):
+                ls.compressed_kv_data = torch.load(cd_path, map_location=self.device, weights_only=True)
+            ci_path = os.path.join(ldir, "compressed_idx.pt")
+            if os.path.exists(ci_path):
+                ls.compressed_kv_idx = torch.load(ci_path, map_location=self.device, weights_only=True)
+            c_path = os.path.join(ldir, "counts.pt")
+            if os.path.exists(c_path):
+                cstate = torch.load(c_path, map_location="cpu", weights_only=True)
+                ls.compressed_count = cstate.get("compressed_count", 0)
+                ls.archived_len = cstate.get("archived_len", 0)
+            av_path = os.path.join(ldir, "archived_kv.pt")
+            if os.path.exists(av_path):
+                ls.archived_kv = torch.load(av_path, map_location="cpu", weights_only=True)
+            self.layer_states[layer_idx] = ls
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            cdir = os.path.join(sdir, f"compressor_{layer_idx}")
+            if not os.path.isdir(cdir):
+                continue
+            comp = self._compressors.get(layer_idx)
+            if comp is None:
+                continue
+            cstate_path = os.path.join(cdir, "state.pt")
+            if os.path.exists(cstate_path):
+                cs = torch.load(cstate_path, map_location="cpu", weights_only=True)
+                comp.accumulated = cs.get("accumulated", 0)
+            kv_path = os.path.join(cdir, "kv_state.pt")
+            if os.path.exists(kv_path):
+                comp.kv_state = torch.load(kv_path, map_location=self.device, weights_only=True)
+            sc_path = os.path.join(cdir, "score_state.pt")
+            if os.path.exists(sc_path):
+                comp.score_state = torch.load(sc_path, map_location=self.device, weights_only=True)
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            hdir = os.path.join(sdir, f"hybrid_{layer_idx}")
+            if not os.path.isdir(hdir):
+                continue
+            hybrid = self._hybrid_kv.get(layer_idx)
+            if hybrid is None:
+                continue
+            swa_path = os.path.join(hdir, "swa_state.pt")
+            if os.path.exists(swa_path):
+                sws = torch.load(swa_path, map_location="cpu", weights_only=True)
+                hybrid.swa._write_pos = sws.get("write_pos", 0)
+                hybrid.swa._num_entries = sws.get("num_entries", 0)
+            kc_path = os.path.join(hdir, "k_cache.pt")
+            if os.path.exists(kc_path):
+                hybrid.swa.k_cache = torch.load(kc_path, map_location=self.device, weights_only=True)
+            vc_path = os.path.join(hdir, "v_cache.pt")
+            if os.path.exists(vc_path):
+                hybrid.swa.v_cache = torch.load(vc_path, map_location=self.device, weights_only=True)
+
+        self._log(f"Loaded session {session_id}: pos={self._global_pos}, layers={len(self.layer_states)}")
+
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=50, temperature=0.6, stream_callback=None,
+                 session_id=None, resume=False):
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         B, T = input_ids.shape
-        self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}")
 
-        self.layer_states = {}
-        self._deq_cache.clear()
-        self.expert_cache.clear()
-        self._layer_weight_cache.clear()
-        clear_deq_cache()
-        for compressor in self._compressors.values():
-            compressor.reset()
-        for indexer in self._indexers.values():
-            indexer.reset()
-        for hybrid in self._hybrid_kv.values():
-            hybrid.reset()
-        self._global_pos = 0
+        skip_prefill = resume and session_id is not None
+
+        if not skip_prefill:
+            self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}")
+            self.layer_states = {}
+            self._deq_cache.clear()
+            self.expert_cache.clear()
+            self._layer_weight_cache.clear()
+            clear_deq_cache()
+            for compressor in self._compressors.values():
+                compressor.reset()
+            for indexer in self._indexers.values():
+                indexer.reset()
+            for hybrid in self._hybrid_kv.values():
+                hybrid.reset()
+            self._global_pos = 0
         if self._prefetch_worker is not None:
             self._prefetch_worker.clear()
         self._init_prefetch()
@@ -2236,72 +2444,79 @@ class HomeSeekInferenceEngine:
         torch.cuda.reset_peak_memory_stats(self.device)
         start = time.time()
 
-        h = self.embed[input_ids].to(torch.bfloat16)
-        h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        if not skip_prefill:
+            h = self.embed[input_ids].to(torch.bfloat16)
+            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-        self._phase = "prefill"
-        for layer_idx in range(self.config.num_hidden_layers):
-            lw = self._get_layer_weights(layer_idx)
+            self._phase = "prefill"
+            for layer_idx in range(self.config.num_hidden_layers):
+                lw = self._get_layer_weights(layer_idx)
 
-            residual_attn = h
-            h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
-            if lw.get("attn_norm.weight") is not None:
-                h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-            attn_out = self._forward_attn(h_pre, lw, layer_idx)
-            if post is not None and comb is not None:
-                h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                residual_attn = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+                if lw.get("attn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                attn_out = self._forward_attn(h_pre, lw, layer_idx)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+                else:
+                    h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+                residual = h
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+                if lw.get("ffn_norm.weight") is not None:
+                    h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+                ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, input_ids)
+                if post is not None and comb is not None:
+                    h = self._process_mhc_post(ffn_out, residual, post, comb)
+                else:
+                    h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
+                self._predict_and_prefetch_next(layer_idx, h_pre, input_ids)
+                if self._prefetch_worker is not None:
+                    self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
+
+                if (layer_idx + 1) % 5 == 0:
+                    mem = torch.cuda.memory_allocated() / (1024**3)
+                    if mem > 18:
+                        if self._prefetch_worker is not None:
+                            self._prefetch_worker.clear()
+                        for li in range(max(0, layer_idx - 5), layer_idx + 1):
+                            if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
+                                if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
+                                    with torch.cuda.stream(self._kv_offload_stream):
+                                        self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
+                                        self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
+                                if self.layer_states[li].compressed_kv_data is not None:
+                                    self.layer_states[li].compressed_kv_data = None
+                                    self.layer_states[li].compressed_kv_idx = None
+                        torch.cuda.empty_cache()
+                        self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
+
+            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+            if self.norm_weight is not None:
+                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+            logits = torch.matmul(h_3d[:, -1:].to(self.lm_head.dtype), self.lm_head.t())
+
+            self._global_pos = T  # prefill done, advance position
+
+            if temperature > 0:
+                probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
+                next_id = torch.multinomial(probs, 1)
             else:
-                h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+                next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
 
-            residual = h
-            h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-            if lw.get("ffn_norm.weight") is not None:
-                h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-            ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, input_ids)
-            if post is not None and comb is not None:
-                h = self._process_mhc_post(ffn_out, residual, post, comb)
-            else:
-                h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-
-            self._predict_and_prefetch_next(layer_idx, h_pre, input_ids)
-            if self._prefetch_worker is not None:
-                self._prefetch_next_layer(layer_idx, lw, hidden_states=h_pre[:, -1:, :])
-
-            if (layer_idx + 1) % 5 == 0:
-                mem = torch.cuda.memory_allocated() / (1024**3)
-                if mem > 18:
-                    if self._prefetch_worker is not None:
-                        self._prefetch_worker.clear()
-                    for li in range(max(0, layer_idx - 5), layer_idx + 1):
-                        if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
-                            if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
-                                with torch.cuda.stream(self._kv_offload_stream):
-                                    self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
-                                    self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
-                            if self.layer_states[li].compressed_kv_data is not None:
-                                self.layer_states[li].compressed_kv_data = None
-                                self.layer_states[li].compressed_kv_idx = None
-                    self._gpu_expert_store.resize(32)
-                    torch.cuda.empty_cache()
-                    self._log(f"  Layer {layer_idx}: freed caches, mem={mem:.1f}GB")
-
-        h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-        if self.norm_weight is not None:
-            h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
-        logits = torch.matmul(h_3d[:, -1:].to(self.lm_head.dtype), self.lm_head.t())
-
-        self._global_pos = T  # prefill done, advance position
-
-        if temperature > 0:
-            probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
-            next_id = torch.multinomial(probs, 1)
+            generated = [next_id]
+            if stream_callback is not None:
+                stream_callback(next_id.item())
+            prefill_end = time.time()
         else:
-            next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
-
-        generated = [next_id]
-        if stream_callback is not None:
-            stream_callback(next_id.item())
-        prefill_end = time.time()
+            self._phase = "decode"
+            next_id = input_ids[:, -1:]
+            generated = []
+            prefill_end = start
+            T = self._global_pos
+            self._log(f"Session resume: pos={T}, max_new={max_new_tokens}")
 
         mtp_num_draft = 3 if self._mtp_loaded else 0
 
@@ -2383,8 +2598,8 @@ class HomeSeekInferenceEngine:
                         if step < max_new_tokens - 1:
                             next_id = draft_ids[:, -1:]
                         continue
-                    n_acc, bonus_logits = self._mtp_accept_drafts(
-                        all_inputs, draft_ids, temperature)
+                    n_acc, bonus_logits = self._mtp_verify_batched(
+                        draft_ids, temperature)
                     if n_acc > 0:
                         accepted_ids = draft_ids[:, :n_acc]
                         for i in range(n_acc):
@@ -2431,6 +2646,8 @@ class HomeSeekInferenceEngine:
         if hits + misses > 0:
             self._log(f"Deq cache: hits={hits} misses={misses} "
                       f"hit_rate={hits/(hits+misses)*100:.1f}%")
+        if session_id is not None:
+            self.save_session(session_id)
         self.loader.close()
         self._log(f"Done: {result['num_generated_tokens']} tokens in {total_time:.1f}s, "
                   f"peak mem: {result['peak_memory_gb']:.1f}GB")

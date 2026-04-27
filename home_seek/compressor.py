@@ -248,4 +248,15 @@ class Compressor:
         """
         if start_pos == 0:
             return self.compress_prefill(x)
-        return self.compress_decode(x, start_pos)
+        B, T, _ = x.shape
+        if T == 1:
+            return self.compress_decode(x, start_pos)
+        # T > 1, start_pos > 0: decode each token sequentially for compressor
+        results = []
+        for t in range(T):
+            result = self.compress_decode(x[:, t:t+1, :], start_pos + t)
+            if result is not None:
+                results.append(result)
+        if results:
+            return torch.cat(results, dim=1)
+        return None

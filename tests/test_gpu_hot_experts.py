@@ -54,8 +54,6 @@ def _make_engine_stub():
     eng._get_shared_expert = MagicMock(return_value=None)
     eng._hot_expert_ids = []
     eng._hot_expert_set_by_layer = {}
-    eng._gpu_expert_store = MagicMock()
-    eng._gpu_expert_store.get_cache_key.return_value = None
     eng._log = lambda msg: None
     return eng
 
@@ -79,7 +77,6 @@ class TestHotExpertSet:
         eng._log = lambda msg: None
         eng._gpu_hot_experts = {}
         eng._max_hot_experts = 16
-        eng._gpu_expert_store = MagicMock()
         eng.loader = MagicMock()
         from home_seek.inference_engine import ExpertWeightCache
         eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")
@@ -97,7 +94,6 @@ class TestHotExpertSet:
         eng._log = lambda msg: None
         eng._gpu_hot_experts = {}
         eng._max_hot_experts = 16
-        eng._gpu_expert_store = MagicMock()
         eng.loader = MagicMock()
         from home_seek.inference_engine import ExpertWeightCache
         eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")

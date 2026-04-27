@@ -284,35 +284,7 @@ class LayerTrace:
         return "\n".join(lines)
 
 
-class GpuExpertStoreMonitor:
-    def __init__(self):
-        self.ensure_calls = 0
-        self.cache_hits = 0
-        self.prefetch_calls = 0
-        self.layers_loaded = set()
-
-    def record_ensure(self, layer: int, hit: bool):
-        self.ensure_calls += 1
-        if hit:
-            self.cache_hits += 1
-        if not hit:
-            self.layers_loaded.add(layer)
-
-    def record_prefetch(self, layer: int):
-        self.prefetch_calls += 1
-
-    def summary(self):
-        hit_rate = self.cache_hits / self.ensure_calls * 100 if self.ensure_calls > 0 else 0
-        lines = [
-            "GPU FP4 Store Activity:",
-            f"  get_cache_key calls: {self.ensure_calls}",
-            f"  cache hits: {self.cache_hits}  (hit rate: {hit_rate:.1f}%)",
-            f"  num experts cached: {len(self.layers_loaded)}",
-        ]
-        return "\n".join(lines)
-
-
-def patch_engine(engine, timer, cache_mon, gpu_mon, layer_trace, mem_trace):
+def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
     original_forward_attn = engine._forward_attn
     original_forward_ffn = engine._forward_ffn
     original_process_mhc = engine._process_mhc_layer
@@ -320,7 +292,6 @@ def patch_engine(engine, timer, cache_mon, gpu_mon, layer_trace, mem_trace):
     original_load_expert = engine._load_expert_weights
     original_expert_deq = engine._load_expert_deq
     original_expert_cache_get = engine.expert_cache.get
-    original_gpu_get = engine._gpu_expert_store.get_cache_key
     original_hc_head = engine._hc_head
 
     def traced_forward_attn(hidden_states, lw, layer_idx):
@@ -401,11 +372,6 @@ def patch_engine(engine, timer, cache_mon, gpu_mon, layer_trace, mem_trace):
         cache_mon.record_cache(hit)
         return original_expert_cache_get(key)
 
-    def traced_gpu_get(layer_idx, expert_idx):
-        hit = (layer_idx, expert_idx) in engine._gpu_expert_store._cache
-        gpu_mon.record_ensure(layer_idx, hit)
-        return original_gpu_get(layer_idx, expert_idx)
-
     engine._forward_attn = traced_forward_attn
     engine._forward_ffn = traced_forward_ffn
     engine._process_mhc_layer = traced_process_mhc
@@ -414,7 +380,6 @@ def patch_engine(engine, timer, cache_mon, gpu_mon, layer_trace, mem_trace):
     engine._load_expert_weights = traced_load_expert
     engine._load_expert_deq = traced_expert_deq
     engine.expert_cache.get = traced_cache_get
-    engine._gpu_expert_store.get_cache_key = traced_gpu_get
     return engine
 
 
@@ -470,12 +435,11 @@ def run_profile(args):
 
     timer = PerLayerTimer()
     cache_mon = CacheMonitor()
-    gpu_mon = GpuExpertStoreMonitor()
     layer_trace = LayerTrace(engine.config.num_hidden_layers)
     mem_trace = []
     mem_trace.append(("init", -1, torch.cuda.memory_allocated()))
 
-    patch_engine(engine, timer, cache_mon, gpu_mon, layer_trace, mem_trace)
+    patch_engine(engine, timer, cache_mon, layer_trace, mem_trace)
 
     util_mon = UtilMonitor()
 
@@ -538,9 +502,6 @@ def run_profile(args):
     print(cache_mon.summary())
 
     print(f"\n{'-' * 70}")
-    print(gpu_mon.summary())
-
-    print(f"\n{'-' * 70}")
     print("Bottleneck Analysis:")
     total_attn = sum(layer_trace.attn_ms) / 1000
     total_ffn = sum(layer_trace.ffn_ms) / 1000
@@ -575,9 +536,6 @@ def run_profile(args):
     if total_file_io_ms / result['total_time_s'] > 0.2:
         print(f"  >> File I/O占比过高({total_file_io_ms/1000/result['total_time_s']*100:.0f}%)，专家权重从文件读取是主要瓶颈")
 
-    gpu_hit = gpu_mon.cache_hits / max(gpu_mon.ensure_calls, 1) * 100
-    print(f"  GPU FP4 store hit rate: {gpu_hit:.1f}%")
-
     if args.output:
         output_data = {
             "config": {
@@ -602,8 +560,6 @@ def run_profile(args):
                 "hot_hits": cache_mon.hot_hits,
                 "hot_misses": cache_mon.hot_misses,
                 "file_loads": cache_mon.file_loads,
-                "gpu_store_hits": gpu_mon.cache_hits,
-                "gpu_store_misses": gpu_mon.ensure_calls - gpu_mon.cache_hits,
             },
         }
         with open(args.output, "w") as f:

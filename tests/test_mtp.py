@@ -108,7 +108,6 @@ def _make_mock_engine():
     eng._log = lambda msg: None
     eng._mtp_loaded = True
     eng.loader = None
-    eng._gpu_expert_store = None
     eng._use_triton = True
 
     from home_seek.inference_engine import ExpertWeightCache
