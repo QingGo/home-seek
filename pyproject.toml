@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "home-seek"
 version = "0.1.0"
@@ -16,14 +20,14 @@ dependencies = [
     "torch==2.8.0",
     "httpx>=0.28.1",
     "socksio>=1.0.0",
-    "tilelang>=0.1.9",
 ]
 
 [project.scripts]
 home-seek-infer = "home_seek.inference_engine:main"
 
 [tool.setuptools.packages.find]
-include = ["home_seek*", "tile_reference*"]
+where = ["src"]
+include = ["home_seek*"]
 
 [dependency-groups]
 dev = [

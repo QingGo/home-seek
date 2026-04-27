@@ -7,7 +7,7 @@ install:
 	uv sync
 
 lint:
-	$(UV) ruff check home_seek/ tests/
+	$(UV) ruff check src/home_seek/ tests/
 
 test-unit:
 	$(UV) python -m pytest tests/ --ignore=tests/integration -m "not slow" -q

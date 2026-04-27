@@ -8,7 +8,7 @@ class TestTileOps:
             pytest.skip("CUDA not available")
 
     def test_cast_to_fp4_and_back(self):
-        from tile_reference import cast, unpack_from_e2m1fn_x2
+        from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         quantized, sf = cast(x, fmt="e2m1", block_size=(1, 32))
@@ -25,7 +25,7 @@ class TestTileOps:
         assert cos_sim >= 0.99, f"Cosine similarity too low: {cos_sim}"
 
     def test_cast_to_fp8_and_back(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         quantized, sf = cast(x, fmt="e4m3", block_size=(32, 32))
         assert quantized.dtype == torch.float8_e4m3fn
@@ -33,7 +33,7 @@ class TestTileOps:
         assert sf.shape[1] == 4
 
     def test_stable_topk(self):
-        from tile_reference import stable_topk
+        from home_seek.router import stable_topk
         scores = torch.tensor([[1.0, 5.0, 3.0, 7.0], [8.0, 2.0, 6.0, 4.0]], device="cuda")
         indices = stable_topk(scores, 2)
         assert indices[0, 0].item() == 3
@@ -42,7 +42,7 @@ class TestTileOps:
         assert indices[1, 1].item() == 2
 
     def test_swiglu_forward(self):
-        from tile_reference import swiglu_forward
+        from tests._reference import swiglu_forward
         x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
         out = swiglu_forward(x)
         assert out.shape == (4, 4)
@@ -54,7 +54,7 @@ class TestTileOps:
         assert torch.allclose(out, expected, atol=1e-5)
 
     def test_swiglu_with_weights(self):
-        from tile_reference import swiglu_forward
+        from tests._reference import swiglu_forward
         x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
         pos = torch.tensor([0, 1, 2, 3], device="cuda")
         weights = torch.tensor([[0.5, 0.5], [0.3, 0.7], [0.9, 0.1], [0.4, 0.6]], device="cuda")
@@ -62,7 +62,7 @@ class TestTileOps:
         assert out.shape == (4, 4)
 
     def test_reduce_fused(self):
-        from tile_reference import reduce_fused
+        from tests._reference import reduce_fused
         x = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
         token_topk_to_pos = torch.tensor([
             [0, 4], [1, 5], [2, 6], [3, 7],
@@ -74,7 +74,7 @@ class TestTileOps:
         assert out.shape == (4, 16)
 
     def test_expand_to_fused(self):
-        from tile_reference import expand_to_fused
+        from tests._reference import expand_to_fused
         x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
         token_topk_to_pos = torch.tensor([
             [0, 4], [1, 5], [2, -1], [3, 7],
@@ -110,77 +110,10 @@ class TestTileOps:
         assert torch.equal(weights_1, weights_2)
 
     def test_mla_attention(self):
-        from home_seek.compressed_attention import MLAAttention
-        from home_seek.model_config import DeepSeekV4FlashConfig
-
-        config = DeepSeekV4FlashConfig()
-        attn = MLAAttention(config, device="cuda")
-
-        B, T = 1, 64
-        hidden = torch.randn(B, T, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-
-        q_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_b = torch.randn(config.num_attention_heads * config.head_dim, config.q_lora_rank,
-                          device="cuda", dtype=torch.bfloat16)
-        kv_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        kv_b = torch.randn(config.num_key_value_heads * config.head_dim * 2, config.q_lora_rank,
-                          device="cuda", dtype=torch.bfloat16)
-        o_p = torch.randn(config.hidden_size, config.num_attention_heads * config.head_dim,
-                          device="cuda", dtype=torch.bfloat16)
-
-        out, k, v = attn.forward_mla(hidden, q_a, q_b, kv_a, kv_b, o_p)
-        assert out.shape == (B, T, config.hidden_size)
-        head_out_dim = config.num_attention_heads * config.head_dim
-        assert k.shape == (B, config.num_key_value_heads, T, config.head_dim)
-        assert v.shape == (B, config.num_key_value_heads, T, config.head_dim)
+        pytest.skip("compressed_attention.py removed (dead code)")
 
     def test_mla_attention_with_cache(self):
-        from home_seek.compressed_attention import MLAAttention
-        from home_seek.model_config import DeepSeekV4FlashConfig
-
-        config = DeepSeekV4FlashConfig()
-        attn = MLAAttention(config, device="cuda")
-
-        B, T = 1, 4
-        hidden = torch.randn(B, T, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-
-        q_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_b = torch.randn(config.num_attention_heads * config.head_dim, config.q_lora_rank,
-                          device="cuda", dtype=torch.bfloat16)
-        kv_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        kv_b = torch.randn(config.num_key_value_heads * config.head_dim * 2, config.q_lora_rank,
-                          device="cuda", dtype=torch.bfloat16)
-        o_p = torch.randn(config.hidden_size, config.num_attention_heads * config.head_dim,
-                          device="cuda", dtype=torch.bfloat16)
-
-        out1, k1, v1 = attn.forward_mla(hidden, q_a, q_b, kv_a, kv_b, o_p)
-        hidden2 = torch.randn(B, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        out2, k2, v2 = attn.forward_mla(hidden2, q_a, q_b, kv_a, kv_b, o_p, past_k=k1, past_v=v1)
-        assert out2.shape == (B, 1, config.hidden_size)
-        assert k2.shape[-2] == T + 1
+        pytest.skip("compressed_attention.py removed (dead code)")
 
     def test_kv_cache_manager(self):
-        from home_seek.kv_cache_manager import KVCacheManager
-        from home_seek.model_config import DeepSeekV4FlashConfig
-
-        config = DeepSeekV4FlashConfig()
-        manager = KVCacheManager(config, device="cuda")
-        manager.init_cache(batch_size=1)
-
-        B, n_kv, D = 1, config.num_key_value_heads, config.head_dim
-
-        for layer_idx in range(min(5, config.num_hidden_layers)):
-            k = torch.randn(B, n_kv, 4, D, device="cuda", dtype=torch.bfloat16)
-            v = torch.randn(B, n_kv, 4, D, device="cuda", dtype=torch.bfloat16)
-            manager.update(layer_idx, k, v)
-
-            swa_k, swa_v = manager.get_swa_cache(layer_idx)
-            assert swa_k.shape[-2] >= 4
-
-            compressed = manager.get_compressed_cache(layer_idx)
-            if compressed[0] is not None:
-                csa_k, csa_v, hca_k, hca_v = compressed
-                assert csa_k.shape[-2] >= 0
-
-        stats = manager.get_memory_stats()
-        assert "allocated_gb" in stats
+        pytest.skip("kv_cache_manager.py removed (dead code)")

@@ -16,11 +16,10 @@ from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache, t
 from home_seek.compressor import Compressor as NewCompressor
 from home_seek.lightning_indexer import LightningIndexer
 from home_seek.hybrid_kv_cache import HybridKVCache
-from tile_reference import unpack_from_e2m1fn_x2
-import tile_kernels
+from home_seek._fp4 import unpack_from_e2m1fn_x2, cast_back
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-_encoding_dir = os.path.join(_current_dir, '../weights/encoding')
+_encoding_dir = os.path.join(_current_dir, '../../weights/encoding')
 sys.path.insert(0, os.path.abspath(_encoding_dir))
 from encoding_dsv4 import encode_messages
 
@@ -101,19 +100,6 @@ def _fp4_simulate(x, block_size=32):
     return x
 
 
-def _hadamard_transform(x):
-    """Fast Walsh-Hadamard transform along last dim."""
-    n = x.shape[-1]
-    h = 1
-    x_f = x.float()
-    while h < n:
-        a = x_f[..., :h]
-        b = x_f[..., h:2*h]
-        x_f = torch.cat([a + b, a - b], dim=-1)
-        h *= 2
-    return x_f.to(x.dtype) * (n ** -0.5)
-
-
 def _ue8m0_to_f32(sf: torch.Tensor) -> torch.Tensor:
     if sf.element_size() != 1:
         return sf.to(torch.float32)
@@ -130,8 +116,8 @@ def load_fp8_weight(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     if data.dtype == torch.float8_e4m3fn:
         if scale is None:
             return data.to(torch.bfloat16)
-        sf = (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32) if scale.element_size() == 1 else scale
-        return tile_kernels.quant.cast_back((data, sf), 'bf16', (128, 128))
+        sf = _ue8m0_to_f32(scale)
+        return cast_back((data, sf), 'bf16', (128, 128))
     return data.to(torch.bfloat16)
 
 
@@ -418,8 +404,7 @@ class HomeSeekInferenceEngine:
         self.predictor = RecordingPredictor(
             HeuristicPredictor(self.config.num_hidden_layers, self.config.num_experts_per_tok))
         self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        self._cpu_fallback_enabled = True
-        self._cpu_fallback_layers = set(range(min(3, self.config.num_hidden_layers))) | set(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
+        self._cpu_fallback_enabled = False
         self._hot_expert_ids = []
         self._hash_expert_ids = []
         self._hot_expert_set = set()
@@ -961,25 +946,8 @@ class HomeSeekInferenceEngine:
         hc_fn = hc_fn.to(dev)
         hc_base = hc_base.to(dev)
         hc_scale = hc_scale.to(dev)
-        
-        if self._use_triton:
-            try:
-                hidden_contig = hidden_4d.contiguous()
-                post_mix, comb_mix, layer_input = tile_kernels.modeling.mhc.ops.mhc_pre_big_fuse(
-                    hidden_contig, hc_fn.float(), hc_scale.to(torch.float32), hc_base.to(torch.float32),
-                    self.config.rms_norm_eps, self.config.hc_eps, self.config.hc_eps,
-                    2.0, self.config.hc_sinkhorn_iters)
-                if apply_pre:
-                    hidden = layer_input.to(hidden_4d.dtype)
-                else:
-                    hidden = hidden_4d.sum(dim=2)
-                post = post_mix.squeeze(-1)
-                comb = comb_mix
-                return hidden, post, comb
-            except Exception as e:
-                self._log(f"mHC kernel fallback (not critical): {type(e).__name__}")
-        
-        # PyTorch fallback
+
+        # PyTorch fallback (mHC tilelang kernel removed)
         hidden_flat = hidden_4d.reshape(B, T, expected_in).float()
         rsqrt = torch.rsqrt(hidden_flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
         mixes = torch.matmul(hidden_flat * rsqrt, hc_fn.float().t())
@@ -1223,19 +1191,13 @@ class HomeSeekInferenceEngine:
     def _load_expert_raw(self, layer_idx, eid):
         raw = self._load_expert_weights(layer_idx, eid)
         if raw is None:
-            if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
-                raw = self._cpu_ffn_fallback(layer_idx, eid)
-            if raw is None:
-                return None
+            return None
         return raw
 
     def _load_expert_deq(self, layer_idx, eid):
         raw = self._load_expert_weights(layer_idx, eid)
         if raw is None:
-            if self._cpu_fallback_enabled and layer_idx in self._cpu_fallback_layers:
-                raw = self._cpu_ffn_fallback(layer_idx, eid)
-            if raw is None:
-                return None
+            return None
         deq = self.expert_cache.deq(f"{layer_idx}_{eid}")
         if deq is None:
             deq = raw
@@ -1888,41 +1850,6 @@ class HomeSeekInferenceEngine:
             h_3d = rms_norm(h_3d, norm_w.to(torch.bfloat16), self.config.rms_norm_eps)
         return h_3d
 
-    def _warmup_page_cache(self):
-        """Sequentially read all safetensors to warm the Linux page cache.
-
-        With 150GB weights and 900GB available RAM, all weight files should
-        fit in page cache after warmup.  Using 8 threads to saturate the RAID
-        read bandwidth (~1.5 GB/s measured → ~100s for 150GB).
-        """
-        import concurrent.futures
-
-        safetensors_files = self.loader._safetensors_files()
-        if not safetensors_files:
-            return
-
-        total_gb = sum(os.path.getsize(f) for f in safetensors_files) / (1024**3)
-        self._log(f"Warming page cache: {len(safetensors_files)} files, "
-                  f"{total_gb:.1f} GB...")
-        t0 = time.time()
-
-        def read_file(fpath):
-            try:
-                with open(fpath, "rb") as f:
-                    chunk_size = 16 * 1024 * 1024  # 16MB chunks
-                    while f.read(chunk_size):
-                        pass
-            except Exception:
-                pass
-
-        max_workers = min(8, len(safetensors_files))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(read_file, safetensors_files))
-
-        elapsed = time.time() - t0
-        bw = total_gb / elapsed if elapsed > 0 else 0
-        self._log(f"Page cache warmup done in {elapsed:.1f}s ({bw:.1f} GB/s)")
-
     def _preload_all_experts(self):
         """Load every (layer, expert) pair into ExpertWeightCache during init.
 
@@ -1968,52 +1895,9 @@ class HomeSeekInferenceEngine:
             return True
         self._log("Warming up kernels...")
 
-        cast_ok = False
-        try:
-            dummy = torch.zeros(1, 1, device=self.device, dtype=torch.bfloat16)
-            s = torch.ones(1, 1, device=self.device)
-            _ = tile_kernels.quant.cast_back((dummy, s), 'bf16', (128, 128))
-            cast_ok = True
-            self._log("cast_back kernel warmup OK")
-        except Exception as e:
-            self._log(f"Warmup: cast_back kernel failed ({type(e).__name__}), "
-                      f"quantized ops may JIT-compile on first use")
-        finally:
-            del dummy
-            try:
-                del s
-            except NameError:
-                pass
-
-        moe_ok = False
-        try:
-            from tile_kernels.moe import get_fused_mapping, expand_to_fused, reduce_fused
-            from tile_kernels.torch.moe import inplace_unique_group_indices
-            dw = torch.randn(16, 4096, device=self.device, dtype=torch.bfloat16)
-            ti = torch.randint(0, 256, (16, 6), device=self.device, dtype=torch.int64)
-            inplace_unique_group_indices(ti, 256)
-            m = get_fused_mapping(ti, 256, 4096, 32)
-            ex = expand_to_fused(dw, m[3], m[0])
-            tw = torch.randn(16, 6, device=self.device, dtype=torch.float32)
-            _ = reduce_fused(ex, tw, m[3])
-            torch.cuda.synchronize(self.device)
-            moe_ok = True
-            self._log("MoE kernels warmup OK")
-        except Exception as e:
-            self._log(f"Warmup: MoE kernels failed ({type(e).__name__}), "
-                      f"fused routing may JIT-compile on first use")
-        finally:
-            try:
-                del dw, ti, ex, tw, m
-            except NameError:
-                pass
-            torch.cuda.empty_cache()
-
-        all_ok = cast_ok and moe_ok
-        self._warmed_up = all_ok
-        status = "OK" if all_ok else "partial failure"
-        self._log(f"Warmup complete: {status} (cast={cast_ok}, moe={moe_ok})")
-        return all_ok
+        self._warmed_up = True
+        self._log("Warmup complete (tile_kernels removed)")
+        return True
 
     @torch.no_grad()
     def _mtp_generate_draft(self, last_hidden, num_draft: int = 3, temperature: float = 0.6,
@@ -2762,7 +2646,6 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--prefetch", action="store_true", help="Enable expert prefetch (may increase memory)")
-    parser.add_argument("--no-fallback", action="store_true", help="Disable CPU fallback")
     parser.add_argument("--hot-experts", default="hot_experts.json", help="Hot experts JSON path")
     parser.add_argument("--use-mtp", action="store_true", help="Enable MTP speculative decoding")
     parser.add_argument("--mtp-eager", action="store_true",
@@ -2774,8 +2657,6 @@ def main():
                                      hot_experts_path=args.hot_experts, reprobe=args.reprobe)
     if args.prefetch:
         engine._prefetch_enabled = True
-    if args.no_fallback:
-        engine._cpu_fallback_enabled = False
     if args.use_mtp:
         engine._mtp_loaded = True
     if args.mtp_eager:

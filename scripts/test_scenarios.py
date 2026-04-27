@@ -77,7 +77,6 @@ def main():
     )
 
     all_results = []
-    rng = np.random.RandomState(42)
 
     scenarios = [
         ("short_128_16", 128, 16),

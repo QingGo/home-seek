@@ -4,7 +4,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from tile_reference import cast, unpack_from_e2m1fn_x2
+from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
 
 
 def quantize_expert_weights(
@@ -15,9 +15,7 @@ def quantize_expert_weights(
 ):
     if inventory_path and os.path.exists(inventory_path):
         with open(inventory_path) as f:
-            inventory = json.load(f)
-    else:
-        inventory = None
+            json.load(f)
 
     os.makedirs(output_dir, exist_ok=True)
 

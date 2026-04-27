@@ -325,7 +325,7 @@ class TestFusedMoEFP4Triton:
         w3_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
         w2_bf16 = torch.randn(D, I, device="cuda", dtype=torch.bfloat16)
 
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         w1_packed, w1_scale = cast(w1_bf16, fmt="e2m1", block_size=(1, 32))
         w3_packed, w3_scale = cast(w3_bf16, fmt="e2m1", block_size=(1, 32))
         w2_packed, w2_scale = cast(w2_bf16, fmt="e2m1", block_size=(1, 32))
@@ -334,7 +334,7 @@ class TestFusedMoEFP4Triton:
                 w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale)
 
     def _deq_ref(self, packed, scale):
-        from tile_reference import unpack_from_e2m1fn_x2
+        from home_seek._fp4 import unpack_from_e2m1fn_x2
         deq = unpack_from_e2m1fn_x2(packed)
         if scale.dim() == 2:
             sf = scale.repeat_interleave(32, dim=1)
@@ -418,7 +418,7 @@ class TestFusedMoEFP4Triton:
         assert torch.isfinite(out).all()
 
     def test_fp4_fuses_gate_up_computation(self):
-        from home_seek.fused_moe import fused_expert_ffn_triton, fused_expert_ffn_pt
+        from home_seek.fused_moe import fused_expert_ffn_triton
         (w1_bf16, w3_bf16, w2_bf16,
          w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights()
 
@@ -518,7 +518,7 @@ class TestFP4DequantizePitfalls:
         """Bug: BLOCK_K_HALF=32 跨越 2 个 scale group, 只加载了一个 scale,
         导致一半值使用错误 scale。修复后 BLOCK_K_HALF=16 (单 group) 应无此问题。"""
         from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
-        from tile_reference import cast, unpack_from_e2m1fn_x2
+        from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
 
         I, D = 8, 128  # 128 cols => 4 scale groups (128/32=4)
         torch.manual_seed(123)
@@ -543,7 +543,7 @@ class TestFP4DequantizePitfalls:
         修复后经 tl.trans 转为 [BK, BN]。本测试验证 gate 投影与 PyTorch 一致。"""
         import triton
         import triton.language as tl
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         from home_seek.fused_moe import _FP4_LUT
 
         @triton.jit
@@ -625,7 +625,7 @@ class TestFP4DequantizePitfalls:
         torch.cuda.synchronize()
 
         # Reference: Python dequantize + matmul
-        from tile_reference import unpack_from_e2m1fn_x2
+        from home_seek._fp4 import unpack_from_e2m1fn_x2
         deq_w = (unpack_from_e2m1fn_x2(w_p_c).float() * w_s_c.repeat_interleave(32, dim=1).float()).to(torch.bfloat16)
         ref = hidden @ deq_w.t()
 
@@ -650,7 +650,6 @@ class TestFP4DequantizePitfalls:
         result = triton_dequantize_fp4_to_bf16(w_packed, w_scale)
 
         # Verify: group 0 columns (0..31) use scale 1, group 1 (32..63) use 2, etc.
-        from tile_reference import unpack_from_e2m1fn_x2
         for g in range(4):
             col_start = g * 32
             col_slice = result[:, col_start:col_start + 32]
@@ -688,7 +687,7 @@ class TestPCIeBARFix:
 
     def _make_fp4_cpu_weights(self):
         """Create FP4-packed weights on CPU, simulating mmap-loaded weights."""
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         I, D = self._I, self._D
         w1_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
         w3_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
@@ -791,7 +790,7 @@ class TestPCIeBARFix:
                           hidden_size=self._D, use_triton=True)
 
         def mock_load(layer, eid):
-            from tile_reference import cast
+            from home_seek._fp4 import cast
             w1_bf16 = torch.randn(self._I, self._D, dtype=torch.bfloat16)
             w3_bf16 = torch.randn(self._I, self._D, dtype=torch.bfloat16)
             w2_bf16 = torch.randn(self._D, self._I, dtype=torch.bfloat16)
@@ -814,7 +813,7 @@ class TestPCIeBARFix:
     def test_triton_deq_uses_gpu_path_when_cpu_moved(self):
         """After DMA, triton_dequantize_fp4_to_bf16 uses GPU Triton kernel."""
         from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
-        from tile_reference import cast
+        from home_seek._fp4 import cast
 
         I, D = 16, 64
         w_bf16 = torch.randn(I, D, dtype=torch.bfloat16)
@@ -838,7 +837,7 @@ class TestPCIeBARFix:
     def test_triton_deq_cpu_fallback_still_works(self):
         """CPU deq fallback (without DMA) still produces correct result."""
         from home_seek.fused_moe import triton_dequantize_fp4_to_bf16
-        from tile_reference import cast
+        from home_seek._fp4 import cast
 
         I, D = 8, 64
         w_bf16 = torch.randn(I, D, dtype=torch.bfloat16)

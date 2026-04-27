@@ -3,7 +3,8 @@ import torch.nn.functional as F
 import pytest
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.inference_engine import HomeSeekInferenceEngine
-from tile_reference import swiglu_forward, unpack_from_e2m1fn_x2
+from home_seek._fp4 import unpack_from_e2m1fn_x2
+from tests._reference import swiglu_forward
 
 
 class TestExpandKV:
@@ -98,32 +99,10 @@ class TestMHC:
         assert mixed.shape == (B, T, hc, D)
 
     def test_mhc_pre_big_fuse_api(self):
-        import tile_kernels.modeling.mhc.ops as mhc_ops
-        B, T, hc, D = 1, 4, 4, 4096
-        residual = torch.randn(B, T, hc, D, device="cuda", dtype=torch.bfloat16)
-        fn = torch.randn(hc * (2 + hc), hc * D, device="cuda", dtype=torch.float32)
-        scale = torch.tensor([1.0, 0.5, 0.1], device="cuda", dtype=torch.float32)
-        base = torch.randn(hc * (2 + hc), device="cuda", dtype=torch.float32)
-        post_mix, comb_mix, layer_input = mhc_ops.mhc_pre_big_fuse(
-            residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 5)
-        assert post_mix.shape == (B, T, hc, 1)
-        assert comb_mix.shape == (B, T, hc, hc)
-        assert layer_input.shape == (B, T, D)
+        pytest.skip("tile_kernels removed")
 
     def test_mhc_post_api(self):
-        import tile_kernels.modeling.mhc.ops as mhc_ops
-        B, T, hc, D = 1, 4, 4, 4096
-        x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
-        residual = torch.randn(B, T, hc, D, device="cuda", dtype=torch.bfloat16)
-        post_mix = torch.randn(B, T, hc, 1, device="cuda", dtype=torch.float32)
-        comb_mix = torch.randn(B, T, hc, hc, device="cuda", dtype=torch.float32)
-        try:
-            result = mhc_ops.mhc_post(x, residual, post_mix, comb_mix)
-            assert result.shape == (B, T, D)
-        except Exception as e:
-            if "PDL" in str(e) or "tilelang" in str(e).lower():
-                pytest.skip("TileKernels MHC post kernel compilation unavailable")
-            raise
+        pytest.skip("tile_kernels removed")
 
     def test_mhc_shape_mismatch_skip(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
@@ -188,37 +167,10 @@ class TestAttention:
             pytest.skip("CUDA not available")
 
     def test_mla_attention_shapes(self):
-        from home_seek.compressed_attention import MLAAttention
-        from home_seek.model_config import DeepSeekV4FlashConfig
-        config = DeepSeekV4FlashConfig()
-        attn = MLAAttention(config, device="cuda")
-        B, T = 1, 64
-        hidden = torch.randn(B, T, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_b = torch.randn(config.num_attention_heads * config.head_dim, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
-        kv_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        kv_b = torch.randn(config.num_key_value_heads * config.head_dim * 2, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
-        o_p = torch.randn(config.hidden_size, config.num_attention_heads * config.head_dim, device="cuda", dtype=torch.bfloat16)
-        out, k, v = attn.forward_mla(hidden, q_a, q_b, kv_a, kv_b, o_p)
-        assert out.shape == (B, T, config.hidden_size)
+        pytest.skip("compressed_attention.py removed (dead code)")
 
     def test_mla_attention_cache_incremental(self):
-        from home_seek.compressed_attention import MLAAttention
-        from home_seek.model_config import DeepSeekV4FlashConfig
-        config = DeepSeekV4FlashConfig()
-        attn = MLAAttention(config, device="cuda")
-        B, T = 1, 4
-        hidden = torch.randn(B, T, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_b = torch.randn(config.num_attention_heads * config.head_dim, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
-        kv_a = torch.randn(config.q_lora_rank, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        kv_b = torch.randn(config.num_key_value_heads * config.head_dim * 2, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
-        o_p = torch.randn(config.hidden_size, config.num_attention_heads * config.head_dim, device="cuda", dtype=torch.bfloat16)
-        out1, k1, v1 = attn.forward_mla(hidden, q_a, q_b, kv_a, kv_b, o_p)
-        h2 = torch.randn(B, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        out2, k2, v2 = attn.forward_mla(h2, q_a, q_b, kv_a, kv_b, o_p, past_k=k1, past_v=v1)
-        assert out2.shape == (B, 1, config.hidden_size)
-        assert k2.shape[-2] == T + 1
+        pytest.skip("compressed_attention.py removed (dead code)")
 
 
 class TestKVCache:
@@ -227,20 +179,7 @@ class TestKVCache:
             pytest.skip("CUDA not available")
 
     def test_kv_cache_manager(self):
-        from home_seek.kv_cache_manager import KVCacheManager
-        from home_seek.model_config import DeepSeekV4FlashConfig
-        config = DeepSeekV4FlashConfig()
-        mgr = KVCacheManager(config, device="cuda")
-        mgr.init_cache(batch_size=1)
-        B, n_kv, D = 1, config.num_key_value_heads, config.head_dim
-        for layer_idx in range(min(5, config.num_hidden_layers)):
-            k = torch.randn(B, n_kv, 4, D, device="cuda", dtype=torch.bfloat16)
-            v = torch.randn(B, n_kv, 4, D, device="cuda", dtype=torch.bfloat16)
-            mgr.update(layer_idx, k, v)
-            swa_k, swa_v = mgr.get_swa_cache(layer_idx)
-            assert swa_k.shape[-2] >= 4
-        stats = mgr.get_memory_stats()
-        assert "allocated_gb" in stats
+        pytest.skip("kv_cache_manager.py removed (dead code)")
 
     def test_compressed_kv_cache(self):
         from home_seek.hybrid_kv_cache import HybridKVCache
@@ -290,7 +229,7 @@ class TestQuantization:
             pytest.skip("CUDA not available")
 
     def test_fp4_roundtrip(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         for h in [64, 128, 256]:
             for w in [128, 256, 512]:
                 x = torch.randn(h, w, device="cuda", dtype=torch.bfloat16)
@@ -303,7 +242,7 @@ class TestQuantization:
                 assert cos >= 0.99
 
     def test_fp8_roundtrip(self):
-        from tile_reference import cast, cast_back
+        from home_seek._fp4 import cast, cast_back
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         q, sf = cast(x, fmt="e4m3", block_size=(32, 32))
         dq = cast_back((q, sf), fmt="fp32", block_size=(32, 32))
@@ -312,7 +251,7 @@ class TestQuantization:
         assert cos >= 0.995
 
     def test_expert_weight_approximation(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         hidden, inter = 4096, 2048
         torch.manual_seed(42)
         gate = torch.randn(inter, hidden, device="cuda", dtype=torch.bfloat16)
@@ -607,20 +546,7 @@ class TestRegression:
             pytest.skip("CUDA not available")
 
     def test_mhc_non_contiguous_input(self):
-        """Bug: expand() creates non-contiguous tensor, TileKernels kernel fails."""
-        import tile_kernels.modeling.mhc.ops as mhc_ops
-        B, T, hc, D = 1, 4, 4, 4096
-        base = torch.randn(1, T, D, device="cuda", dtype=torch.bfloat16)
-        h_4d = base.unsqueeze(2).expand(-1, -1, hc, -1)
-        assert not h_4d.is_contiguous(), "expand() should produce non-contiguous tensor"
-        fn = torch.randn(hc * (2 + hc), hc * D, device="cuda", dtype=torch.float32)
-        scale = torch.tensor([1.0, 0.5, 0.1], device="cuda", dtype=torch.float32)
-        base_t = torch.randn(hc * (2 + hc), device="cuda", dtype=torch.float32)
-        h_contig = h_4d.contiguous()
-        assert h_contig.is_contiguous()
-        post_mix, comb_mix, layer_input = mhc_ops.mhc_pre_big_fuse(
-            h_contig, fn, scale, base_t, 1e-6, 1e-6, 1e-6, 2.0, 5)
-        assert layer_input.shape == (B, T, D)
+        pytest.skip("tile_kernels removed")
 
     def test_swiglu_is_silu_not_sigmoid(self):
         """Bug: SwiGLU = SiLU(gate) * up = gate * sigmoid(gate) * up, not sigmoid(gate) * up."""
@@ -628,7 +554,7 @@ class TestRegression:
         g = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
         u = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
         x = torch.cat([g, u], dim=-1).contiguous()
-        from tile_reference import swiglu_forward
+        from tests._reference import swiglu_forward
         expected = swiglu_forward(x, swiglu_clamp_value=10.0)
         g_clamped = g.float().clamp(max=10.0)
         u_clamped = u.float().clamp(min=-10.0, max=10.0)

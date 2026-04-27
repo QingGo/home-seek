@@ -8,7 +8,7 @@ class TestQuantization:
             pytest.skip("CUDA not available")
 
     def test_fp4_roundtrip_cosine_similarity(self):
-        from tile_reference import cast, unpack_from_e2m1fn_x2
+        from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
 
         torch.manual_seed(42)
         for h in [64, 128, 256, 512]:
@@ -29,7 +29,7 @@ class TestQuantization:
                 assert cos_sim >= 0.99, f"h={h},w={w}: cos_sim={cos_sim:.6f}, mse={mse:.6e}"
 
     def test_fp8_roundtrip(self):
-        from tile_reference import cast, cast_back
+        from home_seek._fp4 import cast, cast_back
 
         torch.manual_seed(42)
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
@@ -44,7 +44,7 @@ class TestQuantization:
         assert cos_sim >= 0.995, f"FP8 roundtrip cos_sim too low: {cos_sim}"
 
     def test_expert_weight_approximation(self):
-        from tile_reference import cast, unpack_from_e2m1fn_x2
+        from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
 
         hidden = 4096
         intermediate = 2048

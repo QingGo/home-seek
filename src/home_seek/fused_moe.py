@@ -17,7 +17,7 @@ def _dequantize_fp4_to_bf16(
     w2_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dequantize all three FP4-packed weight matrices to BF16 in one step."""
-    from tile_reference import unpack_from_e2m1fn_x2
+    from home_seek._fp4 import unpack_from_e2m1fn_x2
 
     def _deq_one(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         deq = unpack_from_e2m1fn_x2(packed)
@@ -434,80 +434,8 @@ class FusedMoEFFN:
         load_expert_fn: Callable,
         layer_idx: int,
     ) -> torch.Tensor:
-        B, D = hidden_states.shape
-        num_topk = topk_idx.shape[1]
-        total_slots = B * num_topk
-
-        if total_slots <= 64:
-            return self._forward_legacy(hidden_states, topk_idx, topk_weights,
-                                        load_expert_fn, layer_idx)
-
-        try:
-            from tile_kernels.torch.moe import inplace_unique_group_indices
-            from tile_kernels.moe import get_fused_mapping, expand_to_fused, reduce_fused
-        except ImportError:
-            return self._forward_legacy(hidden_states, topk_idx, topk_weights,
-                                        load_expert_fn, layer_idx)
-
-        topk_idx_i64 = topk_idx.to(torch.int64).contiguous()
-        inplace_unique_group_indices(topk_idx_i64, self.num_experts)
-
-        alignment = 32
-        num_expanded = (total_slots + (alignment - 1) * self.num_experts) // alignment * alignment
-        mapping = get_fused_mapping(
-            topk_idx_i64, self.num_experts, num_expanded, alignment=alignment,
-        )
-        (pos_to_expert, pos_to_token, pos_to_token_topk,
-         token_topk_to_pos, expert_start, expert_end,
-         num_tokens_per_expert, _) = mapping
-
-        expanded_hidden = expand_to_fused(
-            hidden_states.contiguous(), token_topk_to_pos, pos_to_expert)
-        expanded_out = torch.zeros_like(expanded_hidden)
-        expert_fn = self._get_expert_fn()
-
-        active_experts = sorted(set(
-            int(pos_to_expert[i].item())
-            for i in range(pos_to_expert.shape[0])
-            if pos_to_expert[i].item() >= 0
-        ))
-
-        for eid in active_experts:
-            if eid < expert_start.shape[0]:
-                start = int(expert_start[eid].item())
-                end = int(expert_end[eid].item())
-            else:
-                idxs = (pos_to_expert == eid).nonzero(as_tuple=True)[0]
-                if idxs.numel() == 0:
-                    continue
-                start = int(idxs[0].item())
-                end = int(idxs[-1].item()) + 1
-
-            if start >= end or start >= expanded_hidden.shape[0]:
-                continue
-            end = min(end, expanded_hidden.shape[0])
-            h_slice = expanded_hidden[start:end]
-
-            weights = load_expert_fn(layer_idx, eid)
-            if weights is None:
-                continue
-
-            if len(weights) == 3:
-                w1_d, w3_d, w2_d = weights
-                out_slice = expert_fn(h_slice, w1_d, w3_d, w2_d, self.swiglu_limit)
-            elif len(weights) == 6:
-                w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = weights
-                out_slice = expert_fn(
-                    h_slice, w1_d, w3_d, w2_d, self.swiglu_limit,
-                    w1_scale=w1_s, w3_scale=w3_s, w2_scale=w2_s)
-            else:
-                continue
-
-            expanded_out[start:end] = out_slice.to(expanded_out.dtype)
-
-        topk_weights_f32 = topk_weights.float() if topk_weights.dtype != torch.float32 else topk_weights
-        result = reduce_fused(expanded_out, topk_weights_f32, token_topk_to_pos)
-        return result.to(hidden_states.dtype)
+        return self._forward_legacy(hidden_states, topk_idx, topk_weights,
+                                    load_expert_fn, layer_idx)
 
     def _forward_legacy(
         self, hidden_states, topk_idx, topk_weights,
@@ -719,7 +647,7 @@ def triton_dequantize_fp4_to_bf16(
     [N, K] BF16 tensor on GPU
     """
     if w_packed.device.type != "cuda":
-        from tile_reference import unpack_from_e2m1fn_x2
+        from home_seek._fp4 import unpack_from_e2m1fn_x2
         deq = unpack_from_e2m1fn_x2(w_packed)
         sf = w_scale.repeat_interleave(32, dim=1)
         return (deq.float() * sf.float()).to(torch.bfloat16)

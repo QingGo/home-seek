@@ -20,7 +20,6 @@ import os
 import sys
 import json
 import time
-import math
 import argparse
 import threading
 from collections import defaultdict
@@ -28,7 +27,7 @@ from collections import defaultdict
 import torch
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-_encoding_dir = os.path.join(_current_dir, "../weights/encoding")
+_encoding_dir = os.path.join(_current_dir, "../../weights/encoding")
 sys.path.insert(0, os.path.abspath(_encoding_dir))
 
 from home_seek.inference_engine import HomeSeekInferenceEngine
@@ -279,7 +278,7 @@ class LayerTrace:
         )
         pct_ffn = total_ffn / total_all * 100 if total_all > 0 else 0
         pct_attn = total_attn / total_all * 100 if total_all > 0 else 0
-        lines.append(f"")
+        lines.append("")
         lines.append(f"FFN占比: {pct_ffn:.1f}%, Attn占比: {pct_attn:.1f}%")
         return "\n".join(lines)
 
@@ -391,7 +390,7 @@ def run_profile(args):
     use_mtp = args.use_mtp
 
     print("=" * 70)
-    print(f"HomeSeek Profiling Runner")
+    print("HomeSeek Profiling Runner")
     print(f"  Model: {weight_dir}")
     print(f"  Prompt: \"{prompt}\"")
     print(f"  Max tokens: {max_new_tokens}")
@@ -414,8 +413,6 @@ def run_profile(args):
     )
     if args.prefetch:
         engine._prefetch_enabled = True
-    if args.no_fallback:
-        engine._cpu_fallback_enabled = False
     if use_mtp:
         engine._mtp_loaded = True
     if args.mtp_eager:
@@ -448,7 +445,7 @@ def run_profile(args):
     mem_baseline = torch.cuda.memory_allocated()
     print(f"  Memory baseline: {mem_baseline / (1024**3):.2f} GB")
 
-    print(f"\n[4/5] Running inference ...")
+    print("\n[4/5] Running inference ...")
     print("-" * 70)
     t_gen_start = time.time()
     util_mon.start()
@@ -457,12 +454,11 @@ def run_profile(args):
         result = engine.generate(input_ids, max_new_tokens=max_new_tokens, temperature=temperature)
 
     util_mon.stop()
-    gen_time = time.time() - t_gen_start
 
     print("\n[5/5] Results")
     print("-" * 70)
     out = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
-    print(f"\nGenerated Text:")
+    print("\nGenerated Text:")
     print(out)
     print()
 
@@ -484,7 +480,7 @@ def run_profile(args):
         print(f"  Decode throughput:       {decode_tps:.2f} t/s")
         print(f"  Decode latency:          {decode_t / decode_tok * 1000:.1f} ms/tok")
     else:
-        print(f"  Prefill/decode:          not separated (engine v14 or older)")
+        print("  Prefill/decode:          not separated (engine v14 or older)")
         print(f"  Avg per-token (incl prefill): {result['total_time_s'] / decode_tok * 1000:.0f} ms/tok")
     print(f"  Peak memory: {result['peak_memory_gb']:.2f} GB")
     print(f"  Prompt tokens: {result['num_prompt_tokens']}")
@@ -529,7 +525,7 @@ def run_profile(args):
     if idle_ratio >= 0:
         print(f"  GPU idle ratio (util<30%): {idle_ratio*100:.0f}%")
         if idle_ratio > 0.5:
-            print(f"  >> GPU大量时间空闲，瓶颈在CPU/PCIe/File I/O")
+            print("  >> GPU大量时间空闲，瓶颈在CPU/PCIe/File I/O")
 
     total_file_io_ms = sum(cache_mon.file_load_times)
     print(f"  Total file I/O time: {total_file_io_ms/1000:.1f}s  ({total_file_io_ms/1000/result['total_time_s']*100:.0f}% of total)")
@@ -583,7 +579,6 @@ def main():
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--preload-all", action="store_true",
                         help="Pre-load all experts to CPU RAM during init (eliminates file I/O)")
-    parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--hot-experts", default="hot_experts.json")
     parser.add_argument("--no-triton", action="store_true",
                         help="Disable Triton kernels (use PyTorch fallback for MHC)")

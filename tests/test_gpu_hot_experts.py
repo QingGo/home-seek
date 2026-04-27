@@ -131,7 +131,7 @@ class TestLoadGpuHotExpert:
         clear_deq_cache()
 
     def test_load_and_cache_bf16(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         I, D = _IM, _HS
         w1_bf16 = torch.randn(I, D, dtype=torch.bfloat16, device="cuda")
         w3_bf16 = torch.randn(I, D, dtype=torch.bfloat16, device="cuda")
@@ -170,7 +170,7 @@ class TestLoadGpuHotExpert:
         for i in range(4):
             w = torch.randn(_IM, _HS, device="cuda", dtype=torch.bfloat16)
             eng._gpu_hot_experts[(0, i)] = (w, w, w)
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         w_ref = torch.randn(_IM, _HS, dtype=torch.bfloat16)
         wp, ws = cast(w_ref.cpu(), fmt="e2m1", block_size=(1, 32))
         eng._load_expert_fp4_raw = MagicMock(return_value=(
@@ -228,7 +228,7 @@ class TestForwardFfnHotBatched:
         clear_deq_cache()
 
     def _make_hot_engine(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         eng = _make_engine_stub()
 
         def mock_fp4_raw(layer, eid):
@@ -281,7 +281,7 @@ class TestForwardFfnHotBatched:
 
     def test_matches_legacy_forward(self):
         from home_seek.fused_moe import FusedMoEFFN
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         eng = _make_engine_stub()
 
         w_refs = {}
@@ -324,7 +324,7 @@ class TestForwardFfnHotBatched:
         assert cos.item() > 0.90, f"cosine similarity={cos.item():.6f}"
 
     def test_single_expert(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         eng = _make_engine_stub()
         w_ref = torch.randn(_IM, _HS, dtype=torch.bfloat16)
         w_ref2 = torch.randn(_HS, _IM, dtype=torch.bfloat16)
@@ -397,7 +397,7 @@ class TestFfnHotPathRouting:
     def test_hot_path_fallback_on_failure(self):
         eng = _make_engine_stub()
         eng._hot_expert_set = {1, 2, 3}
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         w_ref = torch.randn(_IM, _HS, dtype=torch.bfloat16)
         wp, ws = cast(w_ref.cpu(), fmt="e2m1", block_size=(1, 32))
         eng._load_expert_fp4_raw = MagicMock(return_value=(
@@ -431,7 +431,7 @@ class TestGpuBf16LruCache:
         clear_deq_cache()
 
     def _make_fp4_raw_mock(self):
-        from tile_reference import cast
+        from home_seek._fp4 import cast
         w1 = torch.randn(_IM, _HS, dtype=torch.bfloat16)
         w3 = torch.randn(_IM, _HS, dtype=torch.bfloat16)
         w2 = torch.randn(_HS, _IM, dtype=torch.bfloat16)

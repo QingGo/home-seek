@@ -1,6 +1,10 @@
 import torch
 import torch.nn.functional as F
-from tile_reference import stable_topk
+
+
+def stable_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
+    _, sorted_indices = torch.sort(scores, dim=1, descending=True, stable=True)
+    return sorted_indices[:, :k].contiguous()
 
 
 def compute_expert_affinity(hidden_states: torch.Tensor, gate_weight: torch.Tensor, top_k: int = 6,
@@ -32,6 +36,4 @@ def compute_expert_affinity_with_bias(
     return topk_indices, topk_weights
 
 
-def compute_shared_expert_affinity(hidden_states: torch.Tensor, gate_weight: torch.Tensor):
-    logits = torch.matmul(hidden_states.to(gate_weight.dtype), gate_weight.t())
-    return torch.sigmoid(logits.float())
+

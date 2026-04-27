@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V19 — Stop token fix + FusedMoEFFN cuBLAS dispatch for small M.
+DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V20 — 整理代码结构，移除无用依赖。
 
 ## 纪律
 
@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V19 — Stop token fix + FusedM
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (176 pass, <30s)
+make test-unit         # 单元测试 (159 pass, 12 skip, <30s)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 性能分析: 5+20 tok, temp=0
 make smoke             # 最小冒烟
@@ -25,19 +25,56 @@ uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --t
 
 所有命令内部使用 `uv run`.
 
+## 项目结构
+
+```
+src/home_seek/            # 主包
+├── inference_engine.py   # 主引擎 (~2700 行)
+├── fused_moe.py          # FusedMoEFFN + SharedExpertFFN (Triton + cuBLAS)
+├── router.py             # MoE 路由 (softplus+sqrt+stable_topk)
+├── compressor.py         # KV 压缩 (支持 T>1 decode)
+├── _fp4.py               # FP4 量化/反量化工具
+├── hybrid_kv_cache.py    # Hybrid KV Cache
+├── lightning_indexer.py  # Lightning Attention indexer
+├── model_config.py       # 配置读取
+├── mhc.py                # MHC split sinkhorn
+├── prefetch_worker.py    # 异步预取 (默认禁用)
+├── expert_predictor.py   # 专家预测器
+├── hw_profile.py         # 硬件探测
+├── profiling_runner.py   # 性能分析入口
+├── quantize_weights.py   # 权重量化脚本
+└── utils.py              # 工具函数
+
+scripts/                  # 独立脚本
+├── analyze_weights.py
+├── download_weights.py
+├── hot_expert_analyzer.py
+├── list_weights.py
+├── mem_profiler.py
+├── mem_stress_test.py
+├── test_scenarios.py
+└── hw_probe.py
+
+tests/                    # 测试
+├── conftest.py
+├── _reference.py         # 测试专用参考实现（swiglu, reduce/expand fused）
+├── test_fixes.py
+├── test_fp4_experts.py   # 原名 test_v10.py
+├── test_gpu_expert_store.py
+├── test_mtp.py
+├── test_quantization.py
+├── test_tile_ops.py
+└── test_weight_loading_bug.py
+```
+
 ## 关键路径
 
 - 模型: `weights/` (46 safetensors, ~150GB); 论文: `docs/paper.md`
 - 热专家: `hot_experts.json`; 架构设计: `docs/arch_design.md`
 - 实施记录: `docs/implementation_notes.md`
 - 里程碑记忆: `.agent_memory.md` (基线+瓶颈+下一步)
-- 主引擎: `home_seek/inference_engine.py` (~2770 行)
-- MoE FFN: `home_seek/fused_moe.py` (Triton FP4 dequant + cuBLAS)
-- KV 压缩: `home_seek/compressor.py` (支持 T>1 decode)
-- 路由: `home_seek/router.py` (softplus+sqrt+stable_topk)
-- 配置: `home_seek/model_config.py`
 
-## 缓存体系 (V18)
+## 缓存体系 (V20)
 
 ```
 请求 expert (layer, eid)
@@ -49,18 +86,18 @@ uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --t
   │    └─ ~2746 unpinned (LRU)
   └─ 4. safetensors mmap (RAID 1.5 GB/s)
 
-[V18 移除] _gpu_expert_store (GPU FP4, 命中率 ~0%, 冗余)
-
 共享专家:
   └─ _shared_expert_weights (GPU, 43 层 FP8, lazily dequant → BF16)
-     └─ M=1 decode: cuBLAS (SharedExpertFFN), Triton if M>1
+     └─ M=1 decode: cuBLAS, Triton if M>1
 
 MTP 模块:
   ├─ _mtp_weights: 33 非专家权重 (GPU BF16)
   ├─ ExpertWeightCache: 256 专家 (CPU FP4 pinned)
-  ├─ _mtp_generate_draft: 自回归生成 draft (单层 MTP block)
-  └─ _mtp_verify_batched: 批验证 (43 层, T=T_draft, causal mask)
+  ├─ _mtp_generate_draft: 自回归生成 draft
+  └─ _mtp_verify_batched: 批验证 (43 层, causal mask)
 ```
+
+无外部 GPU kernel 依赖（无 tile_kernels/tilelang）。所有 MHC 走 PyTorch fallback；MoE 路由走 `_forward_legacy`。
 
 ## 性能评估铁律
 
@@ -69,14 +106,13 @@ MTP 模块:
 - **指标**: Decode throughput (t/s) + File loads
 - **Prefill/decode 分离**: `decode_time_s` / `num_generated_tokens`
 - **Shared expert 修改**: cuBLAS vs Triton 的 FP32 累加序差异 → 路由噪声 ±20%. **不得用于 A/B 对比**
-- **MTP 精度裂谷已修正**: 原分析 (MHC_post Triton vs PyTorch) 为错误归因 — Triton kernel 始终失败 (AssertionError). 真正根因: (1) causal mask 缺失 (2) 状态未完整回滚 (3) RoPE 位置错误 (4) d_0 未验证. 全部已修复.
 - 修 bug 先写 L1 测试
 
 ## 已知陷阱 (gotchas)
 
 - **模型真正的结束标记是 token 1 (`</｜end▁of▁sentence｜>`)**, 不是 EOS 128000. `_load_stop_token_ids()` 从 `weights/tokenizer.json` 读取. 找不到文件直接报错.
 - **FusedMoEFFN cuBLAS 小 M**: `fused_expert_ffn_triton` 在 M<=8 时走 cuBLAS, 避免 Triton 15/16 SM 空转. `fused_moe.py:297`.
-- `ExpertWeightCache.clear()` 保留 pinned 条目 (V17 修复)
+- `ExpertWeightCache.clear()` 保留 pinned 条目
 - 共享 RAID 多线程读盘反效果, prefetch 默认禁用
 - `tl.load/store` 必须有行列掩码; `tl.dot` M,N,K≥16
 - M=1 decode: Triton 比 cuBLAS 慢 8× (15/16 SM 空转). SharedExpertFFN 和 FusedMoEFFN 都应考虑此限制

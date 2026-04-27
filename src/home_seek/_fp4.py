@@ -2,9 +2,15 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Union
 
-from tile_reference.utils import align, ceil_div
-from tile_reference.quant_common import unpack_from_e2m1fn_x2, transform_sf
-from tile_reference.quant_types import QuantTensor
+QuantTensor = tuple[torch.Tensor, torch.Tensor]
+
+
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
 
 
 def get_min_clamp_val(dtype: torch.dtype):
@@ -19,12 +25,86 @@ def get_max_quant_val(dtype: torch.dtype):
     return max_quant_by_dtype[dtype]
 
 
+def _right_shift_unsigned(x, shift):
+    return (x >> shift) & ((1 << (32 - shift)) - 1)
+
+
+def convert_to_e2m1_bits(quant_tensor, max_quant_val, device):
+    q_int = quant_tensor.contiguous().view(torch.int32)
+    signs = q_int & 0x80000000
+    exponents = (q_int >> 23) & 0xFF
+    mantissas_orig = q_int & 0x7FFFFF
+
+    E8_BIAS, E2_BIAS = 127, 1
+    is_subnormal = exponents < E8_BIAS
+    shift = E8_BIAS - exponents - 1
+    mantissas_pre = 0x400000 | _right_shift_unsigned(mantissas_orig, 1)
+    bit0_dropped = (mantissas_orig & 0x1) != 0
+    mask = (1 << shift.clamp(max=31)) - 1
+    dropped_post = (mantissas_pre & mask) != 0
+    sticky = is_subnormal & (bit0_dropped | dropped_post)
+    mantissas = torch.where(is_subnormal, mantissas_pre >> shift, mantissas_orig)
+    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
+    m2bits = _right_shift_unsigned(mantissas, 21) & 0x3
+    lsb_keep = _right_shift_unsigned(m2bits, 1) & 0x1
+    guard = m2bits & 0x1
+    sticky |= (mantissas & ((1 << 21) - 1)) != 0
+    round_inc = guard & (sticky.to(torch.int32) | lsb_keep)
+    e2m1_tmp = _right_shift_unsigned(((exponents << 2) | m2bits) + round_inc, 1)
+    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
+    e2m1_value = (_right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)
+    return e2m1_value
+
+
+def transform_sf(sf: torch.Tensor) -> torch.Tensor:
+    if sf.dtype == torch.float32:
+        return sf
+    assert sf.dtype == torch.int32
+    sf = sf.contiguous()
+    if sf.stride(-1) != 1:
+        sf = sf.as_strided(size=sf.shape, stride=(sf.shape[-1], 1))
+    sf = sf.view(torch.uint8)
+    sf = sf.to(torch.int32)
+    sf = (sf << 23).view(torch.float32)
+    return sf
+
+
+def unpack_from_e2m1fn_x2(x: torch.Tensor, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    assert x.dtype == torch.int8 or x.dtype == torch.uint8
+    if x.ndim == 0:
+        raise ValueError('x must have at least 1 dimension so the last dim can be doubled')
+    lo = (x & 0x0F).to(torch.int16)
+    hi = ((x >> 4) & 0x0F).to(torch.int16)
+
+    def decode_fp4_e2m1(n: torch.Tensor) -> torch.Tensor:
+        s = (n >> 3) & 0x1
+        e = (n >> 1) & 0x3
+        m = n & 0x1
+        sign = torch.where(s == 1, torch.tensor(-1.0, device=n.device), torch.tensor(1.0, device=n.device))
+        bias = 1
+        sub = (m.to(torch.float32) * 0.5) * (2.0 ** (1 - bias))
+        base = 1.0 + m.to(torch.float32) * 0.5
+        exp = (e - bias).to(torch.float32)
+        norm = base * torch.pow(torch.tensor(2.0, device=n.device), exp)
+        val = torch.where(e == 0, sub, norm)
+        return (val * sign).to(out_dtype)
+
+    flo = decode_fp4_e2m1(lo)
+    fhi = decode_fp4_e2m1(hi)
+    y = torch.stack([flo, fhi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
+    return y
+
+
 def cast_back(x: QuantTensor, fmt: str, block_size: tuple[int, int] = (32, 32)) -> torch.Tensor:
     input_tensor, input_sf = x
     assert input_tensor.dtype in (torch.float8_e4m3fn, torch.int8)
     input_sf = transform_sf(input_sf)
     input_sf = input_sf.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1)
-    input_tensor = unpack_from_e2m1fn_x2(input_tensor) if input_tensor.dtype == torch.int8 else input_tensor.to(torch.float32)
+    input_tensor = (
+        unpack_from_e2m1fn_x2(input_tensor)
+        if input_tensor.dtype == torch.int8
+        else input_tensor.to(torch.float32)
+    )
     input_sf = input_sf[: input_tensor.shape[0], : input_tensor.shape[1]]
     x = input_tensor * input_sf
     return x.to(dtype=torch.float32 if fmt == 'fp32' else torch.bfloat16)
@@ -47,7 +127,11 @@ def cast(
         assert input_sf is not None and x_block_size is not None
         input_sf = transform_sf(input_sf)
         input_sf = input_sf.repeat_interleave(x_block_size[0], dim=0).repeat_interleave(x_block_size[1], dim=1)
-        input_tensor = unpack_from_e2m1fn_x2(input_tensor) if input_tensor.dtype == torch.int8 else input_tensor.to(torch.float32)
+        input_tensor = (
+            unpack_from_e2m1fn_x2(input_tensor)
+            if input_tensor.dtype == torch.int8
+            else input_tensor.to(torch.float32)
+        )
         input_sf = input_sf[: input_tensor.shape[0], : input_tensor.shape[1]]
         x = input_tensor * input_sf
     else:
@@ -89,8 +173,14 @@ def cast(
     ph, pw = padded_src.shape
 
     if sf is None:
-        reshaped_for_max = padded_src.view(ph // bh, bh, pw // bw, bw).permute(0, 2, 1, 3).reshape(ph // bh, pw // bw, -1)
-        reshaped_mask = valid_mask.view(ph // bh, bh, pw // bw, bw).permute(0, 2, 1, 3).reshape(ph // bh, pw // bw, -1)
+        reshaped_for_max = (
+            padded_src.view(ph // bh, bh, pw // bw, bw)
+            .permute(0, 2, 1, 3).reshape(ph // bh, pw // bw, -1)
+        )
+        reshaped_mask = (
+            valid_mask.view(ph // bh, bh, pw // bw, bw)
+            .permute(0, 2, 1, 3).reshape(ph // bh, pw // bw, -1)
+        )
 
         abs_f = torch.abs(reshaped_for_max)
         abs_f = torch.where(reshaped_mask, abs_f, torch.tensor(-1.0, device=device, dtype=abs_f.dtype))
@@ -108,16 +198,24 @@ def cast(
             quant_sf = torch.where(dequant_sf_rounded == 0, torch.tensor(0.0, device=device), 1.0 / dequant_sf_rounded)
         else:
             ds_int_rounded = ds_int
-            quant_sf = torch.where(ds_int_rounded == 0, torch.tensor(0.0, device=device), max_quant_val_expanded / max_val)
+            quant_sf = torch.where(
+                ds_int_rounded == 0, torch.tensor(0.0, device=device),
+                max_quant_val_expanded / max_val,
+            )
     else:
         assert not use_packed_ue8m0 and not use_tma_aligned_col_major_sf
         expected_sf_shape = (ph // bh, pw // bw)
         assert sf.ndim == 2, f'sf must be 2D, got {sf.ndim}D'
-        assert tuple(sf.shape) == expected_sf_shape, f'sf shape mismatch: expected {expected_sf_shape}, got {tuple(sf.shape)}'
+        assert tuple(sf.shape) == expected_sf_shape, (
+            f'sf shape mismatch: expected {expected_sf_shape}, got {tuple(sf.shape)}'
+        )
         quant_sf = sf.reciprocal().unsqueeze(-1)
 
     if has_input_sf:
-        quant_sf_extended = quant_sf.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1).squeeze(-1)
+        quant_sf_extended = (
+            quant_sf.repeat_interleave(block_size[0], dim=0)
+            .repeat_interleave(block_size[1], dim=1).squeeze(-1)
+        )
         quant_sf_extended = quant_sf_extended[:h, :w]
         quant_tensor = x * quant_sf_extended
     else:
@@ -155,34 +253,3 @@ def cast(
         dq_sf = ds_int_rounded.view(torch.float32)
 
     return out_weight, dq_sf
-
-
-def convert_to_e2m1_bits(quant_tensor, max_quant_val, device):
-    q_int = quant_tensor.contiguous().view(torch.int32)
-    signs = q_int & 0x80000000
-    exponents = (q_int >> 23) & 0xFF
-    mantissas_orig = q_int & 0x7FFFFF
-
-    E8_BIAS, E2_BIAS = 127, 1
-    is_subnormal = exponents < E8_BIAS
-    shift = E8_BIAS - exponents - 1
-    mantissas_pre = 0x400000 | _right_shift_unsigned(mantissas_orig, 1)
-    bit0_dropped = (mantissas_orig & 0x1) != 0
-    mask = (1 << shift.clamp(max=31)) - 1
-    dropped_post = (mantissas_pre & mask) != 0
-    sticky = is_subnormal & (bit0_dropped | dropped_post)
-    mantissas = torch.where(is_subnormal, mantissas_pre >> shift, mantissas_orig)
-    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
-    m2bits = _right_shift_unsigned(mantissas, 21) & 0x3
-    lsb_keep = _right_shift_unsigned(m2bits, 1) & 0x1
-    guard = m2bits & 0x1
-    sticky |= (mantissas & ((1 << 21) - 1)) != 0
-    round_inc = guard & (sticky.to(torch.int32) | lsb_keep)
-    e2m1_tmp = _right_shift_unsigned(((exponents << 2) | m2bits) + round_inc, 1)
-    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
-    e2m1_value = (_right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)
-    return e2m1_value
-
-
-def _right_shift_unsigned(x, shift):
-    return (x >> shift) & ((1 << (32 - shift)) - 1)
