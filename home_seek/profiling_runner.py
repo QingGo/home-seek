@@ -505,8 +505,22 @@ def run_profile(args):
     print("Performance Summary:")
     print(f"  Total time: {result['total_time_s']:.2f}s")
     print(f"  Generated tokens: {result['num_generated_tokens']}")
-    print(f"  Throughput: {result['new_tokens_per_second']:.2f} t/s")
-    print(f"  Latency per token: {result['total_time_s'] / max(1, result['num_generated_tokens']) * 1000:.1f} ms/token")
+    print(f"  Throughput (with prefill): {result['new_tokens_per_second']:.2f} t/s")
+    decode_tps = result.get('decode_tokens_per_second', 0)
+    prefill_t = result.get('prefill_time_s', 0)
+    decode_t = result.get('decode_time_s', 0)
+    prompt_tok = result['num_prompt_tokens']
+    decode_tok = max(1, result['num_generated_tokens'])
+    has_split = 'prefill_time_s' in result and result['prefill_time_s'] > 0
+    if has_split:
+        print(f"  Prefill time:            {prefill_t:.2f}s  ({prompt_tok} tok, {result['prefill_tokens_per_second']:.1f} t/s)")
+        print(f"  TTFT:                    {prefill_t:.2f}s")
+        print(f"  Decode time:             {decode_t:.2f}s")
+        print(f"  Decode throughput:       {decode_tps:.2f} t/s")
+        print(f"  Decode latency:          {decode_t / decode_tok * 1000:.1f} ms/tok")
+    else:
+        print(f"  Prefill/decode:          not separated (engine v14 or older)")
+        print(f"  Avg per-token (incl prefill): {result['total_time_s'] / decode_tok * 1000:.0f} ms/tok")
     print(f"  Peak memory: {result['peak_memory_gb']:.2f} GB")
     print(f"  Prompt tokens: {result['num_prompt_tokens']}")
 

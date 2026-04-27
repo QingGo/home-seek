@@ -366,6 +366,7 @@ class HomeSeekInferenceEngine:
         self._hot_expert_ids = []
         self._hash_expert_ids = []
         self._hot_expert_set = set()
+        self._hot_expert_set_by_layer = {}
         self._gpu_hot_experts = {}
         _vram_free = max(self.hw_profile.vram_free_gb, 8.0)
         _expert_bf16_gb = 48.0 / 1024
@@ -384,6 +385,7 @@ class HomeSeekInferenceEngine:
         self._mtp_eager = False
         self._warmed_up = False
         self._layer_weight_cache = {}
+        self._phase = "idle"
 
         self._gpu_expert_store = AllExpertFP4Store(
             weight_dir, self.config, str(self.device), max_experts=128)
@@ -427,19 +429,29 @@ class HomeSeekInferenceEngine:
         self._hot_expert_ids = data.get("top_hot_experts",
                                         data.get("top_16_hot_experts", []))
         self._hot_expert_set = set(self._hot_expert_ids)
+
+        per_layer = data.get("top_hot_experts_by_layer", {})
+        self._hot_expert_set_by_layer = {}
+        for k, v in per_layer.items():
+            self._hot_expert_set_by_layer[int(k)] = set(v)
+
+        if not self._hot_expert_set_by_layer and hasattr(self, 'config') and hasattr(self.config, 'num_hidden_layers'):
+            for lidx in range(self.config.num_hidden_layers):
+                self._hot_expert_set_by_layer[lidx] = self._hot_expert_set
+
         hash_ids = data.get("hash_layer_expert_ids", [])
         self._hash_expert_ids = hash_ids[:18] if len(hash_ids) > 18 else hash_ids
-        self._log(f"Hot experts: {len(self._hot_expert_ids)} IDs, "
+        self._log(f"Hot experts: {len(self._hot_expert_ids)} IDs ({len(self._hot_expert_set_by_layer)} layers), "
                   f"Hash experts: {len(self._hash_expert_ids)} IDs")
 
     def _preload_gpu_hot_experts(self):
         if not self._hot_expert_ids:
             return
         count = 0
-        preload_per_layer = min(len(self._hot_expert_ids), 16)
         preload_layers = min(4, self.config.num_hidden_layers)
         for layer in range(preload_layers):
-            for eid in self._hot_expert_ids[:preload_per_layer]:
+            layer_set = self._hot_expert_set_by_layer.get(layer, self._hot_expert_set)
+            for eid in list(layer_set)[:16]:
                 if (layer, eid) not in self._gpu_hot_experts:
                     self._load_expert_fp4_raw(layer, eid)
                     count += 1
@@ -454,7 +466,8 @@ class HomeSeekInferenceEngine:
         hot_ids.update(self._hash_expert_ids)
         count = 0
         for layer_idx in range(self.config.num_hidden_layers):
-            layer_ids = hot_ids if layer_idx < self.config.num_hash_layers else self._hot_expert_ids
+            layer_hot = self._hot_expert_set_by_layer.get(layer_idx, set(self._hot_expert_ids))
+            layer_ids = hot_ids if layer_idx < self.config.num_hash_layers else layer_hot
             for eid in layer_ids:
                 cache_key = f"{layer_idx}_{eid}"
                 if self.expert_cache.get(cache_key) is not None:
@@ -1074,7 +1087,8 @@ class HomeSeekInferenceEngine:
             w1_entry = self._make_raw_entry(gate_packed, gate_scale)
             w3_entry = self._make_raw_entry(up_packed, up_scale)
             w2_entry = self._make_raw_entry(down_packed, down_scale)
-            pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+            layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
+            pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
             self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
             return self.expert_cache.get(cache_key)
 
@@ -1094,7 +1108,8 @@ class HomeSeekInferenceEngine:
                     w1_entry = self._make_raw_entry(w1, s1)
                     w3_entry = self._make_raw_entry(w3, s3)
                     w2_entry = self._make_raw_entry(w2, s2)
-                    pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+                    layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
+                    pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
                     self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
                     return self.expert_cache.get(cache_key)
 
@@ -1116,7 +1131,8 @@ class HomeSeekInferenceEngine:
         w3_entry = self._make_raw_entry(w3, s3)
         w2_entry = self._make_raw_entry(w2, s2)
 
-        pin = layer_idx < self.config.num_hash_layers or eid in self._hot_expert_ids
+        layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
+        pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
         return self.expert_cache.get(cache_key)
 
@@ -1197,7 +1213,8 @@ class HomeSeekInferenceEngine:
         w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
             w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
 
-        if eid in self._hot_expert_set:
+        layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
+        if eid in layer_hot:
             if len(self._gpu_hot_experts) >= self._max_hot_experts:
                 self._gpu_hot_experts.pop(next(iter(self._gpu_hot_experts)))
             self._gpu_hot_experts[hot_key] = (w1_b, w3_b, w2_b)
@@ -1463,12 +1480,50 @@ class HomeSeekInferenceEngine:
                         self._load_expert_raw(next_idx, eid)
 
     def _load_shared_experts_gpu(self):
+        count = 0
+        for layer_idx in range(self.config.num_hidden_layers):
+            if layer_idx not in self._shared_expert_weights:
+                shared_prefix = f"layers.{layer_idx}.ffn.shared_experts"
+                shared_keys = [f"{shared_prefix}.w1.weight", f"{shared_prefix}.w1.scale",
+                               f"{shared_prefix}.w3.weight", f"{shared_prefix}.w3.scale",
+                               f"{shared_prefix}.w2.weight", f"{shared_prefix}.w2.scale"]
+                tensors = self.loader.get_weights(*shared_keys)
+                w1 = tensors.get(shared_keys[0])
+                if w1 is None:
+                    self._shared_expert_weights[layer_idx] = None
+                    continue
+                s1 = tensors.get(shared_keys[1])
+                w3_t = tensors.get(shared_keys[2])
+                s3 = tensors.get(shared_keys[3])
+                w2_t = tensors.get(shared_keys[4])
+                s2 = tensors.get(shared_keys[5])
+                dev = self.device
+                self._shared_expert_weights[layer_idx] = (
+                    w1.to(dev), s1.to(dev) if s1 is not None else None,
+                    w3_t.to(dev) if w3_t is not None else None, s3.to(dev) if s3 is not None else None,
+                    w2_t.to(dev) if w2_t is not None else None, s2.to(dev) if s2 is not None else None,
+                    "fp8",
+                )
+                count += 1
         self._shared_experts_loaded = True
-        self._log("Shared expert lazy loading enabled (loaded on first use)")
+        self._log(f"Pre-loaded {count} shared experts as FP8 on GPU")
 
     def _get_shared_expert(self, layer_idx: int):
-        if layer_idx in self._shared_expert_weights:
-            return self._shared_expert_weights[layer_idx]
+        cached = self._shared_expert_weights.get(layer_idx)
+        if cached is not None:
+            if len(cached) == 3:
+                return cached
+            if len(cached) == 7 and cached[6] == "fp8":
+                w1_fp8, w1_s, w3_fp8, w3_s, w2_fp8, w2_s, _ = cached
+                w1_bf = load_fp8_weight(w1_fp8, w1_s) if w1_fp8 is not None else None
+                w3_bf = load_fp8_weight(w3_fp8, w3_s) if w3_fp8 is not None else None
+                w2_bf = load_fp8_weight(w2_fp8, w2_s) if w2_fp8 is not None else None
+                if w1_bf is not None and w3_bf is not None and w2_bf is not None:
+                    result = (w1_bf, w3_bf, w2_bf)
+                    self._shared_expert_weights[layer_idx] = result
+                    return result
+                self._shared_expert_weights[layer_idx] = None
+                return None
         shared_prefix = f"layers.{layer_idx}.ffn.shared_experts"
         shared_keys = [f"{shared_prefix}.w1.weight", f"{shared_prefix}.w1.scale",
                        f"{shared_prefix}.w3.weight", f"{shared_prefix}.w3.scale",
@@ -1855,6 +1910,7 @@ class HomeSeekInferenceEngine:
         h = self.embed[input_ids].to(torch.bfloat16)
         h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
+        self._phase = "prefill"
         for layer_idx in range(self.config.num_hidden_layers):
             lw = self._get_layer_weights(layer_idx)
 
@@ -1914,9 +1970,11 @@ class HomeSeekInferenceEngine:
             next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
 
         generated = [next_id]
+        prefill_end = time.time()
 
         mtp_num_draft = 1 if self._mtp_loaded else 0
 
+        self._phase = "decode"
         step = 0
         while step < max_new_tokens - 1:
             self._global_pos = T + step
@@ -2012,15 +2070,22 @@ class HomeSeekInferenceEngine:
                         continue
 
         total_time = time.time() - start
+        prefill_time = prefill_end - start
+        decode_time = total_time - prefill_time
         all_tokens = torch.cat([input_ids] + generated, dim=-1)
         result = {
             "tokens": all_tokens,
             "total_time_s": total_time,
+            "prefill_time_s": prefill_time,
+            "decode_time_s": decode_time,
             "new_tokens_per_second": len(generated) / total_time,
+            "prefill_tokens_per_second": T / prefill_time if prefill_time > 0 else 0,
+            "decode_tokens_per_second": len(generated) / decode_time if decode_time > 0 else 0,
             "peak_memory_gb": torch.cuda.max_memory_allocated() / (1024**3),
             "num_prompt_tokens": T,
             "num_generated_tokens": len(generated),
         }
+        self._phase = "idle"
         from home_seek.fused_moe import deq_cache_stats
         hits, misses = deq_cache_stats()
         if hits + misses > 0:
