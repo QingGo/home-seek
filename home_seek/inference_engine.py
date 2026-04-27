@@ -307,9 +307,13 @@ class ExpertWeightCache:
         self.put(key, (w1_d, None, "bf16"), (w3_d, None, "bf16"), (w2_d, None, "bf16"), pin=pin)
 
     def clear(self):
+        pinned_entries = {k: self.cache[k] for k in list(self.cache.keys()) if k in self.pinned}
         self.cache.clear()
+        self.cache.update(pinned_entries)
         self._hot_deq.clear()
         self.pinned.clear()
+        for k in pinned_entries:
+            self.pinned.add(k)
 
     def trim(self, target_count: int = 64):
         excess = len(self.cache) - len(self.pinned) - target_count
@@ -401,6 +405,7 @@ class HomeSeekInferenceEngine:
         self._load_mtp_weights()
         self._init_prefetch()
         if self._hot_expert_ids:
+            self._preload_hot_experts_cpu_cache()
             self._preload_gpu_hot_experts()
         if preload_all:
             self._preload_all_experts()
@@ -440,6 +445,37 @@ class HomeSeekInferenceEngine:
             if len(self._gpu_hot_experts) >= self._max_hot_experts:
                 break
         self._log(f"Pre-loaded {count} hot expert BF16 weights on GPU")
+
+    def _preload_hot_experts_cpu_cache(self):
+        hot_ids = set(self._hot_expert_ids)
+        hot_ids.update(self._hash_expert_ids)
+        count = 0
+        for layer_idx in range(self.config.num_hidden_layers):
+            layer_ids = hot_ids if layer_idx < self.config.num_hash_layers else self._hot_expert_ids
+            for eid in layer_ids:
+                cache_key = f"{layer_idx}_{eid}"
+                if self.expert_cache.get(cache_key) is not None:
+                    continue
+                prefix = f"layers.{layer_idx}.ffn.experts.{eid}"
+                keys = [f"{prefix}.w1.weight", f"{prefix}.w1.scale",
+                        f"{prefix}.w3.weight", f"{prefix}.w3.scale",
+                        f"{prefix}.w2.weight", f"{prefix}.w2.scale"]
+                tensors = self.loader.get_weights(*keys)
+                w1 = tensors.get(keys[0]); s1 = tensors.get(keys[1])
+                w3 = tensors.get(keys[2]); s3 = tensors.get(keys[3])
+                w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
+                if w1 is None:
+                    continue
+                self._gpu_expert_store.cache_on_gpu(
+                    layer_idx, eid, w1, s1, w3, s3, w2, s2)
+                w1_entry = self._make_raw_entry(w1, s1)
+                w3_entry = self._make_raw_entry(w3, s3)
+                w2_entry = self._make_raw_entry(w2, s2)
+                self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
+                count += 1
+        if count > 0:
+            self._log(f"Pre-loaded {count} hot expert raw entries into CPU cache "
+                      f"({count * 48 // 1024} MB packed)")
 
     def _init_prefetch(self):
         if self._prefetch_enabled and self._prefetch_worker is None:
