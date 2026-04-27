@@ -6,6 +6,10 @@ import torch
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "cuda: requires CUDA GPU (auto-skipped if not available)")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 1. Session 级 Triton kernel 预热 —— 消除每个测试文件的首次 JIT 编译延迟
 # ──────────────────────────────────────────────────────────────────────
@@ -70,10 +74,11 @@ def _make_seed(test_name: str) -> int:
 
 
 def pytest_runtest_setup(item):
-    """Set deterministic random seeds before each test."""
+    """Skip if CUDA unavailable (all tests in this project require GPU)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
     test_name = item.nodeid
     seed = _make_seed(test_name)
-    # Store the seed on the item so we can retrieve it on failure
     item._deterministic_seed = seed
     torch.manual_seed(seed)
     if torch.cuda.is_available():

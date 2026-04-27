@@ -1,12 +1,7 @@
 import torch
-import pytest
 
 
 class TestQuantization:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_fp4_roundtrip_cosine_similarity(self):
         from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
 

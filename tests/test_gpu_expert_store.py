@@ -7,10 +7,6 @@ import pytest
 
 @pytest.mark.fast
 class TestMakeRawEntryGpuFP4:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_fp4_already_on_gpu(self):
         from home_seek.inference_engine import HomeSeekInferenceEngine
 
@@ -43,10 +39,6 @@ class TestMakeRawEntryGpuFP4:
 
 @pytest.mark.fast
 class TestDequantizeGpuFP4:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_deq_fp4_gpu_no_device_transfer(self):
         from home_seek.inference_engine import ExpertWeightCache
 

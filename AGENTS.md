@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V20 — 整理代码结构，移除无用依赖。
+DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21 — 软件工程质量改进：scope：dead code removal, logging, CI, config dataclass, type checking, MTP dedup, engine split, contract tests.
 
 ## 纪律
 
@@ -13,14 +13,18 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V20 — 整理代码结构，�
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (159 pass, 12 skip, <30s)
+make test-unit         # 单元测试 (165 pass, 2 skip, <30s)
 make test-integration  # 集成测试 (需 weights/)
-make profile           # 性能分析: 5+20 tok, temp=0
+make profile           # 性能分析: 5+20 tok, temp=0, 自动保存 JSON
+make profile-compare   # 对比当前与上次 profile 的指标变化
 make smoke             # 最小冒烟
 
 # MTP (Makefile 不支持 --use-mtp flags, 直接调用)
 uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0 --use-mtp
 uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0 --use-mtp --mtp-eager
+
+# 回归哈希验证 (设环境变量后集成测试自动校验)
+HOME_SEEK_EXPECTED_HASH=abc123 make test-integration
 ```
 
 所有命令内部使用 `uv run`.
@@ -28,43 +32,52 @@ uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --t
 ## 项目结构
 
 ```
-src/home_seek/            # 主包
-├── inference_engine.py   # 主引擎 (~2700 行)
-├── fused_moe.py          # FusedMoEFFN + SharedExpertFFN (Triton + cuBLAS)
-├── router.py             # MoE 路由 (softplus+sqrt+stable_topk)
-├── compressor.py         # KV 压缩 (支持 T>1 decode)
-├── _fp4.py               # FP4 量化/反量化工具
-├── hybrid_kv_cache.py    # Hybrid KV Cache
-├── lightning_indexer.py  # Lightning Attention indexer
-├── model_config.py       # 配置读取
-├── mhc.py                # MHC split sinkhorn
-├── prefetch_worker.py    # 异步预取 (默认禁用)
-├── expert_predictor.py   # 专家预测器
-├── hw_profile.py         # 硬件探测
-├── profiling_runner.py   # 性能分析入口
-├── quantize_weights.py   # 权重量化脚本
-└── utils.py              # 工具函数
+src/home_seek/                     # 主包
+├── inference_engine/              # 推理引擎包 (V21 从单文件拆分)
+│   ├── __init__.py                # 兼容旧 import 路径
+│   ├── engine.py                  # HomeSeekInferenceEngine + 辅助函数
+│   ├── weight_loader.py           # WeightLoader + FP4/FP8 加载函数
+│   ├── layer_state.py             # LayerState (per-layer KV 状态)
+│   └── expert_cache.py            # ExpertWeightCache + ExpertCacheManager
+├── fused_moe.py                   # FusedMoEFFN + SharedExpertFFN (Triton + cuBLAS)
+├── router.py                      # MoE 路由 (softplus+sqrt+stable_topk)
+├── compressor.py                  # KV 压缩 (支持 T>1 decode)
+├── _fp4.py                        # FP4 量化/反量化工具
+├── hybrid_kv_cache.py             # Hybrid KV Cache
+├── lightning_indexer.py           # Lightning Attention indexer
+├── model_config.py                # @dataclass 配置 (V21 从手写类迁移)
+├── mhc.py                         # MHC split sinkhorn
+├── expert_predictor.py            # 专家预测器 (RecordingPredictor)
+├── hw_profile.py                  # 硬件探测
+├── profiling_runner.py            # 性能分析入口
+├── quantize_weights.py            # 权重量化脚本
+└── utils.py                       # rms_norm 工具函数
 
-scripts/                  # 独立脚本
+scripts/                           # 独立脚本
 ├── analyze_weights.py
 ├── download_weights.py
 ├── hot_expert_analyzer.py
 ├── list_weights.py
 ├── mem_profiler.py
 ├── mem_stress_test.py
+├── prefetch_worker.py             # 异步预取 (V21 从 src 移入, 默认禁用)
 ├── test_scenarios.py
 └── hw_probe.py
 
-tests/                    # 测试
-├── conftest.py
-├── _reference.py         # 测试专用参考实现（swiglu, reduce/expand fused）
+tests/                             # 测试
+├── conftest.py                    # Triton 预热 + CUDA 自动 skip + 确定性种子
+├── _reference.py                  # 测试专用参考实现 (swiglu, reduce/expand fused)
+├── _engine_stub.py                # EngineStub 统一测试构造 (V21 新增)
 ├── test_fixes.py
-├── test_fp4_experts.py   # 原名 test_v10.py
+├── test_fp4_experts.py            # 原名 test_v10.py
 ├── test_gpu_expert_store.py
 ├── test_mtp.py
 ├── test_quantization.py
 ├── test_tile_ops.py
-└── test_weight_loading_bug.py
+├── test_weight_loading_bug.py     # +契约测试 (TestExpertCacheContract)
+└── integration/
+    ├── conftest.py
+    └── test_inference_e2e.py      # +回归哈希测试
 ```
 
 ## 关键路径
@@ -74,17 +87,18 @@ tests/                    # 测试
 - 实施记录: `docs/implementation_notes.md`
 - 里程碑记忆: `.agent_memory.md` (基线+瓶颈+下一步)
 
-## 缓存体系 (V20)
+## 缓存体系 (V21)
 
 ```
 请求 expert (layer, eid)
-  ├─ 1. _gpu_hot_experts (GPU BF16, ~64 × 48MB, per-layer LRU, pinned)
-  ├─ 2. _gpu_bf16_cache  (GPU BF16 LRU, ~76 × 48MB, 自动淘汰)
-  ├─ 3. ExpertWeightCache (CPU FP4, 5120 条, pin=永不淘汰)
-  │    ├─ ~2118 pinned (hot×43 + hash×3)
-  │    ├─ ~256 pinned (MTP experts)
-  │    └─ ~2746 unpinned (LRU)
-  └─ 4. safetensors mmap (RAID 1.5 GB/s)
+  └─ ExpertCacheManager.get(layer, eid)        ← 统一入口 (V21)
+       ├─ 1. _gpu_hot (GPU BF16, ~64 × 48MB, FIFO evict)
+       ├─ 2. _gpu_bf16 (GPU BF16 LRU, ~100 × 48MB, 自动淘汰)
+       ├─ 3. ExpertWeightCache (CPU FP4, 5120 条, pin=永不淘汰)
+       │    ├─ ~2118 pinned (hot×43 + hash×3)
+       │    ├─ ~256 pinned (MTP experts)
+       │    └─ ~2746 unpinned (LRU)
+       └─ 4. safetensors mmap (RAID 1.5 GB/s)
 
 共享专家:
   └─ _shared_expert_weights (GPU, 43 层 FP8, lazily dequant → BF16)
@@ -95,6 +109,8 @@ MTP 模块:
   ├─ ExpertWeightCache: 256 专家 (CPU FP4 pinned)
   ├─ _mtp_generate_draft: 自回归生成 draft
   └─ _mtp_verify_batched: 批验证 (43 层, causal mask)
+
+_forward_layer 共享方法 (V21): 消除 generate/decode/MTP verify 间 5 处重复的层循环.
 ```
 
 无外部 GPU kernel 依赖（无 tile_kernels/tilelang）。所有 MHC 走 PyTorch fallback；MoE 路由走 `_forward_legacy`。
@@ -106,14 +122,15 @@ MTP 模块:
 - **指标**: Decode throughput (t/s) + File loads
 - **Prefill/decode 分离**: `decode_time_s` / `num_generated_tokens`
 - **Shared expert 修改**: cuBLAS vs Triton 的 FP32 累加序差异 → 路由噪声 ±20%. **不得用于 A/B 对比**
+- **Profile 自动保存**: `make profile` 输出 JSON 到 `artifacts/last_profile.json`, `make profile-compare` 对比前后变化
 - 修 bug 先写 L1 测试
 
 ## 已知陷阱 (gotchas)
 
 - **模型真正的结束标记是 token 1 (`</｜end▁of▁sentence｜>`)**, 不是 EOS 128000. `_load_stop_token_ids()` 从 `weights/tokenizer.json` 读取. 找不到文件直接报错.
 - **FusedMoEFFN cuBLAS 小 M**: `fused_expert_ffn_triton` 在 M<=8 时走 cuBLAS, 避免 Triton 15/16 SM 空转. `fused_moe.py:297`.
-- `ExpertWeightCache.clear()` 保留 pinned 条目
-- 共享 RAID 多线程读盘反效果, prefetch 默认禁用
+- `ExpertWeightCache.clear()` 保留 pinned 条目; `ExpertCacheManager.clear()` 清空全部
+- 共享 RAID 多线程读盘反效果, prefetch 默认禁用. V21 已移除 prefetch 代码 (移入 scripts/)
 - `tl.load/store` 必须有行列掩码; `tl.dot` M,N,K≥16
 - M=1 decode: Triton 比 cuBLAS 慢 8× (15/16 SM 空转). SharedExpertFFN 和 FusedMoEFFN 都应考虑此限制
 - 修改 Triton kernel 后删 `~/.triton/cache/`
@@ -126,6 +143,11 @@ MTP 模块:
 - **KV session 文件**: `sessions/{session_id}/` 存所有层状态, 恢复时自动 map_location 到 GPU
 - **温度 0 对比必须**: 消除路由噪声
 - **MHC_post Triton kernel 始终失败** (AssertionError): 直走 PyTorch fallback
+- **EngineStub 是推荐的测试构造方式**: 用 `from tests._engine_stub import make_engine` 替代 `HomeSeekInferenceEngine.__new__()` + 手工属性赋值
+- **Config 现在是 dataclass**: `DeepSeekV4FlashConfig(head_dim=512)` 而非 `type('obj', ...)()`; `from_json()` 自动通过 `__dataclass_fields__` 映射字段
+- **`_forward_layer` 共享方法**: 不要直接复制粘贴层循环; 所有层 forward 都走 `self._forward_layer(h, lw, layer_idx, input_ids)`
+- **`encoding_dsv4` 路径**: V21 使用 `_project_root` 绝对路径计算, 不依赖 `__file__` 相对层级
+- **日志**: 使用 `logging.getLogger(__name__)` 而非 `print()`. `_log` 方法内部调用 `_logger.info()`
 
 ## Triton Kernel 铁律
 

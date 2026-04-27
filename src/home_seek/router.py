@@ -8,7 +8,7 @@ def stable_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def compute_expert_affinity(hidden_states: torch.Tensor, gate_weight: torch.Tensor, top_k: int = 6,
-                            routed_scaling_factor: float = 1.5):
+                            routed_scaling_factor: float = 1.5) -> tuple[torch.Tensor, torch.Tensor]:
     logits = torch.matmul(hidden_states.to(gate_weight.dtype), gate_weight.t())
     logits = logits.float()
     scores = F.softplus(logits).sqrt()
@@ -23,7 +23,7 @@ def compute_expert_affinity_with_bias(
     hidden_states: torch.Tensor, gate_weight: torch.Tensor,
     gate_bias: torch.Tensor, top_k: int = 6,
     routed_scaling_factor: float = 1.5,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits = torch.matmul(hidden_states.to(gate_weight.dtype), gate_weight.t())
     if gate_bias is not None:
         logits = logits + gate_bias.to(logits.dtype)

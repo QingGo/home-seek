@@ -9,7 +9,6 @@ def _make_engine_stub():
     eng.device = torch.device("cuda")
     eng.expert_cache = ExpertWeightCache(max_experts=16, device="cuda")
     eng._cpu_fallback_enabled = False
-    eng._prefetch_worker = None
     eng.verbose = False
     eng.loader = MagicMock()
     eng.loader.get_weights.return_value = {}
@@ -22,10 +21,6 @@ _FP4_R, _FP4_C = 4, 64
 
 @pytest.mark.fast
 class TestRawEntryDevice:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_fp4_raw_stays_on_cpu(self):
         from home_seek.inference_engine import HomeSeekInferenceEngine
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
@@ -64,10 +59,6 @@ class TestRawEntryDevice:
 
 @pytest.mark.fast
 class TestDequantizeEntry:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_deq_fp4_from_cpu(self):
         from home_seek.inference_engine import ExpertWeightCache
         cache = ExpertWeightCache(max_experts=16, device="cuda")
@@ -107,10 +98,6 @@ class TestDequantizeEntry:
 
 @pytest.mark.fast
 class TestExpertCache:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_put_and_get_fp4(self):
         from home_seek.inference_engine import ExpertWeightCache
         cache = ExpertWeightCache(max_experts=16, device="cuda")
@@ -139,10 +126,6 @@ class TestExpertCache:
 
 @pytest.mark.fast
 class TestFusedMoE:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def _mock_load(self, I=32, D=256):
         return lambda layer, eid: (
             torch.randn(I, D, device="cuda", dtype=torch.bfloat16),
@@ -200,10 +183,6 @@ class TestFusedMoE:
 
 @pytest.mark.fast
 class TestExpertFFNPt:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_fused_expert_ffn_pt_shape(self):
         from home_seek.fused_moe import fused_expert_ffn_pt
         B, D, I = 4, 256, 32
@@ -234,10 +213,6 @@ class TestExpertFFNPt:
 
 @pytest.mark.fast
 class TestSharedExpert:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_shared_ffn_shape(self):
         from home_seek.fused_moe import SharedExpertFFN
         sffn = SharedExpertFFN(hidden_size=64, intermediate_size=32)
@@ -264,10 +239,6 @@ class TestSharedExpert:
 
 @pytest.mark.fast
 class TestExpertDeq:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_load_expert_deq_none_for_missing(self):
         eng = _make_engine_stub()
         with pytest.MonkeyPatch().context() as mp:
@@ -290,10 +261,6 @@ class TestExpertDeq:
 
 @pytest.mark.fast
 class TestMakeRawEntry:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_none(self):
         eng = _make_engine_stub()
         assert eng._make_raw_entry(None, None) is None
@@ -313,8 +280,6 @@ class TestFusedMoEFP4Triton:
     _B = 4
 
     def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
 
@@ -463,10 +428,6 @@ class TestFP4DequantizePitfalls:
     - BLOCK_K_HALF must be <=16 so one tile covers one scale group (32 cols).
     - tl.dot needs [BK, BN] layout, not [BN, BK]; use tl.trans after interleave.
     """
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
 
     def test_interleave_via_join_reshape(self):
         """Bug: 曾认为 tl.join([N,K,1],[N,K,1]) reshape [N,2K] 不能交错。
@@ -680,8 +641,6 @@ class TestPCIeBARFix:
     _topk = 4
 
     def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
 

@@ -31,7 +31,22 @@ include = ["home_seek*"]
 
 [dependency-groups]
 dev = [
+    "mypy>=1.20.2",
     "pytest>=9.0.3",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+check_untyped_defs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+disallow_any_unimported = false
+exclude = [
+    "tests/",
+    "scripts/",
+    "build/",
 ]
 
 [tool.ruff]
@@ -50,6 +65,7 @@ markers = [
     "fast: <1s unit tests",
     "slow: >1s tests",
     "integration: end-to-end tests",
+    "cuda: requires CUDA GPU (auto-skipped if not available)",
 ]
 testpaths = ["tests"]
 addopts = "-m 'not slow'"

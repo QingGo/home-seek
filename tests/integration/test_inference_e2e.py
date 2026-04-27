@@ -1,5 +1,6 @@
 import os
 import sys
+import hashlib
 import torch
 import pytest
 
@@ -91,3 +92,25 @@ class TestInferenceE2E:
         peak = torch.cuda.max_memory_allocated()
         print(f"Generation test: {result['num_generated_tokens']} tokens, "
               f"peak: {peak / (1024**3):.2f} GB")
+
+    def test_regression_hash(self):
+        """Verify output matches known-good reference hash.
+        Update EXPECTED_HASH by running with --update-hash flag."""
+        engine = _get_engine()
+        tokenizer = _get_tokenizer()
+        input_ids = _encode_prompt(tokenizer, engine, "Hello")
+
+        result = engine.generate(input_ids, max_new_tokens=5, temperature=0.0)
+        text = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
+        actual = hashlib.sha256(text.encode()).hexdigest()
+
+        expected = os.environ.get("HOME_SEEK_EXPECTED_HASH")
+        if expected:
+            assert actual == expected, (
+                f"Output hash mismatch!\n"
+                f"  Expected: {expected}\n"
+                f"  Actual:   {actual}"
+            )
+        else:
+            print(f"\n  [regression] Recorded hash: HOME_SEEK_EXPECTED_HASH={actual}")
+            print(f"  [regression] Set env or hardcode this as EXPECTED_HASH in the test")

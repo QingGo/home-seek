@@ -3,18 +3,17 @@ import torch.nn.functional as F
 import pytest
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.inference_engine import HomeSeekInferenceEngine
+from home_seek.model_config import DeepSeekV4FlashConfig
 from home_seek._fp4 import unpack_from_e2m1fn_x2
 from tests._reference import swiglu_forward
 
 
 class TestExpandKV:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_expand_kv_direct(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng.config = type('obj', (object,), {'head_dim': 512})()
+        eng.config = DeepSeekV4FlashConfig(
+            head_dim=512,
+        )
 
         kv_latent = torch.randn(2, 8, 512, device="cuda", dtype=torch.bfloat16)
         k, v = eng._expand_kv(kv_latent)
@@ -24,7 +23,9 @@ class TestExpandKV:
 
     def test_expand_kv_no_woa_crash(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng.config = type('obj', (object,), {'head_dim': 512})()
+        eng.config = DeepSeekV4FlashConfig(
+            head_dim=512,
+        )
         kv_latent = torch.randn(1, 4, 512, device="cuda", dtype=torch.bfloat16)
         k, v = eng._expand_kv(kv_latent)
         assert k.shape[-2] == 4
@@ -42,10 +43,6 @@ class TestExpandKV:
 
 
 class TestSwiGLU:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_swiglu_clamp(self):
         x = torch.tensor([[100.0, -100.0, 1.0, -1.0, 5.0, -5.0, 2.0, -2.0]],
                          device="cuda", dtype=torch.bfloat16)
@@ -61,10 +58,6 @@ class TestSwiGLU:
 
 
 class TestMHC:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_mhc_split_sinkhorn(self):
         B, S = 1, 8
         hc_mult = 4
@@ -81,12 +74,19 @@ class TestMHC:
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.verbose = False
         eng._use_triton = True
-        eng.config = type('obj', (object,), {
-            'hc_mult': 4, 'hc_sinkhorn_iters': 5, 'hc_eps': 1e-6, 'rms_norm_eps': 1e-6,
-            'num_attention_heads': 64, 'num_key_value_heads': 1,
-            'head_dim': 512, 'o_groups': 8, 'o_lora_rank': 1024,
-            'hidden_size': 4096, 'sliding_window': 128,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            hc_mult=4,
+            hc_sinkhorn_iters=5,
+            hc_eps=1e-6,
+            rms_norm_eps=1e-6,
+            num_attention_heads=64,
+            num_key_value_heads=1,
+            head_dim=512,
+            o_groups=8,
+            o_lora_rank=1024,
+            hidden_size=4096,
+            sliding_window=128,
+        )
         B, T, hc, D = 1, 3, 4, 4096
         h4d = torch.randn(B, T, hc, D, device="cuda", dtype=torch.bfloat16)
         hc_base = torch.randn(24, device="cuda", dtype=torch.bfloat16)
@@ -98,18 +98,16 @@ class TestMHC:
         mixed = eng._process_mhc_post(ffn_out, h4d, post.float(), comb.float())
         assert mixed.shape == (B, T, hc, D)
 
-    def test_mhc_pre_big_fuse_api(self):
-        pytest.skip("tile_kernels removed")
-
-    def test_mhc_post_api(self):
-        pytest.skip("tile_kernels removed")
-
     def test_mhc_shape_mismatch_skip(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.verbose = False
-        eng.config = type('obj', (object,), {
-            'hc_mult': 4, 'hc_sinkhorn_iters': 5, 'hc_eps': 1e-6, 'rms_norm_eps': 1e-6, 'hidden_size': 4096,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            hc_mult=4,
+            hc_sinkhorn_iters=5,
+            hc_eps=1e-6,
+            rms_norm_eps=1e-6,
+            hidden_size=4096,
+        )
         hidden = torch.randn(1, 4, 4, 4096, device="cuda", dtype=torch.bfloat16)
         hc_base = torch.randn(12, device="cuda", dtype=torch.bfloat16)
         hc_fn_wrong = torch.randn(12, 4096, device="cuda", dtype=torch.bfloat16)
@@ -120,13 +118,12 @@ class TestMHC:
 
 
 class TestRouting:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_hash_routing(self):
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng.config = type('obj', (object,), {'num_experts_per_tok': 6, 'num_hash_layers': 3})()
+        eng.config = DeepSeekV4FlashConfig(
+            num_experts_per_tok=6,
+            num_hash_layers=3,
+        )
         input_ids = torch.tensor([[5, 10, 15]], device="cuda")
         tid2eid = torch.randint(0, 256, (100, 6), device="cuda")
         eids, weights = eng._compute_hash_experts(input_ids, 0, tid2eid)
@@ -161,26 +158,7 @@ class TestRouting:
         assert torch.equal(r1, r2) and torch.equal(w1, w2)
 
 
-class TestAttention:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-    def test_mla_attention_shapes(self):
-        pytest.skip("compressed_attention.py removed (dead code)")
-
-    def test_mla_attention_cache_incremental(self):
-        pytest.skip("compressed_attention.py removed (dead code)")
-
-
 class TestKVCache:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-    def test_kv_cache_manager(self):
-        pytest.skip("kv_cache_manager.py removed (dead code)")
-
     def test_compressed_kv_cache(self):
         from home_seek.hybrid_kv_cache import HybridKVCache
         c = HybridKVCache(compress_ratio=4, head_dim=512, device="cuda")
@@ -195,7 +173,9 @@ class TestKVCache:
     def test_get_compressed_attention_kv(self):
         from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng.config = type('obj', (object,), {'head_dim': 512})()
+        eng.config = DeepSeekV4FlashConfig(
+            head_dim=512,
+        )
         state = LayerState()
         state.compressed_kv_data = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
         result = eng._get_compressed_attention_kv(state, {})
@@ -205,9 +185,11 @@ class TestKVCache:
         from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng.device = torch.device("cuda")
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'hidden_size': 4096, 'head_dim': 512,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            hidden_size=4096,
+            head_dim=512,
+        )
         eng.config.get_compress_ratio = lambda idx: 4
         B, T, D = 1, 16, 4096
         hidden = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
@@ -224,10 +206,6 @@ class TestKVCache:
 
 
 class TestQuantization:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_fp4_roundtrip(self):
         from home_seek._fp4 import cast
         for h in [64, 128, 256]:
@@ -268,10 +246,6 @@ class TestQuantization:
 
 
 class TestCSAIndexer:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_compute_indexer_shapes(self):
         from home_seek.inference_engine import HomeSeekInferenceEngine, LayerState
         from home_seek.model_config import DeepSeekV4FlashConfig
@@ -332,8 +306,6 @@ class TestCSAIndexer:
         eng._deq_cache = {}
         eng.device = torch.device("cuda")
         eng.verbose = False
-        eng._prefetch_worker = None
-        eng._prefetch_enabled = False
         eng._cpu_fallback_enabled = False
         eng._cpu_fallback_layers = set()
         eng.expert_cache = type('obj', (object,), {'cache': {}})()
@@ -359,10 +331,6 @@ class TestCSAIndexer:
 
 
 class TestRoutingFix:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_routing_with_scaling_factor(self):
         from home_seek.router import compute_expert_affinity
         torch.manual_seed(42)
@@ -398,10 +366,6 @@ class TestRoutingFix:
 
 
 class TestExpertCache:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_expert_weight_cache_lru(self):
         from home_seek.inference_engine import ExpertWeightCache
         cache = ExpertWeightCache(max_experts=3)
@@ -469,47 +433,7 @@ class TestExpertCache:
         assert len(cache) == 1
 
 
-class TestPrefetchWorker:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-    def test_async_prefetch_worker_init(self):
-        from home_seek.prefetch_worker import AsyncPrefetchWorker
-        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
-        assert worker is not None
-        assert worker._worker.is_alive()
-        worker.shutdown()
-
-    def test_async_prefetch_clear(self):
-        from home_seek.prefetch_worker import AsyncPrefetchWorker
-        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
-        with worker._cache_lock:
-            worker._prefetch_cache[(0, 1)] = "dummy"
-        worker.clear()
-        assert worker.size() == 0
-        worker.shutdown()
-
-    def test_async_prefetch_get_missing(self):
-        from home_seek.prefetch_worker import AsyncPrefetchWorker
-        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
-        result = worker.get(0, 1)
-        assert result is None
-        worker.shutdown()
-
-    def test_async_prefetch_empty(self):
-        from home_seek.prefetch_worker import AsyncPrefetchWorker
-        worker = AsyncPrefetchWorker("/tmp", {}, device="cuda")
-        worker.prefetch(0, [])
-        assert worker.size() == 0
-        worker.shutdown()
-
-
 class TestWeightLoaderMmap:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_weight_loader_init_no_weights(self):
         from home_seek.inference_engine import WeightLoader
         import tempfile
@@ -540,13 +464,6 @@ class TestWeightLoaderMmap:
 class TestRegression:
     """Lightweight regression tests for bugs found during M2.5/M3 development.
     Each test runs in <1s on a CUDA GPU."""
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-    def test_mhc_non_contiguous_input(self):
-        pytest.skip("tile_kernels removed")
 
     def test_swiglu_is_silu_not_sigmoid(self):
         """Bug: SwiGLU = SiLU(gate) * up = gate * sigmoid(gate) * up, not sigmoid(gate) * up."""
@@ -605,9 +522,10 @@ class TestRegression:
         """Bug: embed and lm_head loaded separately despite tie_word_embeddings=True."""
         from home_seek.inference_engine import HomeSeekInferenceEngine
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng.config = type('obj', (object,), {
-            'tie_word_embeddings': True, 'num_hidden_layers': 1,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            tie_word_embeddings=True,
+            num_hidden_layers=1,
+        )
         embed = torch.randn(1000, 64, device="cuda", dtype=torch.bfloat16)
         eng.embed = embed
         eng.lm_head = embed
@@ -657,10 +575,6 @@ class TestRegression:
 
 class TestCompressorOverlap:
     """Bug #1: overlap_transform should use -inf for score padding (not 0)."""
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
 
     def test_overlap_transform_score_fill_neg_inf(self):
         from home_seek.compressor import Compressor
@@ -713,10 +627,6 @@ class TestCompressorOverlap:
 
 class TestAttnSink:
     """Bug #2: attn_sink should match demo virtual softmax entry behavior."""
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
 
     def test_attn_sink_virtual_entry(self):
         """Verify that attn_sink acts as a virtual softmax entry (no KV)."""

@@ -29,7 +29,6 @@ def _make_engine_stub():
     eng.device = torch.device("cuda")
     eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")
     eng._cpu_fallback_enabled = False
-    eng._prefetch_worker = None
     eng.verbose = False
     eng.loader = MagicMock()
     eng.loader.get_weights.return_value = {}
@@ -60,10 +59,6 @@ def _make_engine_stub():
 
 @pytest.mark.fast
 class TestHotExpertSet:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_hot_expert_set_populated(self):
         import json
         with open("hot_experts.json") as f:
@@ -125,8 +120,6 @@ class TestHotExpertSet:
 @pytest.mark.fast
 class TestLoadGpuHotExpert:
     def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
 
@@ -190,10 +183,6 @@ class TestLoadGpuHotExpert:
 
 @pytest.mark.fast
 class TestAllRoutedAreHot:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_all_hot_ids(self):
         eng = _make_engine_stub()
         eng._hot_expert_set = {1, 2, 3, 4, 5, 6, 7, 8}
@@ -222,8 +211,6 @@ class TestAllRoutedAreHot:
 @pytest.mark.fast
 class TestForwardFfnHotBatched:
     def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
 
@@ -345,10 +332,6 @@ class TestForwardFfnHotBatched:
 
 @pytest.mark.fast
 class TestFfnHotPathRouting:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_all_hot_uses_hot_path(self):
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
@@ -386,7 +369,6 @@ class TestFfnHotPathRouting:
                 torch.randn(_IM, _HS, device="cuda", dtype=torch.bfloat16),
                 torch.randn(_HS, _IM, device="cuda", dtype=torch.bfloat16),
             ) if e > 0 else None)
-        eng._prefetch_worker = None
 
         try:
             ffn_out, used = eng._forward_ffn(hidden, lw, 0)
@@ -414,7 +396,6 @@ class TestFfnHotPathRouting:
                 torch.randn(_IM, _HS, device="cuda", dtype=torch.bfloat16),
                 torch.randn(_HS, _IM, device="cuda", dtype=torch.bfloat16),
             ))
-        eng._prefetch_worker = None
 
         try:
             ffn_out, used = eng._forward_ffn(hidden, lw, 0)
@@ -425,8 +406,6 @@ class TestFfnHotPathRouting:
 @pytest.mark.fast
 class TestGpuBf16LruCache:
     def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
         from home_seek.fused_moe import clear_deq_cache
         clear_deq_cache()
 

@@ -128,10 +128,6 @@ def _make_mock_engine():
 class TestMTPGenerateDraft:
     """Test _mtp_generate_draft correctness."""
 
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-
     def test_returns_none_when_mtp_missing(self):
         """When MTP weights are not loaded, return None, 0."""
         from home_seek.inference_engine import HomeSeekInferenceEngine
@@ -200,10 +196,6 @@ class TestMTPGenerateDraft:
 @pytest.mark.fast
 class TestMTPAcceptDrafts:
     """Test _mtp_accept_drafts correctness."""
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
 
     def test_returns_zero_when_no_drafts(self):
         """Empty/bad draft_ids → return 0, None."""
@@ -307,10 +299,6 @@ class TestMTPAcceptDrafts:
 @pytest.mark.fast
 class TestMTPIntegration:
     """Test MTP integration in generate()."""
-
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
 
     def test_mtp_disabled_when_mtp_loaded_false(self):
         """When _mtp_loaded=False, mtp_num_draft=0 and no MTP loop."""

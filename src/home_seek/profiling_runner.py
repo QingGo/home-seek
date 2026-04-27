@@ -26,8 +26,8 @@ from collections import defaultdict
 
 import torch
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_encoding_dir = os.path.join(_current_dir, "../../weights/encoding")
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_encoding_dir = os.path.join(_project_root, 'weights', 'encoding')
 sys.path.insert(0, os.path.abspath(_encoding_dir))
 
 from home_seek.inference_engine import HomeSeekInferenceEngine
@@ -411,8 +411,6 @@ def run_profile(args):
         preload_all=args.preload_all,
         use_triton=not args.no_triton,
     )
-    if args.prefetch:
-        engine._prefetch_enabled = True
     if use_mtp:
         engine._mtp_loaded = True
     if args.mtp_eager:
@@ -576,7 +574,6 @@ def main():
     parser.add_argument("--mtp-eager", action="store_true",
                         help="Eager MTP: accept all drafts without verification (fast but risky)")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--preload-all", action="store_true",
                         help="Pre-load all experts to CPU RAM during init (eliminates file I/O)")
     parser.add_argument("--hot-experts", default="hot_experts.json")

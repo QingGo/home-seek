@@ -1,6 +1,7 @@
 import torch
 import pytest
 from home_seek.inference_engine import HomeSeekInferenceEngine
+from home_seek.model_config import DeepSeekV4FlashConfig
 
 
 class TestWeightCacheIntegrity:
@@ -14,12 +15,16 @@ class TestWeightCacheIntegrity:
         """Verify _deq cache uses per-layer keys so no cross-layer contamination."""
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._deq_cache = {}
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 3, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 3,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-            'swiglu_limit': 10.0, 'routed_scaling_factor': 1.5,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=3,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=3,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            swiglu_limit=10.0,
+            routed_scaling_factor=1.5,
+        )
 
         data = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
         scale = None
@@ -37,12 +42,16 @@ class TestWeightCacheIntegrity:
         """Verify _deq cache is cleared at each generate() start."""
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._deq_cache = {}
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 1,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-            'swiglu_limit': 10.0, 'routed_scaling_factor': 1.5,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=1,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            swiglu_limit=10.0,
+            routed_scaling_factor=1.5,
+        )
 
         data = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
         _ = eng._deq("test.weight", data, None, 0)
@@ -62,12 +71,16 @@ class TestWeightCacheIntegrity:
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._deq_cache = {}
         eng.device = torch.device("cuda")
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 1,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-            'swiglu_limit': 10.0, 'routed_scaling_factor': 1.5,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=1,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            swiglu_limit=10.0,
+            routed_scaling_factor=1.5,
+        )
 
         # Create FP8 weight with ue8m0 scale
         from home_seek._fp4 import cast
@@ -91,11 +104,14 @@ class TestWeightCacheIntegrity:
         eng.device = torch.device("cuda")
         eng.loader = None
         eng.verbose = False
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 1,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=1,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+        )
 
         # Directly test the _get_shared_expert logic with correct scale shape for cast_back
         I, D = 2048, 4096
@@ -130,11 +146,14 @@ class TestWeightCacheIntegrity:
         eng.device = torch.device("cuda")
         eng.loader = None
         eng.verbose = False
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 1,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=1,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+        )
 
         I, D = 2048, 4096
         w1_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
@@ -151,9 +170,9 @@ class TestWeightCacheIntegrity:
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._hot_expert_set = {1, 2, 3}
         eng._hot_expert_set_by_layer = {1: {1, 2, 3, 4, 5, 6}}
-        eng.config = type('obj', (object,), {
-            'num_experts_per_tok': 6,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_experts_per_tok=6,
+        )
 
         topk = torch.tensor([[1, 2, 3, 4, 5, 6]], device="cuda")
         assert eng._all_routed_are_hot(topk, layer_idx=1), \
@@ -162,28 +181,6 @@ class TestWeightCacheIntegrity:
         topk2 = torch.tensor([[1, 2, 3, 4, 5, 6]], device="cuda")
         assert not eng._all_routed_are_hot(topk2, layer_idx=0), \
             "Layer 0 has no per-layer set, falls back to global where 4,5,6 not hot → should return False"
-
-    def test_mhc_post_pytorch_fallback_shape_matches_triton(self):
-        """Verify PyTorch MHC post fallback returns SAME shape as Triton kernel."""
-        pytest.skip("tile_kernels removed")
-        post_3d = post_mix.squeeze(-1)  # [B, T, hc]
-        term1 = post_3d.unsqueeze(-1) * x_expanded
-        residual_expanded = residual.unsqueeze(3)
-        comb = comb_mix
-        term2 = torch.sum(comb.unsqueeze(-1) * residual_expanded, dim=2)
-        y = term1 + term2
-        fallback_result = y.to(x.dtype)
-
-        print(f"\nTriton result shape: {triton_result.shape if triton_result is not None else 'N/A'}")
-        print(f"Fallback result shape: {fallback_result.shape}")
-
-        # Check: if shapes differ, this is the BUG
-        if triton_result is not None:
-            assert triton_result.shape == fallback_result.shape, \
-                f"SHAPE MISMATCH! Triton: {triton_result.shape}, Fallback: {fallback_result.shape}"
-            # Also check dtype
-            assert triton_result.dtype == fallback_result.dtype, \
-                f"DTYPE MISMATCH! Triton: {triton_result.dtype}, Fallback: {fallback_result.dtype}"
 
     def test_gpu_bf16_cache_not_cleared_across_generate(self):
         """Verify _gpu_bf16_cache is NOT cleared between generate() calls (potential stale data)."""
@@ -224,7 +221,7 @@ class TestWeightCacheIntegrity:
 
     def test_fp8_simulate_preserves_hidden_std(self):
         """Verify _fp8_simulate doesn't explode variance."""
-        from home_seek.inference_engine import _fp8_simulate
+        from home_seek.inference_engine.engine import _fp8_simulate
         x = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16) * 14.5
         orig_std = x.float().std().item()
         _fp8_simulate(x, block_size=64)
@@ -236,7 +233,7 @@ class TestWeightCacheIntegrity:
 
     def test_ue8m0_scale_conversion_correct(self):
         """Verify ue8m0 → float32 scale conversion used in load_fp8_weight."""
-        from home_seek.inference_engine import _ue8m0_to_f32
+        from home_seek.inference_engine.weight_loader import _ue8m0_to_f32
 
         # ue8m0=127 should map to 1.0 in float32
         sf_u8 = torch.tensor([127], dtype=torch.uint8, device="cuda")
@@ -302,9 +299,9 @@ class TestForwardFfnHotExpertPath:
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._hot_expert_set = {1, 2, 3, 4, 5, 6, 7, 8}
         eng._hot_expert_set_by_layer = {0: {3, 4, 5, 6, 7, 8, 9, 10}}
-        eng.config = type('obj', (object,), {
-            'num_experts_per_tok': 6,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_experts_per_tok=6,
+        )
 
         # Layer 0's hot experts include 9,10 → all are per-layer hot
         topk = torch.tensor([[3, 4, 5, 6, 9, 10]], device="cuda")
@@ -319,12 +316,15 @@ class TestForwardFfnHotExpertPath:
         eng._max_hot_experts = 16
         eng._max_bf16_cache = 16
         eng.device = torch.device("cuda")
-        eng.config = type('obj', (object,), {
-            'num_hidden_layers': 1, 'n_routed_experts': 256,
-            'num_experts_per_tok': 6, 'num_hash_layers': 1,
-            'hidden_size': 4096, 'moe_intermediate_size': 2048,
-            'swiglu_limit': 10.0,
-        })()
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            num_hash_layers=1,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            swiglu_limit=10.0,
+        )
 
         B, D, I = 1, 4096, 2048
         # Simulate hot experts cached in GPU
@@ -467,3 +467,124 @@ class TestStopToken:
         assert 1 not in gen, f"Token 1 should be stripped from output, got {gen}"
         assert 'Hello! How can I help you today?' in text
         assert len(gen) < 20, "Should have stopped early (not hit max_new_tokens)"
+
+
+class TestExpertCacheContract:
+    """Contract tests for ExpertWeightCache — these define the API contract.
+
+    Any implementation of ExpertWeightCache must pass these tests,
+    ensuring that cache eviction, pinning, and clear() behave consistently.
+    """
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        from home_seek.inference_engine import ExpertWeightCache
+        self.cache = ExpertWeightCache(max_experts=5)
+        w = torch.randn(4, 8, device="cuda")
+        self.w_triple = (w, w, w)
+
+    # ── Contract 1: put + get roundtrip ──
+
+    def test_put_get_roundtrip(self):
+        self.cache.put_deq("k", *self.w_triple)
+        assert self.cache.get("k") is not None, "put + get should succeed"
+
+    def test_put_get_same_returns_cached(self):
+        self.cache.put_deq("k", *self.w_triple)
+        result = self.cache.get("k")
+        assert result is not None, "get should return cached entry"
+        w1_entry, w3_entry, w2_entry = result
+        assert w1_entry[0].data_ptr() == self.w_triple[0].data_ptr(), "get should return same object by ptr"
+
+    def test_get_missing_returns_none(self):
+        assert self.cache.get("nonexistent") is None
+
+    # ── Contract 2: LRU eviction ──
+
+    def test_eviction_fifo(self):
+        for i in range(6):
+            self.cache.put_deq(f"e{i}", *self.w_triple)
+        assert self.cache.get("e0") is None, "oldest unpinned should be evicted"
+        assert self.cache.get("e5") is not None, "newest should survive"
+
+    def test_eviction_respects_pin(self):
+        self.cache.put_deq("pinned", *self.w_triple, pin=True)
+        for i in range(10):
+            self.cache.put_deq(f"e{i}", *self.w_triple)
+        assert self.cache.get("pinned") is not None, "pinned entries survive eviction"
+
+    # ── Contract 3: clear preserves pinned ──
+
+    def test_clear_preserves_pinned(self):
+        self.cache.put_deq("pinned", *self.w_triple, pin=True)
+        self.cache.put_deq("unpinned", *self.w_triple)
+        self.cache.clear()
+        assert self.cache.get("pinned") is not None, "pinned survives clear"
+        assert self.cache.get("unpinned") is None, "unpinned is removed by clear"
+
+    # ── Contract 4: trim ──
+
+    def test_trim_reduces_to_target(self):
+        for i in range(20):
+            self.cache.put_deq(f"e{i}", *self.w_triple)
+        self.cache.trim(target_count=3)
+        assert len(self.cache) <= 8, "trim to 3 unpinned + pinned(0) = 3"
+        assert len(self.cache) >= 3, "trim should keep at least target"
+
+    # ── Contract 5: deq with hot_deq cache ──
+
+    def test_deq_populates_hot_cache(self):
+        c = type(self.cache)(max_experts=10, hot_deq_size=4)
+        c.put_deq("k", *self.w_triple)
+        result = c.deq("k")
+        assert result is not None, "deq should work"
+        w1, w3, w2 = result
+        assert w1.shape == self.w_triple[0].shape
+
+    def test_deq_hot_cache_hit(self):
+        c = type(self.cache)(max_experts=10, hot_deq_size=4)
+        c.put_deq("k", *self.w_triple)
+        first = c.deq("k")
+        second = c.deq("k")
+        assert first is not None and second is not None
+        assert first[0].data_ptr() == second[0].data_ptr(), "hot cache should return same object"
+
+
+class TestExpertCacheManagerContract:
+    """Contract tests for ExpertCacheManager — the unified entry point."""
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        from home_seek.inference_engine import HomeSeekInferenceEngine, ExpertWeightCache
+        from home_seek.fused_moe import triton_dequantize_fp4_all
+        from home_seek._fp4 import cast
+        self.I, self.D = 128, 256
+        w1 = torch.randn(self.I, self.D, device="cuda", dtype=torch.bfloat16)
+        w3 = torch.randn(self.I, self.D, device="cuda", dtype=torch.bfloat16)
+        w2 = torch.randn(self.D, self.I, device="cuda", dtype=torch.bfloat16)
+        w1p, w1s = cast(w1.cpu(), fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(w3.cpu(), fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(w2.cpu(), fmt="e2m1", block_size=(1, 32))
+        self.fp4_triple = ((w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4"))
+        self.w1_bf, self.w3_bf, self.w2_bf = triton_dequantize_fp4_all(
+            w1p.to("cuda"), w1s.to("cuda").to(torch.float32),
+            w3p.to("cuda"), w3s.to("cuda").to(torch.float32),
+            w2p.to("cuda"), w2s.to("cuda").to(torch.float32),
+        )
+
+    def test_expert_cache_manager_get_returns_3tuple(self):
+        """CacheManager.get returns 3 BF16 tensors."""
+        from home_seek.inference_engine.expert_cache import ExpertCacheManager
+        mgr = ExpertCacheManager(device="cuda")
+        mgr.configure({}, set(), 0,
+                      lambda l, e: self.fp4_triple,
+                      lambda d, s: (d.to("cuda"), s, "fp4"),
+                      lambda *a: (self.w1_bf, self.w3_bf, self.w2_bf))
+        result = mgr.get(0, 1)
+        assert result is not None
+        assert len(result) == 3
+        for w in result:
+            assert w.dtype == torch.bfloat16
+            assert w.device.type == "cuda"

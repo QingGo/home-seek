@@ -1,12 +1,7 @@
 import torch
-import pytest
 
 
 class TestTileOps:
-    def setup_method(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
     def test_cast_to_fp4_and_back(self):
         from home_seek._fp4 import cast, unpack_from_e2m1fn_x2
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
@@ -109,11 +104,4 @@ class TestTileOps:
         assert torch.equal(indices_1, indices_2)
         assert torch.equal(weights_1, weights_2)
 
-    def test_mla_attention(self):
-        pytest.skip("compressed_attention.py removed (dead code)")
 
-    def test_mla_attention_with_cache(self):
-        pytest.skip("compressed_attention.py removed (dead code)")
-
-    def test_kv_cache_manager(self):
-        pytest.skip("kv_cache_manager.py removed (dead code)")
