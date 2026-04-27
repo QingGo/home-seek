@@ -424,7 +424,8 @@ class HomeSeekInferenceEngine:
             return
         with open(hot_experts_path) as f:
             data = json.load(f)
-        self._hot_expert_ids = data.get("top_16_hot_experts", [])
+        self._hot_expert_ids = data.get("top_hot_experts",
+                                        data.get("top_16_hot_experts", []))
         self._hot_expert_set = set(self._hot_expert_ids)
         hash_ids = data.get("hash_layer_expert_ids", [])
         self._hash_expert_ids = hash_ids[:18] if len(hash_ids) > 18 else hash_ids
@@ -435,8 +436,10 @@ class HomeSeekInferenceEngine:
         if not self._hot_expert_ids:
             return
         count = 0
-        for layer in range(min(2, self.config.num_hidden_layers)):
-            for eid in self._hot_expert_ids[:8]:
+        preload_per_layer = min(len(self._hot_expert_ids), 16)
+        preload_layers = min(4, self.config.num_hidden_layers)
+        for layer in range(preload_layers):
+            for eid in self._hot_expert_ids[:preload_per_layer]:
                 if (layer, eid) not in self._gpu_hot_experts:
                     self._load_expert_fp4_raw(layer, eid)
                     count += 1

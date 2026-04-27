@@ -66,10 +66,14 @@ class TestHotExpertSet:
             pytest.skip("CUDA required")
 
     def test_hot_expert_set_populated(self):
+        import json
+        with open("hot_experts.json") as f:
+            data = json.load(f)
+        expected_ids = set(data.get("top_hot_experts", data.get("top_16_hot_experts", [])))
+        expected_count = len(expected_ids)
         from home_seek.inference_engine import HomeSeekInferenceEngine
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
-        eng._hot_expert_ids = [114, 9, 172, 25, 183, 176, 101, 221,
-                               217, 107, 210, 17, 237, 18, 124, 250]
+        eng._hot_expert_ids = []
         eng._hot_expert_set = set()
         eng._log = lambda msg: None
         eng._gpu_hot_experts = {}
@@ -79,10 +83,37 @@ class TestHotExpertSet:
         from home_seek.inference_engine import ExpertWeightCache
         eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")
         eng._preload_hot_experts("hot_experts.json")
-        assert len(eng._hot_expert_set) == 16
-        assert 114 in eng._hot_expert_set
-        assert 250 in eng._hot_expert_set
-        assert 0 not in eng._hot_expert_set
+        assert len(eng._hot_expert_set) == expected_count
+        first_eid = next(iter(expected_ids))
+        assert first_eid in eng._hot_expert_set
+        assert -1 not in eng._hot_expert_set
+
+    def test_hot_expert_set_legacy_fallback(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._hot_expert_ids = []
+        eng._hot_expert_set = set()
+        eng._log = lambda msg: None
+        eng._gpu_hot_experts = {}
+        eng._max_hot_experts = 16
+        eng._gpu_expert_store = MagicMock()
+        eng.loader = MagicMock()
+        from home_seek.inference_engine import ExpertWeightCache
+        eng.expert_cache = ExpertWeightCache(max_experts=64, device="cuda")
+        import json
+        import tempfile
+        import os
+        legacy = {"top_16_hot_experts": [1, 2, 3, 4, 5, 6],
+                  "hash_layer_expert_ids": list(range(18))}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(legacy, f)
+            p = f.name
+        try:
+            eng._preload_hot_experts(p)
+            assert len(eng._hot_expert_set) == 6
+            assert 1 in eng._hot_expert_set
+        finally:
+            os.unlink(p)
 
     def test_hot_expert_set_empty_when_no_file(self):
         from home_seek.inference_engine import HomeSeekInferenceEngine
