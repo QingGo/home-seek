@@ -179,7 +179,7 @@ flowchart LR
 ### 瓶颈排序 (warm decode, R2-R5 avg)
 
 | # | 瓶颈 | 每 token 耗时 | 占比 | 状态 |
-|:---|---:|---:|---:|
+|:---|---:|---:|---:|:---|
 | 1 | **FFN 层** (DMA + dequant + matmul) | ~430ms | 69% | ⚠ 含文件 I/O |
 | 2 | **Attention 层** (QKV proj + attn + compress) | ~190ms | 30% | ⚠ 大 GEMM 主导 |
 | 3 | 其中: **文件 I/O** (page cache) | ~90ms | 14% | ⬇ 已大幅降低 (冷 4.5ms→温 1.0ms/load) |

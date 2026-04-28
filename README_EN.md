@@ -179,7 +179,7 @@ Key: `(layer, eid)` | Per-expert: `I×D×51/32 ≈ 12.75 MB` (FP4 data + f8 scal
 ### Bottleneck Ranking (warm decode, R2-R5 avg)
 
 | # | Bottleneck | per-token time | Share | Status |
-|:---|---:|---:|---:|
+|:---|---:|---:|---:|:---|
 | 1 | **FFN layer** (DMA + dequant + matmul) | ~430ms | 69% | ⚠ includes file I/O |
 | 2 | **Attention layer** (QKV proj + attn + compress) | ~190ms | 30% | ⚠ dominated by large GEMMs |
 | 3 | of which: **File I/O** (page cache) | ~90ms | 14% | ⬇ greatly reduced (cold 4.5ms→warm 1.0ms/load) |
