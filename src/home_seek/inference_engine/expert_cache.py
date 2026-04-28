@@ -70,7 +70,7 @@ class ExpertWeightCache:
         if key in self.cache:
             self.cache.move_to_end(key)
             return
-        if not pin and len(self.cache) >= self.max_experts + len(self.pinned):
+        if not pin and len(self.cache) >= self.max_experts:
             for k in list(self.cache.keys()):
                 if k not in self.pinned:
                     self.cache.pop(k)

@@ -1,14 +1,9 @@
 import os
-import sys
 import hashlib
 import torch
 import pytest
 
-
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_encoding_dir = os.path.join(_current_dir, '../../weights/encoding')
-sys.path.insert(0, os.path.abspath(_encoding_dir))
-from encoding_dsv4 import encode_messages
+from home_seek.encoding_dsv4 import encode_messages
 
 
 _engine = None

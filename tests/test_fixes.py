@@ -1,3 +1,6 @@
+import os
+import sys
+import unittest
 import torch
 import torch.nn.functional as F
 import pytest
@@ -676,3 +679,87 @@ class TestAttnSink:
 
         assert torch.allclose(out_cat, out_virtual, atol=1e-5), \
             "Virtual sink and cat-sink should produce identical results"
+
+
+class TestEncodingDsv4Import:
+    """encoding_dsv4 must import from the package, not via sys.path hack."""
+
+    def test_import_from_home_seek(self):
+        from home_seek.encoding_dsv4 import encode_messages
+        assert callable(encode_messages)
+
+    def test_encode_basic(self):
+        from home_seek.encoding_dsv4 import encode_messages
+        r = encode_messages([{"role": "user", "content": "Hi"}], thinking_mode="chat")
+        assert isinstance(r, str) and len(r) > 0
+
+    def test_no_sys_path_hack(self):
+        """No 'weights/encoding' should remain in sys.path."""
+        for p in sys.path:
+            assert "weights/encoding" not in p, f"sys.path hack still present: {p}"
+
+
+class TestAnsiCodes:
+    """ANSI escape codes controlled by TERM env var."""
+
+    def test_b_returns_ansi_when_term_set(self):
+        from home_seek.__main__ import _B
+        with unittest.mock.patch.dict(os.environ, {"TERM": "screen"}):
+            assert _B("92") == "\033[92m"
+            assert _B("0") == "\033[0m"
+
+    def test_b_returns_empty_when_term_dumb(self):
+        from home_seek.__main__ import _B
+        with unittest.mock.patch.dict(os.environ, {"TERM": "dumb"}):
+            assert _B("92") == ""
+
+    def test_b_returns_empty_when_no_term(self):
+        from home_seek.__main__ import _B
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            assert _B("92") == ""
+
+
+class TestProfileSnapshotDelta:
+    """CacheMonitor / LayerTrace snapshots must support diff-based multi-round."""
+
+    def test_cache_monitor_snapshot_delta(self):
+        from home_seek.profiling_runner import CacheMonitor
+        cm = CacheMonitor()
+        for _ in range(10): cm.record_cache(True)
+        for _ in range(3): cm.record_cache(False)
+        s1 = cm.snapshot()
+        for _ in range(5): cm.record_cache(True)
+        for _ in range(2): cm.record_cache(False)
+        s2 = cm.snapshot()
+        d = CacheMonitor.delta(s1, s2)
+        assert d['cache_hits'] == 5
+        assert d['cache_misses'] == 2
+
+    def test_layer_trace_snapshot_delta(self):
+        from home_seek.profiling_runner import LayerTrace
+        lt = LayerTrace(3)
+        lt.attn_ms[0] += 100.0
+        lt.ffn_ms[0] += 200.0
+        s1 = lt.snapshot()
+        lt.attn_ms[0] += 50.0
+        lt.ffn_ms[0] += 100.0
+        s2 = lt.snapshot()
+        d = LayerTrace.delta(s1, s2)
+        assert d['attn_ms'][0] == 50.0
+        assert d['ffn_ms'][0] == 100.0
+        assert d['attn_ms'][1] == 0.0
+
+
+class TestDownloadCli:
+    """home-seek download CLI contract."""
+
+    def test_error_on_existing_dir(self):
+        import tempfile, os
+        from home_seek.__main__ import cmd_download
+        tmp = tempfile.mkdtemp()
+        class Args: dir = tmp; source = "modelscope"
+        try:
+            with pytest.raises(SystemExit):
+                cmd_download(Args())
+        finally:
+            os.rmdir(tmp)

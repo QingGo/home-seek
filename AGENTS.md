@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21 — 软件工程质量改进：scope：dead code removal, logging, CI, config dataclass, type checking, MTP dedup, engine split, contract tests.
+DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.2 — Server mode + CLI + OOM fixes。
 
 ## 纪律
 
@@ -13,18 +13,27 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21 — 软件工程质量改�
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (165 pass, 2 skip, <30s)
+make test-unit         # 单元测试 (182 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
-make profile           # 性能分析: 5+20 tok, temp=0, 自动保存 JSON
-make profile-compare   # 对比当前与上次 profile 的指标变化
-make smoke             # 最小冒烟
+make profile           # 单轮 profile (--rounds 1)
+make server            # 启动 API 服务器
+make cli               # 交互式客户端
 
-# MTP (Makefile 不支持 --use-mtp flags, 直接调用)
+# 多轮 profiling (不同 prompt 消除缓存偏差)
+uv run python -m home_seek.profiling_runner --rounds 5 \
+  --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" \
+  --max-tokens 20 --temperature 0
+
+# MTP
 uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0 --use-mtp
-uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0 --use-mtp --mtp-eager
 
-# 回归哈希验证 (设环境变量后集成测试自动校验)
-HOME_SEEK_EXPECTED_HASH=abc123 make test-integration
+# Server + CLI
+python -m home_seek server --port 8000
+python -m home_seek cli --port 8000
+
+# 下载权重
+python -m home_seek download                     # ModelScope
+python -m home_seek download --source huggingface # HuggingFace
 ```
 
 所有命令内部使用 `uv run`.
@@ -53,16 +62,14 @@ src/home_seek/                     # 主包
 ├── quantize_weights.py            # 权重量化脚本
 └── utils.py                       # rms_norm 工具函数
 
-scripts/                           # 独立脚本
-├── analyze_weights.py
-├── download_weights.py
-├── hot_expert_analyzer.py
-├── list_weights.py
-├── mem_profiler.py
-├── mem_stress_test.py
-├── prefetch_worker.py             # 异步预取 (V21 从 src 移入, 默认禁用)
-├── test_scenarios.py
-└── hw_probe.py
+scripts/                           # 独立工具脚本
+├── hot_expert_analyzer.py         # 生成 hot_experts.json
+├── hw_probe.py                    # 硬件性能探测
+├── analyze_weights.py             # 权重结构分析
+├── list_weights.py                # 权重文件列表
+├── mem_profiler.py                # 内存分析
+├── mem_stress_test.py             # 内存压力测试
+└── test_scenarios.py              # 集成测试场景
 
 tests/                             # 测试
 ├── conftest.py                    # Triton 预热 + CUDA 自动 skip + 确定性种子
@@ -113,7 +120,10 @@ MTP 模块:
 _forward_layer 共享方法 (V21): 消除 generate/decode/MTP verify 间 5 处重复的层循环.
 ```
 
-无外部 GPU kernel 依赖（无 tile_kernels/tilelang）。所有 MHC 走 PyTorch fallback；MoE 路由走 `_forward_legacy`。
+Server: `home-seek server` / `home-seek cli` / `home-seek download`
+- Server 使用线程级 HTTP server (std lib), 避免 uvicorn fork+CUDA 不兼容
+- CLI 通过 SSE 流式输出, ANSI 颜色自动禁用(管道/重定向)
+- 每轮独立统计: prefill t/s, decode t/s, TTFT
 
 ## 性能评估铁律
 

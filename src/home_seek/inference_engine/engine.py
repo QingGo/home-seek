@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import json
 import time
 import logging
@@ -24,11 +23,8 @@ from home_seek.lightning_indexer import LightningIndexer
 from home_seek.hybrid_kv_cache import HybridKVCache
 
 
-_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
-_encoding_dir = os.path.join(_project_root, 'weights', 'encoding')
-sys.path.insert(0, os.path.abspath(_encoding_dir))
 try:
-    from encoding_dsv4 import encode_messages
+    from home_seek.encoding_dsv4 import encode_messages
 except ImportError:
     encode_messages = None
 
@@ -107,7 +103,25 @@ class HomeSeekInferenceEngine:
         self.hw_profile = probe_hardware(force=reprobe, weight_dir=weight_dir) if reprobe else load_profile()
         if self.hw_profile is None:
             self.hw_profile = probe_hardware(force=True, weight_dir=weight_dir)
-        cache_size = 5120
+        try:
+            _cgroup_max = 96 * 1024**3  # fallback: 96 GB = 90 GiB
+            for _p in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+                if os.path.exists(_p):
+                    with open(_p) as _f:
+                        _v = _f.read().strip()
+                    if _v.isdigit() and int(_v) < 10**15:  # sane limit
+                        _cgroup_max = int(_v)
+                        break
+            _avail_bytes = _cgroup_max
+            _per_expert_bytes = 30 * 1024 * 1024  # ~30 MB per FP4 expert
+            _reserve_bytes = 4 * 1024**3  # engine + OS
+            _max_by_ram = max(0, (_avail_bytes - _reserve_bytes) // _per_expert_bytes)
+            cache_size = max(1024, min(5120, _max_by_ram))
+            self._log(f"Host: {_avail_bytes/1e9:.0f} GB cgroup limit, "
+                      f"cache_size={cache_size} (~{cache_size*_per_expert_bytes/1e9:.0f} GB)")
+        except Exception:
+            cache_size = 4096
+            self._log(f"Host: unknown RAM, cache_size={cache_size}")
         self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
         self.layer_states: dict[int, LayerState] = {}
         self._deq_cache: OrderedDict = OrderedDict()
@@ -843,9 +857,12 @@ class HomeSeekInferenceEngine:
                 scale_gpu = scale.to(torch.float32) if scale is not None and scale.dtype != torch.float32 else scale
                 return (data, scale_gpu, "fp4_gpu")
             dev = "cpu"
-            data = data.to(dev)
+            data = data.to(dev).pin_memory()
             if scale is not None:
-                scale = scale.to(torch.float32).to(dev) if scale.dtype != torch.float32 else scale.to(dev)
+                if scale.dtype != torch.float32:
+                    scale = scale.to(torch.float32).to(dev).pin_memory()
+                else:
+                    scale = scale.to(dev).pin_memory()
             return (data, scale, "fp4")
         data = data.to(self.device, non_blocking=True)
         return (data, scale, "bf16")
@@ -1304,9 +1321,12 @@ class HomeSeekInferenceEngine:
             w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
             if w1 is None:
                 continue
-            w1_entry = (w1.to("cpu"), s1.to(torch.float32).to("cpu") if s1 is not None else None, "fp4")
-            w3_entry = (w3.to("cpu"), s3.to(torch.float32).to("cpu") if s3 is not None else None, "fp4")
-            w2_entry = (w2.to("cpu"), s2.to(torch.float32).to("cpu") if s2 is not None else None, "fp4")
+            s1_p = s1.to(torch.float32).to("cpu").pin_memory() if s1 is not None else None
+            s3_p = s3.to(torch.float32).to("cpu").pin_memory() if s3 is not None else None
+            s2_p = s2.to(torch.float32).to("cpu").pin_memory() if s2 is not None else None
+            w1_entry = (w1.to("cpu").pin_memory(), s1_p, "fp4")
+            w3_entry = (w3.to("cpu").pin_memory(), s3_p, "fp4")
+            w2_entry = (w2.to("cpu").pin_memory(), s2_p, "fp4")
             self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
             expert_count += 1
 
@@ -1343,9 +1363,12 @@ class HomeSeekInferenceEngine:
         w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
         if w1 is None:
             return None
-        w1_entry = (w1.to("cpu"), s1.to(torch.float32).to("cpu") if s1 is not None else None, "fp4")
-        w3_entry = (w3.to("cpu"), s3.to(torch.float32).to("cpu") if s3 is not None else None, "fp4")
-        w2_entry = (w2.to("cpu"), s2.to(torch.float32).to("cpu") if s2 is not None else None, "fp4")
+        s1_p = s1.to(torch.float32).to("cpu").pin_memory() if s1 is not None else None
+        s3_p = s3.to(torch.float32).to("cpu").pin_memory() if s3 is not None else None
+        s2_p = s2.to(torch.float32).to("cpu").pin_memory() if s2 is not None else None
+        w1_entry = (w1.to("cpu").pin_memory(), s1_p, "fp4")
+        w3_entry = (w3.to("cpu").pin_memory(), s3_p, "fp4")
+        w2_entry = (w2.to("cpu").pin_memory(), s2_p, "fp4")
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
         return self.expert_cache.get(cache_key)
 
@@ -2003,12 +2026,18 @@ class HomeSeekInferenceEngine:
         skip_prefill = resume and session_id is not None
 
         if not skip_prefill:
-            self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}")
+            self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}, "
+                      f"cache={len(self.expert_cache)}/{self.expert_cache.max_experts}, "
+                      f"gpu_hot={len(self._gpu_hot_experts)}, gpu_bf16={len(self._gpu_bf16_cache)}")
             self.layer_states = {}
             self._deq_cache.clear()
             self.expert_cache.clear()
             self._layer_weight_cache.clear()
             clear_deq_cache()
+            # Clear GPU caches to prevent VRAM accumulation across requests
+            self._gpu_hot_experts.clear()
+            self._gpu_bf16_cache.clear()
+            torch.cuda.empty_cache()
             for compressor in self._compressors.values():
                 compressor.reset()
             for indexer in self._indexers.values():

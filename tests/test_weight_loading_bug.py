@@ -455,7 +455,7 @@ class TestStopToken:
         """When model generates </｜end▁of▁sentence｜>, generation stops and token 1 is excluded."""
         from home_seek.inference_engine import HomeSeekInferenceEngine as H
         from transformers import PreTrainedTokenizerFast
-        from encoding_dsv4 import encode_messages
+        from home_seek.encoding_dsv4 import encode_messages
         tok = PreTrainedTokenizerFast(tokenizer_file='weights/tokenizer.json')
         tok.eos_token_id = 128000
         eng = H('weights', hot_experts_path='hot_experts.json')
@@ -574,6 +574,100 @@ class TestExpertCacheManagerContract:
             w2p.to("cuda"), w2s.to("cuda").to(torch.float32),
         )
 
+    def test_make_raw_entry_fp4_pins_cpu_memory(self):
+        """_make_raw_entry must pin FP4 CPU tensors for non-blocking DMA."""
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.device = torch.device("cuda")
+        eng.config = DeepSeekV4FlashConfig()
+
+        cpu_int8 = torch.randint(-128, 127, (2048, 4096), dtype=torch.int8, device="cpu")
+        cpu_scale = torch.randn(16, 128, dtype=torch.float32, device="cpu")
+
+        entry = eng._make_raw_entry(cpu_int8, cpu_scale)
+        assert entry is not None
+        data, scale, fmt = entry
+        assert fmt == "fp4"
+        assert data.device.type == "cpu"
+        assert data.is_pinned(), "FP4 weight data must be pinned"
+        assert scale.is_pinned(), "FP4 weight scale must be pinned"
+
+    def test_make_raw_entry_fp4_pins_works_without_scale(self):
+        """_make_raw_entry pins data even when scale is None."""
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.device = torch.device("cuda")
+        eng.config = DeepSeekV4FlashConfig()
+
+        cpu_int8 = torch.randint(-128, 127, (2048, 4096), dtype=torch.int8, device="cpu")
+
+        entry = eng._make_raw_entry(cpu_int8, None)
+        assert entry is not None
+        data, scale, fmt = entry
+        assert fmt == "fp4"
+        assert data.device.type == "cpu"
+        assert data.is_pinned(), "FP4 weight data must be pinned even without scale"
+        assert scale is None
+
+    def test_expert_cache_pinned_entries_are_pinned_cpu(self):
+        """ExpertWeightCache stores pinned CPU tensors."""
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10, device="cuda")
+
+        cpu_data = torch.randint(-128, 127, (2048, 4096), dtype=torch.int8, device="cpu").pin_memory()
+        cpu_scale = torch.randn(16, 128, dtype=torch.float32, device="cpu").pin_memory()
+        entry = (cpu_data, cpu_scale, "fp4")
+
+        cache.put("test_expert", entry, entry, entry, pin=True)
+        cached = cache.get("test_expert")
+        assert cached is not None
+        for w_entry in cached:
+            w_data, w_scale, w_fmt = w_entry
+            assert w_fmt == "fp4"
+            assert w_data.is_pinned(), "Cached FP4 data must remain pinned"
+            assert w_scale.is_pinned(), "Cached FP4 scale must remain pinned"
+
+    def test_cache_eviction_threshold_respects_max_experts(self):
+        """Eviction must trigger when total entries reach max_experts, not max+pinned.
+
+        Regression: the old check `>= max_experts + len(pinned)` allowed the cache
+        to grow unbounded (7507 entries when max=5120 with 2387 pinned = 195 GB).
+        """
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10, device="cuda")
+        w = (torch.randn(4, 8, device="cuda"), None, "bf16")
+
+        # Fill cache to max_experts with unpinned entries
+        for i in range(10):
+            cache.put(f"e{i}", w, w, w, pin=False)
+        assert len(cache) == 10, "Cache should hold exactly max_experts entries"
+
+        # Adding one more unpinned → eviction of oldest unpinned should occur
+        # NOTE: don't call get() before eviction — it calls move_to_end and changes order!
+        cache.put("e_new", w, w, w, pin=False)
+        assert len(cache) == 10, "Cache should not exceed max_experts"
+        # e0 is inserted first, so it should be evicted (LRU order: e0 oldest)
+        assert cache.get("e0") is None, "Oldest unpinned should be evicted"
+        assert cache.get("e_new") is not None, "New entry should be in cache"
+
+    def test_cache_eviction_with_pinned_entries(self):
+        """Pinned entries count toward max_experts, not on top of it."""
+        from home_seek.inference_engine import ExpertWeightCache
+        cache = ExpertWeightCache(max_experts=10, device="cuda")
+        w = (torch.randn(4, 8, device="cuda"), None, "bf16")
+
+        # Pin 3 entries, fill 7 unpinned → full at 10
+        for i in range(3):
+            cache.put(f"p{i}", w, w, w, pin=True)
+        for i in range(7):
+            cache.put(f"e{i}", w, w, w, pin=False)
+        assert len(cache) == 10
+
+        # Adding one more → evicts one unpinned, keeps at 10
+        cache.put("e_new", w, w, w, pin=False)
+        assert len(cache) == 10
+        for i in range(3):
+            assert cache.get(f"p{i}") is not None, "Pinned entries survive eviction"
+        assert cache.get("e_new") is not None, "New entry survives"
+
     def test_expert_cache_manager_get_returns_3tuple(self):
         """CacheManager.get returns 3 BF16 tensors."""
         from home_seek.inference_engine.expert_cache import ExpertCacheManager
@@ -588,3 +682,51 @@ class TestExpertCacheManagerContract:
         for w in result:
             assert w.dtype == torch.bfloat16
             assert w.device.type == "cuda"
+
+
+class TestInferenceEngineApiContract:
+    """Contract tests for InferenceEngine API surface."""
+
+    def setup_method(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    def test_generate_returns_tuple_not_dict(self):
+        """generate() returns (list[int], RequestStats), NOT a dict.
+
+        Regression: server handler called .get() on the result as if it were a dict.
+        """
+        from home_seek.api_server import InferenceEngine
+        import inspect
+        sig = inspect.signature(InferenceEngine.generate)
+        hint = sig.return_annotation
+        assert hint is not inspect.Parameter.empty, "generate() needs return type annotation"
+        hint_str = str(hint)
+        assert "list" in hint_str or "tuple" in hint_str, \
+            f"generate() return hint should mention list/tuple, got: {hint_str}"
+
+    def test_request_stats_dict_has_all_cli_fields(self):
+        """RequestStats.dict() must include all fields the CLI reads from server response."""
+        from home_seek.api_server import RequestStats
+        s = RequestStats()
+        s.encoding_tokens = 5
+        s.encoding_time_s = 8.0
+        s.decode_time_s = 10.0
+        s.generated_tokens = 9
+        d = s.dict()
+        for key in ('encoding_tokens', 'encoding_time_ms', 'encoding_speed_tps',
+                    'generated_tokens', 'decode_time_ms', 'decode_speed_tps'):
+            assert key in d, f"RequestStats.dict() missing key: {key}"
+
+    def test_request_stats_summary_no_ttft(self):
+        """RequestStats.summary() must NOT contain 'TTFT'.
+
+        TTFT is redundant with prefill time and was removed from CLI display.
+        """
+        from home_seek.api_server import RequestStats
+        s = RequestStats()
+        s.encoding_tokens = 5
+        s.encoding_time_s = 8.0
+        s.decode_time_s = 10.0
+        s.generated_tokens = 9
+        assert "TTFT" not in s.summary(), "TTFT must be removed from summary"

@@ -60,6 +60,12 @@ smoke:
 	$(UV) python -m home_seek.profiling_runner \
 		--prompt "Hello" --max-tokens 20 --temperature 0
 
+server:
+	$(UV) python -m home_seek server --port 8000
+
+cli:
+	$(UV) python -m home_seek cli --port 8000
+
 $(PROFILE_DIR):
 	mkdir -p $(PROFILE_DIR)
 

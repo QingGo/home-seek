@@ -155,3 +155,4 @@ weights
 artifacts/
 hot_experts.json
 .agent_memory.md
+hw_profile.json

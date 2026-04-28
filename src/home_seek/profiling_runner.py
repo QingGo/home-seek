@@ -17,7 +17,6 @@ Metrics collected:
 """
 
 import os
-import sys
 import json
 import time
 import argparse
@@ -25,10 +24,6 @@ import threading
 from collections import defaultdict
 
 import torch
-
-_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-_encoding_dir = os.path.join(_project_root, 'weights', 'encoding')
-sys.path.insert(0, os.path.abspath(_encoding_dir))
 
 from home_seek.inference_engine import HomeSeekInferenceEngine
 
@@ -141,6 +136,29 @@ class PerLayerTimer:
             key = stage
         self.events[key].append(duration_ms)
 
+    def snapshot(self) -> dict:
+        """Return copy of current counts per stage."""
+        return {k: len(v) for k, v in self.events.items()}
+
+    @staticmethod
+    def timer_snapshot(timer: 'PerLayerTimer') -> dict:
+        return timer.snapshot()
+
+    @staticmethod
+    def delta_summary(before: dict, after: dict) -> dict:
+        """Return dict of stage -> count, total_ms for the delta."""
+        result = {}
+        all_keys = set(before) | set(after)
+        for key in all_keys:
+            # only per-layer stages
+            if key in ('attention', 'ffn', 'mhc_attn', 'mhc_ffn', 'mhc_post',
+                       'embed', 'hc_head', 'norm', 'lm_head', 'total_layer', 'decode_step'):
+                count_before = before.get(key, 0)
+                count_after = after.get(key, 0)
+                if count_after > count_before:
+                    result[key] = {'count': count_after - count_before}
+        return result
+
     def summary(self):
         lines = []
         lines.append(f"{'Stage':<25} {'Mean(ms)':<10} {'Total(ms)':<10} {'Min(ms)':<10} {'Max(ms)':<10} {'Count':<8}")
@@ -180,6 +198,39 @@ class CacheMonitor:
         self.deq_times = []
         self.file_load_times = []
 
+    def snapshot(self) -> dict:
+        """Return serializable snapshot for differential profiling."""
+        return {
+            'hot_hits': self.hot_hits,
+            'hot_misses': self.hot_misses,
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'gpu_store_hits': self.gpu_store_hits,
+            'gpu_store_misses': self.gpu_store_misses,
+            'file_loads': self.file_loads,
+            'deq_n': len(self.deq_times),
+            'deq_total': sum(self.deq_times),
+            'file_n': len(self.file_load_times),
+            'file_total': sum(self.file_load_times),
+        }
+
+    @staticmethod
+    def delta(before: dict, after: dict) -> dict:
+        """Compute difference between two snapshots."""
+        return {
+            'hot_hits': after['hot_hits'] - before['hot_hits'],
+            'hot_misses': after['hot_misses'] - before['hot_misses'],
+            'cache_hits': after['cache_hits'] - before['cache_hits'],
+            'cache_misses': after['cache_misses'] - before['cache_misses'],
+            'gpu_store_hits': after['gpu_store_hits'] - before['gpu_store_hits'],
+            'gpu_store_misses': after['gpu_store_misses'] - before['gpu_store_misses'],
+            'file_loads': after['file_n'] - before['file_n'],
+            'deq_n': after['deq_n'] - before['deq_n'],
+            'deq_total': after['deq_total'] - before['deq_total'],
+            'file_n': after['file_n'] - before['file_n'],
+            'file_total': after['file_total'] - before['file_total'],
+        }
+
     def record_hot(self, hit: bool):
         if hit:
             self.hot_hits += 1
@@ -207,7 +258,18 @@ class CacheMonitor:
     def record_file_load_time(self, ms: float):
         self.file_load_times.append(ms)
 
-    def summary(self):
+    def summary(self, snap: dict | None = None):
+        s = snap or self.snapshot()
+        total_hot = s['hot_hits'] + s['hot_misses']
+        hot_rate = s['hot_hits'] / total_hot * 100 if total_hot > 0 else 0
+        total_cache = s['cache_hits'] + s['cache_misses']
+        cache_rate = s['cache_hits'] / total_cache * 100 if total_cache > 0 else 0
+        fl_n, fl_avg = s['file_n'], (s['file_total'] / s['file_n'] if s['file_n'] > 0 else 0)
+        return [
+            f"  Hot cache hits: {s['hot_hits']}, misses: {s['hot_misses']}  (hit rate: {hot_rate:.1f}%)",
+            f"  Raw cache hits: {s['cache_hits']}, misses: {s['cache_misses']}  (hit rate: {cache_rate:.1f}%)",
+            f"  File loads: {s['file_n']}  (avg {fl_avg:.1f}ms, total {s['file_total']/1000:.1f}s)",
+        ]
         total_hot = self.hot_hits + self.hot_misses
         hot_rate = self.hot_hits / total_hot * 100 if total_hot > 0 else 0
         total_cache = self.cache_hits + self.cache_misses
@@ -248,6 +310,26 @@ class LayerTrace:
         self.mhc_post_ms = [0.0] * num_layers
         self.expert_ids = [[] for _ in range(num_layers)]
         self.layer_total_ms = [0.0] * num_layers
+
+    def snapshot(self) -> dict:
+        return {
+            'attn_ms': self.attn_ms[:],
+            'ffn_ms': self.ffn_ms[:],
+            'mhc_attn_ms': self.mhc_attn_ms[:],
+            'mhc_ffn_ms': self.mhc_ffn_ms[:],
+            'mhc_post_ms': self.mhc_post_ms[:],
+        }
+
+    @staticmethod
+    def delta(before: dict, after: dict) -> dict:
+        num = len(before['attn_ms'])
+        return {
+            'attn_ms': [after['attn_ms'][i] - before['attn_ms'][i] for i in range(num)],
+            'ffn_ms': [after['ffn_ms'][i] - before['ffn_ms'][i] for i in range(num)],
+            'mhc_attn_ms': [after['mhc_attn_ms'][i] - before['mhc_attn_ms'][i] for i in range(num)],
+            'mhc_ffn_ms': [after['mhc_ffn_ms'][i] - before['mhc_ffn_ms'][i] for i in range(num)],
+            'mhc_post_ms': [after['mhc_post_ms'][i] - before['mhc_post_ms'][i] for i in range(num)],
+        }
 
     def summary(self):
         lines = ["Per-Layer Breakdown:"]
@@ -382,17 +464,63 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
     return engine
 
 
+def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, num_layers, tokenizer):
+    """Print single round's performance summary."""
+    out = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
+    print(f"\n  >>> {label} <<<")
+    print(f"  Output: {out[:80]}")
+    print()
+
+    decode_tps = result.get('decode_tokens_per_second', 0)
+    prefill_t = result.get('prefill_time_s', 0)
+    decode_t = result.get('decode_time_s', 0)
+    total_t = result['total_time_s']
+    prompt_tok = result['num_prompt_tokens']
+    decode_tok = max(1, result['num_generated_tokens'])
+
+    print(f"  {'Prefill':>12}  {'Decode':>12}  {'Total':>12}")
+    print(f"  {'-'*40}")
+    print(f"  {'time':>12}  {prefill_t:>10.2f}s  {decode_t:>10.2f}s  {total_t:>10.2f}s")
+    print(f"  {'t/s':>12}  {result.get('prefill_tokens_per_second',0):>10.1f}  {decode_tps:>10.2f}  {result['new_tokens_per_second']:>10.2f}")
+    print(f"  {'tokens':>12}  {prompt_tok:>10}  {decode_tok:>10}  {prompt_tok+decode_tok:>10}")
+    print(f"  {'latency':>12}  {'':>10}  {decode_t / decode_tok * 1000:>9.1f}ms/tok")
+    print(f"  {'Peak mem':>12}  {result['peak_memory_gb']:>9.1f}GB")
+
+    # Cache + file I/O
+    fl_n, fl_total = cache_mon_snap['file_n'], cache_mon_snap['file_total']
+    total_cache = cache_mon_snap['cache_hits'] + cache_mon_snap['cache_misses']
+    hit_rate = cache_mon_snap['cache_hits'] / total_cache * 100 if total_cache > 0 else 0
+    print(f"\n  Cache: {cache_mon_snap['cache_hits']}h/{cache_mon_snap['cache_misses']}m ({hit_rate:.0f}%)")
+    if fl_n > 0:
+        print(f"  File:  {fl_n} loads, {fl_total/1000:.1f}s total, {fl_total/fl_n:.1f}ms avg")
+
+    # Layer total
+    total_attn = sum(layer_snap['attn_ms'])
+    total_ffn = sum(layer_snap['ffn_ms'])
+    total_misc = sum(layer_snap['mhc_attn_ms']) + sum(layer_snap['mhc_ffn_ms']) + sum(layer_snap['mhc_post_ms'])
+    total_layer = total_attn + total_ffn + total_misc
+    print(f"\n  Layer:  Attn={total_attn:.0f}ms  FFN={total_ffn:.0f}ms  Misc={total_misc:.0f}ms  Total={total_layer:.0f}ms")
+    print(f"  Per-tok layer: {total_layer/decode_tok:.0f}ms/tok  FFN: {total_ffn/decode_tok:.0f}ms/tok")
+
+
 def run_profile(args):
     weight_dir = args.weight_dir
-    prompt = args.prompt
     max_new_tokens = args.max_tokens
     temperature = args.temperature
     use_mtp = args.use_mtp
+    num_rounds = getattr(args, 'rounds', 1)
+    prompts = getattr(args, 'prompts', args.prompt)
 
     print("=" * 70)
     print("HomeSeek Profiling Runner")
     print(f"  Model: {weight_dir}")
-    print(f"  Prompt: \"{prompt}\"")
+    print(f"  Rounds: {num_rounds}")
+    if isinstance(prompts, list):
+        print(f"  Prompts: {len(prompts)}")
+        for p in prompts:
+            print(f"    - \"{p[:50]}\"")
+    else:
+        print(f"  Prompt: \"{prompts}\"")
     print(f"  Max tokens: {max_new_tokens}")
     print(f"  Temperature: {temperature}")
     print(f"  MTP: {use_mtp}")
@@ -418,15 +546,23 @@ def run_profile(args):
     init_time = time.time() - t_init
     print(f"  Init done in {init_time:.2f}s")
 
-    print("\n[2/5] Tokenizing prompt...")
+    print("\n[2/5] Preparing prompts...")
     from transformers import PreTrainedTokenizerFast
     tokenizer_path = os.path.join(weight_dir, "tokenizer.json")
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-    from encoding_dsv4 import encode_messages
-    prompt_text = encode_messages([{"role": "user", "content": prompt}], thinking_mode="chat")
-    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(engine.device)
-    num_prompt_tokens = input_ids.shape[1]
-    print(f"  Prompt tokens: {num_prompt_tokens}")
+    from home_seek.encoding_dsv4 import encode_messages
+
+    if isinstance(prompts, str):
+        prompts_list = [prompts] * num_rounds
+    else:
+        prompts_list = prompts[:num_rounds]
+
+    encoded_inputs = []
+    for p in prompts_list:
+        text = encode_messages([{"role": "user", "content": p}], thinking_mode="chat")
+        ids = tokenizer.encode(text, return_tensors="pt").to(engine.device)
+        encoded_inputs.append(ids)
+        print(f"  Prompt \"{p[:40]}\" -> {ids.shape[1]} tokens")
 
     timer = PerLayerTimer()
     cache_mon = CacheMonitor()
@@ -435,152 +571,216 @@ def run_profile(args):
     mem_trace.append(("init", -1, torch.cuda.memory_allocated()))
 
     patch_engine(engine, timer, cache_mon, layer_trace, mem_trace)
-
     util_mon = UtilMonitor()
 
-    print("\n[3/5] Baseline...")
-    torch.cuda.reset_peak_memory_stats()
-    mem_baseline = torch.cuda.memory_allocated()
-    print(f"  Memory baseline: {mem_baseline / (1024**3):.2f} GB")
-
-    print("\n[4/5] Running inference ...")
+    print("\n[3/5] Running inference ...")
     print("-" * 70)
-    t_gen_start = time.time()
-    util_mon.start()
 
-    with torch.no_grad():
-        result = engine.generate(input_ids, max_new_tokens=max_new_tokens, temperature=temperature)
+    round_results = []
+    for round_idx in range(num_rounds):
+        input_ids = encoded_inputs[round_idx % len(encoded_inputs)]
 
-    util_mon.stop()
+        if round_idx > 0:
+            engine._deq_cache.clear()
 
-    print("\n[5/5] Results")
-    print("-" * 70)
-    out = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
-    print("\nGenerated Text:")
-    print(out)
-    print()
+        # Snapshot monitors before
+        cache_before = cache_mon.snapshot()
+        timer_before = timer.snapshot()
+        layer_before = layer_trace.snapshot()
+        mem_before = torch.cuda.memory_allocated()
 
-    print("-" * 70)
-    print("Performance Summary:")
-    print(f"  Total time: {result['total_time_s']:.2f}s")
-    print(f"  Generated tokens: {result['num_generated_tokens']}")
-    print(f"  Throughput (with prefill): {result['new_tokens_per_second']:.2f} t/s")
-    decode_tps = result.get('decode_tokens_per_second', 0)
-    prefill_t = result.get('prefill_time_s', 0)
-    decode_t = result.get('decode_time_s', 0)
-    prompt_tok = result['num_prompt_tokens']
-    decode_tok = max(1, result['num_generated_tokens'])
-    has_split = 'prefill_time_s' in result and result['prefill_time_s'] > 0
-    if has_split:
-        print(f"  Prefill time:            {prefill_t:.2f}s  ({prompt_tok} tok, {result['prefill_tokens_per_second']:.1f} t/s)")
-        print(f"  TTFT:                    {prefill_t:.2f}s")
-        print(f"  Decode time:             {decode_t:.2f}s")
-        print(f"  Decode throughput:       {decode_tps:.2f} t/s")
-        print(f"  Decode latency:          {decode_t / decode_tok * 1000:.1f} ms/tok")
-    else:
-        print("  Prefill/decode:          not separated (engine v14 or older)")
-        print(f"  Avg per-token (incl prefill): {result['total_time_s'] / decode_tok * 1000:.0f} ms/tok")
-    print(f"  Peak memory: {result['peak_memory_gb']:.2f} GB")
-    print(f"  Prompt tokens: {result['num_prompt_tokens']}")
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
-    print(f"\n{'-' * 70}")
-    print(util_mon.summary())
+        util_mon.start()
+        with torch.no_grad():
+            result = engine.generate(input_ids, max_new_tokens=max_new_tokens,
+                                      temperature=temperature)
+        util_mon.stop()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
 
-    print(f"\n{'-' * 70}")
-    print(layer_trace.summary())
+        # Snapshot after
+        cache_after = cache_mon.snapshot()
+        timer_after = timer.snapshot()
+        layer_after = layer_trace.snapshot()
 
-    print(f"\n{'-' * 70}")
-    print(timer.summary())
+        # Compute deltas
+        cache_delta = CacheMonitor.delta(cache_before, cache_after)
+        layer_delta = LayerTrace.delta(layer_before, layer_after)
+        result['_elapsed'] = elapsed
+        result['_peak_mem'] = torch.cuda.max_memory_allocated() / (1024**3)
 
-    print(f"\n{'-' * 70}")
-    print(cache_mon.summary())
+        label = f"Round {round_idx + 1}"
+        if isinstance(prompts_list[round_idx], str):
+            pname = prompts_list[round_idx][:30]
+            label += f" \"{pname}\""
 
-    print(f"\n{'-' * 70}")
-    print("Bottleneck Analysis:")
-    total_attn = sum(layer_trace.attn_ms) / 1000
-    total_ffn = sum(layer_trace.ffn_ms) / 1000
-    total_misc = sum(layer_trace.mhc_attn_ms) / 1000 + sum(layer_trace.mhc_ffn_ms) / 1000
-    total_layer = total_attn + total_ffn + total_misc
-    gen_tok = max(1, result['num_generated_tokens'])
+        _print_round_result(label, result, cache_delta, layer_delta,
+                           {'before': timer_before, 'after': timer_after},
+                           engine.config.num_hidden_layers, tokenizer)
+        print()
 
-    print(f"  Layer loop total:   {total_layer:.2f}s  ({total_layer/result['total_time_s']*100:.0f}% of total)")
-    print(f"  Attention:          {total_attn:.2f}s  ({total_attn/total_layer*100:.1f}% of layer)")
-    print(f"  FFN:                {total_ffn:.2f}s  ({total_ffn/total_layer*100:.1f}% of layer)")
-    print(f"  MHC (pre+post):     {total_misc:.2f}s  ({total_misc/total_layer*100:.1f}% of layer)")
+        round_results.append({
+            'label': label,
+            'result': result,
+            'cache': cache_delta,
+            'layer': layer_delta,
+        })
 
-    if total_layer > 0:
-        per_token_layer = total_layer / result['num_generated_tokens'] * 1000
-        per_token_ffn = total_ffn / result['num_generated_tokens'] * 1000
-        print(f"  Per-token layer loop: {per_token_layer:.0f} ms/token")
-        print(f"  Per-token FFN:        {per_token_ffn:.0f} ms/token")
+    # Multi-round comparison table
+    if num_rounds > 1:
+        print("=" * 70)
+        print("Multi-Round Comparison")
+        print("=" * 70)
+        header = f"{'Round':<15} {'t/s':>8} {'Decode':>8} {'File(s)':>9} {'Loads':>7} {'Hit%':>7} {'Attn':>7} {'FFN':>7} {'Mem':>7}"
+        print(header)
+        print("-" * len(header))
+        for r in round_results:
+            res = r['result']
+            tps = res.get('decode_tokens_per_second', 0)
+            dec = res.get('decode_time_s', 0)
+            c = r['cache']
+            hit = c['cache_hits'] / max(c['cache_hits'] + c['cache_misses'], 1) * 100
+            l = r['layer']
+            attn = sum(l['attn_ms'])
+            ffn = sum(l['ffn_ms'])
+            mem = res.get('peak_memory_gb', 0)
+            print(f"{r['label']:<15} {tps:>8.2f} {dec:>8.2f}s {c['file_total']/1000:>8.2f}s "
+                  f"{c['file_n']:>7} {hit:>6.0f}% {attn:>6.0f} {ffn:>6.0f} {mem:>6.1f}")
 
-    hot_rate = cache_mon.hot_hits / max(cache_mon.hot_hits + cache_mon.hot_misses, 1) * 100
-    print(f"  Hot cache hit rate: {hot_rate:.1f}%")
-    if hot_rate < 85:
-        print(f"  >> Hot cache命中率偏低({hot_rate:.1f}%)")
-
-    idle_ratio = util_mon.gpu_idle_ratio()
-    if idle_ratio >= 0:
-        print(f"  GPU idle ratio (util<30%): {idle_ratio*100:.0f}%")
-        if idle_ratio > 0.5:
-            print("  >> GPU大量时间空闲，瓶颈在CPU/PCIe/File I/O")
-
-    total_file_io_ms = sum(cache_mon.file_load_times)
-    print(f"  Total file I/O time: {total_file_io_ms/1000:.1f}s  ({total_file_io_ms/1000/result['total_time_s']*100:.0f}% of total)")
-    if total_file_io_ms / result['total_time_s'] > 0.2:
-        print(f"  >> File I/O占比过高({total_file_io_ms/1000/result['total_time_s']*100:.0f}%)，专家权重从文件读取是主要瓶颈")
-
+    # Save results
     if args.output:
-        output_data = {
-            "config": {
-                "prompt": prompt,
-                "prompt_tokens": num_prompt_tokens,
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "mtp": use_mtp,
+        save_data = {
+            'performance': {
+                'total_time_s': round_results[-1]['result'].get('total_time_s', 0),
+                'tokens_per_second': round_results[-1]['result'].get('new_tokens_per_second', 0),
+                'ms_per_token': round_results[-1]['result'].get('total_time_s', 0) / max(1, round_results[-1]['result'].get('num_generated_tokens', 1)) * 1000,
+                'peak_memory_gb': round_results[-1]['result'].get('peak_memory_gb', 0),
+                'num_generated': round_results[-1]['result'].get('num_generated_tokens', 0),
             },
-            "performance": {
-                "total_time_s": result["total_time_s"],
-                "tokens_per_second": result["new_tokens_per_second"],
-                "ms_per_token": result["total_time_s"] / gen_tok * 1000,
-                "peak_memory_gb": result["peak_memory_gb"],
-                "num_generated": result["num_generated_tokens"],
-            },
-            "layers": {
-                "attn_ms": layer_trace.attn_ms,
-                "ffn_ms": layer_trace.ffn_ms,
-            },
-            "cache": {
-                "hot_hits": cache_mon.hot_hits,
-                "hot_misses": cache_mon.hot_misses,
-                "file_loads": cache_mon.file_loads,
-            },
+            'rounds': [{
+                'label': r['label'],
+                'decode_tps': r['result'].get('decode_tokens_per_second', 0),
+                'decode_time_s': r['result'].get('decode_time_s', 0),
+                'cache': r['cache'],
+            } for r in round_results],
         }
-        with open(args.output, "w") as f:
-            json.dump(output_data, f, indent=2, default=str)
+        out_dir = os.path.dirname(args.output)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.output, 'w') as f:
+            json.dump(save_data, f, indent=2)
         print(f"\nResults saved to {args.output}")
 
-    return result
+    if num_rounds == 1:
+        last = round_results[0]
+        result = last['result']
+        print(f"\n{'-' * 70}")
+        print(util_mon.summary())
+
+        print(f"\n{'-' * 70}")
+        print(layer_trace.summary())
+
+        print(f"\n{'-' * 70}")
+        print(timer.summary())
+
+        print(f"\n{'-' * 70}")
+        print('\n'.join(cache_mon.summary()))
+
+        print(f"\n{'-' * 70}")
+        print("Bottleneck Analysis:")
+        total_attn = sum(layer_trace.attn_ms) / 1000
+        total_ffn = sum(layer_trace.ffn_ms) / 1000
+        total_misc = sum(layer_trace.mhc_attn_ms) / 1000 + sum(layer_trace.mhc_ffn_ms) / 1000
+        total_layer = total_attn + total_ffn + total_misc
+        gen_tok = max(1, result['num_generated_tokens'])
+
+        print(f"  Layer loop total:   {total_layer:.2f}s  ({total_layer/result['total_time_s']*100:.0f}% of total)")
+        print(f"  Attention:          {total_attn:.2f}s  ({total_attn/total_layer*100:.1f}% of layer)")
+        print(f"  FFN:                {total_ffn:.2f}s  ({total_ffn/total_layer*100:.1f}% of layer)")
+        print(f"  MHC (pre+post):     {total_misc:.2f}s  ({total_misc/total_layer*100:.1f}% of layer)")
+
+        if total_layer > 0:
+            per_token_layer = total_layer / result['num_generated_tokens'] * 1000
+            per_token_ffn = total_ffn / result['num_generated_tokens'] * 1000
+            print(f"  Per-token layer loop: {per_token_layer:.0f} ms/token")
+            print(f"  Per-token FFN:        {per_token_ffn:.0f} ms/token")
+
+        hot_rate = cache_mon.hot_hits / max(cache_mon.hot_hits + cache_mon.hot_misses, 1) * 100
+        print(f"  Hot cache hit rate: {hot_rate:.1f}%")
+        if hot_rate < 85:
+            print(f"  >> Hot cache命中率偏低({hot_rate:.1f}%)")
+
+        idle_ratio = util_mon.gpu_idle_ratio()
+        if idle_ratio >= 0:
+            print(f"  GPU idle ratio (util<30%): {idle_ratio*100:.0f}%")
+            if idle_ratio > 0.5:
+                print("  >> GPU大量时间空闲，瓶颈在CPU/PCIe/File I/O")
+
+        total_file_io_ms = last['cache']['file_total']
+        print(f"  Total file I/O time: {total_file_io_ms/1000:.1f}s  ({total_file_io_ms/1000/result['total_time_s']*100:.0f}% of total)")
+        if total_file_io_ms / result['total_time_s'] > 0.2:
+            print(f"  >> File I/O占比过高({total_file_io_ms/1000/result['total_time_s']*100:.0f}%)，专家权重从文件读取是主要瓶颈")
+
+        if args.output:
+            output_data = {
+                "config": {
+                    "prompt": str(prompts_list[0]),
+                    "prompt_tokens": result['num_prompt_tokens'],
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "mtp": use_mtp,
+                },
+                "performance": {
+                    "total_time_s": result["total_time_s"],
+                    "tokens_per_second": result["new_tokens_per_second"],
+                    "ms_per_token": result["total_time_s"] / gen_tok * 1000,
+                    "peak_memory_gb": result["peak_memory_gb"],
+                    "num_generated": result["num_generated_tokens"],
+                },
+                "layers": {
+                    "attn_ms": layer_trace.attn_ms,
+                    "ffn_ms": layer_trace.ffn_ms,
+                },
+                "cache": last['cache'],
+            }
+            with open(args.output, "w") as f:
+                json.dump(output_data, f, indent=2, default=str)
+            print(f"\nResults saved to {args.output}")
+
+    return round_results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HomeSeek End-to-End Profiling Runner")
+        description="End-to-end profiling for HomeSeekInferenceEngine")
     parser.add_argument("--weight-dir", default="weights")
-    parser.add_argument("--prompt", default="介绍一下你自己")
-    parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--prompt", default="Hello",
+                        help="Single prompt, or first prompt when --prompts used")
+    parser.add_argument("--prompts", nargs="+", default=None,
+                        help="List of prompts for multi-round. Overrides --prompt")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="Number of rounds (default 1). Prompts cycle if fewer prompts than rounds")
+    parser.add_argument("--max-tokens", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--use-mtp", action="store_true")
     parser.add_argument("--mtp-eager", action="store_true",
-                        help="Eager MTP: accept all drafts without verification (fast but risky)")
+                        help="MTP eager: accept all draft tokens without verification")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--preload-all", action="store_true",
-                        help="Pre-load all experts to CPU RAM during init (eliminates file I/O)")
+                        help="Preload all experts into pinned CPU memory at init")
     parser.add_argument("--hot-experts", default="hot_experts.json")
     parser.add_argument("--no-triton", action="store_true",
-                        help="Disable Triton kernels (use PyTorch fallback for MHC)")
+                        help="Disable Triton kernels (use PyTorch fallbacks)")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
+    if args.prompts:
+        args.prompts = list(args.prompts)
+        args.rounds = max(args.rounds, len(args.prompts))
+    else:
+        args.prompts = args.prompt
     run_profile(args)
 
 
