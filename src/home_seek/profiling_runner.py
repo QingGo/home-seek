@@ -21,11 +21,14 @@ import json
 import time
 import argparse
 import threading
+import logging
 from collections import defaultdict
 
 import torch
 
 from home_seek.inference_engine import HomeSeekInferenceEngine
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
 
 class UtilMonitor:

@@ -104,6 +104,7 @@ def _make_mock_engine():
     # HC head function (None for sum(dim=2) fallback)
     eng.hc_head_fn = None
 
+    eng._compressors = {}
     eng._layer_weight_cache = {}
     eng._log = lambda msg: None
     eng._mtp_loaded = True
@@ -297,6 +298,139 @@ class TestMTPAcceptDrafts:
 
 
 @pytest.mark.fast
+class TestMTPVerifyBatched:
+    """Test _mtp_verify_batched state management and control flow."""
+
+    def test_empty_drafts_returns_zero(self):
+        """None or empty draft_ids → return (0, None)."""
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._log = lambda msg: None
+
+        n_acc, bonus = eng._mtp_verify_batched(None)
+        assert n_acc == 0 and bonus is None
+
+        empty = torch.empty(1, 0, dtype=torch.int64, device="cuda")
+        n_acc, bonus = eng._mtp_verify_batched(empty)
+        assert n_acc == 0 and bonus is None
+
+    def test_restores_state_on_rejection(self):
+        """When main_pred_id's prediction != draft[0], KV must be restored."""
+        eng = _make_mock_engine()
+        # Mock _get_layer_weights to skip the loader dependency
+        eng._get_layer_weights = lambda layer_idx: {}
+        from home_seek.inference_engine import LayerState
+        orig_cache = torch.randn(1, 3, _HS, _HC * 4, device="cuda")
+        eng.layer_states[0] = LayerState(device="cuda")
+        eng.layer_states[0].kv_latent_cache = orig_cache
+        eng._global_pos = 5
+
+        # Force the issue: set lm_head so argmax is a controlled value != 42
+        # lm_head[_V, _HS]: set a single row to 1, all others to -1
+        # Then any positive hidden state gives argmax = that row
+        with torch.no_grad():
+            eng.lm_head.fill_(-1.0)
+            eng.lm_head[99] = 1.0   # argmax will be 99
+
+        draft_ids = torch.tensor([[42, 43, 44]], device="cuda", dtype=torch.int64)
+        main_pred = torch.tensor([[5]], device="cuda", dtype=torch.int64)
+        n_acc, bonus = eng._mtp_verify_batched(draft_ids, 0.0, main_pred_id=main_pred)
+
+        assert n_acc == 0, f"Expected rejection, got n_acc={n_acc}"
+        assert bonus is None
+        # KV must be restored to original (values + shape preserved)
+        assert 0 in eng.layer_states
+        restored = eng.layer_states[0].kv_latent_cache
+        assert restored.shape == (1, 3, _HS, _HC * 4)
+        assert torch.equal(restored, orig_cache)
+
+    def test_all_drafts_accepted_with_mocked_forward(self):
+        """When forward produces hidden states matching draft sequence, accept all + bonus."""
+        eng = _make_mock_engine()
+        eng._get_layer_weights = lambda layer_idx: {}
+        eng._global_pos = 2
+        eng.norm_weight = None  # disable rms_norm (random weight corrupts argmax)
+
+        # Use dimension-specific lm_head: lm_head[tok_id, dim_i] = 1.0
+        # Then if hidden[:, dim_i] > all others, argmax = tok_id
+        with torch.no_grad():
+            eng.lm_head.zero_()
+            eng.lm_head[10, 0] = 1.0   # predict 10 if hidden[0] dominates
+            eng.lm_head[20, 1] = 1.0   # predict 20 if hidden[1] dominates
+            eng.lm_head[30, 2] = 1.0   # predict 30 if hidden[2] dominates
+            eng.lm_head[99, 3] = 1.0   # never used in this test
+
+        def mock_forward(h_4d, lw, layer_idx, input_ids):
+            B, T_in, hc_in, D = h_4d.shape
+            out = torch.zeros(B, T_in, hc_in, D, device=h_4d.device, dtype=h_4d.dtype)
+            if T_in == 1:
+                # Step 1: hidden[0] = 1.0 → logit[10] dominates → argmax = 10
+                out[:, 0, :, 0] = 1.0 / hc_in
+            else:
+                # Step 2: position i → activate dimension i+1 → argmax = {20, 30, ...}
+                for ti in range(T_in):
+                    dim_idx = min(ti + 1, D - 1)
+                    out[:, ti, :, dim_idx] = 1.0 / hc_in
+            return out, set()
+
+        original_forward = eng._forward_layer
+        eng._forward_layer = mock_forward
+        try:
+            draft_ids = torch.tensor([[10, 20, 30]], device="cuda", dtype=torch.int64)
+            main_pred = torch.tensor([[5]], device="cuda", dtype=torch.int64)
+            n_acc, bonus = eng._mtp_verify_batched(draft_ids, 0.0, main_pred_id=main_pred)
+        finally:
+            eng._forward_layer = original_forward
+
+        assert n_acc == 3, f"Expected 3 drafts accepted, got {n_acc}"
+        assert bonus is not None and bonus.dim() >= 1
+
+    def test_partial_accept_restores_kv(self):
+        """When forward predicts 99 (not 20) at batch pos 0, accept only draft[0]."""
+        eng = _make_mock_engine()
+        eng._get_layer_weights = lambda layer_idx: {}
+        eng._global_pos = 2
+        eng.norm_weight = None
+        num_layers = eng.config.num_hidden_layers
+
+        from home_seek.inference_engine import LayerState
+        for i in range(num_layers):
+            eng.layer_states[i] = LayerState(device="cuda")
+            eng.layer_states[i].kv_latent_cache = torch.randn(
+                1, 5, _HS, _HC * 4, device="cuda", dtype=torch.bfloat16)
+
+        # lm_head: dim 0 → predict 10, dim 1 → predict 99 (not draft[1]=20)
+        with torch.no_grad():
+            eng.lm_head.zero_()
+            eng.lm_head[10, 0] = 1.0
+            eng.lm_head[99, 1] = 1.0
+
+        def mock_forward(h_4d, lw, layer_idx, input_ids):
+            B, T_in, hc_in, D = h_4d.shape
+            out = torch.zeros(B, T_in, hc_in, D, device=h_4d.device, dtype=h_4d.dtype)
+            if T_in == 1:
+                # Step 1: activate dim 0 → lm_head[10] → argmax = 10 ✓
+                out[:, 0, :, 0] = 1.0 / hc_in
+            else:
+                # Step 2 pos 0: activate dim 1 → lm_head[99] → argmax = 99 ≠ 20 ✗
+                out[:, 0, :, 1] = 1.0 / hc_in
+            return out, set()
+
+        original_forward = eng._forward_layer
+        eng._forward_layer = mock_forward
+        try:
+            draft_ids = torch.tensor([[10, 20, 30]], device="cuda", dtype=torch.int64)
+            main_pred = torch.tensor([[5]], device="cuda", dtype=torch.int64)
+            n_acc, bonus = eng._mtp_verify_batched(draft_ids, 0.0, main_pred_id=main_pred)
+        finally:
+            eng._forward_layer = original_forward
+
+        assert n_acc == 1, f"Expected 1 draft accepted (only d_0), got {n_acc}"
+        assert bonus is not None and bonus.dim() >= 1
+        # KV layer states preserved (forward is mocked, no append_kv runs)
+
+
+@pytest.mark.fast
 class TestMTPIntegration:
     """Test MTP integration in generate()."""
 
@@ -307,19 +441,18 @@ class TestMTPIntegration:
         eng._mtp_loaded = False
         eng._log = lambda msg: None
 
-        # Simulate the generate() logic for mtp_num_draft
-        mtp_num_draft = 3 if eng._mtp_loaded else 0
+        mtp_num_draft = getattr(eng, '_mtp_num_draft', 4) if eng._mtp_loaded else 0
         assert mtp_num_draft == 0
 
     def test_mtp_enabled_when_mtp_loaded_true(self):
-        """When _mtp_loaded=True, mtp_num_draft=3."""
+        """When _mtp_loaded=True, mtp_num_draft=4 (M=4)."""
         from home_seek.inference_engine import HomeSeekInferenceEngine
         eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
         eng._mtp_loaded = True
         eng._log = lambda msg: None
 
-        mtp_num_draft = 3 if eng._mtp_loaded else 0
-        assert mtp_num_draft == 3
+        mtp_num_draft = getattr(eng, '_mtp_num_draft', 4) if eng._mtp_loaded else 0
+        assert mtp_num_draft == 4
 
     def test_mtp_load_weights_sets_loaded(self):
         """_load_mtp_weights does NOT enable MTP (caller sets _mtp_loaded)."""

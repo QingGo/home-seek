@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.2 — Server mode + CLI + OOM fixes。
+DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.4 — CPU cache + MTP optimizations。
 
 ## 纪律
 
@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.2 — Server mode + CLI + O
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (182 pass, 2 skip)
+make test-unit         # 单元测试 (197 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 单轮 profile (--rounds 1)
 make server            # 启动 API 服务器
@@ -94,30 +94,32 @@ tests/                             # 测试
 - 实施记录: `docs/implementation_notes.md`
 - 里程碑记忆: `.agent_memory.md` (基线+瓶颈+下一步)
 
-## 缓存体系 (V21)
+## 缓存体系 (V21.4)
 
 ```
 请求 expert (layer, eid)
-  └─ ExpertCacheManager.get(layer, eid)        ← 统一入口 (V21)
-       ├─ 1. _gpu_hot (GPU BF16, ~64 × 48MB, FIFO evict)
+  └─ ExpertCacheManager (统一入口, 但引擎实际走自己的 _gpu_hot / _gpu_bf16 / ExpertWeightCache)
+       ├─ 1. _gpu_hot (GPU BF16, ~64 × 48MB, FIFO evict; 启动时预装 hot_experts.json)
        ├─ 2. _gpu_bf16 (GPU BF16 LRU, ~100 × 48MB, 自动淘汰)
-       ├─ 3. ExpertWeightCache (CPU FP4, 5120 条, pin=永不淘汰)
-       │    ├─ ~2118 pinned (hot×43 + hash×3)
-       │    ├─ ~256 pinned (MTP experts)
-       │    └─ ~2746 unpinned (LRU)
-       └─ 4. safetensors mmap (RAID 1.5 GB/s)
+       ├─ 3. ExpertWeightCache (CPU FP4, ~3292 条, pin=永不淘汰)
+       │    ├─ ~2103 pinned (hot×43 + hash×3 + MTP×256)
+       │    └─ ~1189 unpinned (LRU, 跨层条带预载)
+       └─ 4. safetensors mmap (page cache, RAID 1.5 GB/s)
+
+V21.4 关键: _per_expert_bytes = I*D*51//32 ≈ 12.75 MB (f8 scale 不转 fp32).
+cache 大小与 page cache 平衡: ~45 GB CPU cache + ~45 GB page cache. 留一半 RAM 给 OS.
 
 共享专家:
   └─ _shared_expert_weights (GPU, 43 层 FP8, lazily dequant → BF16)
      └─ M=1 decode: cuBLAS, Triton if M>1
 
-MTP 模块:
+MTP 模块 (V21.4):
   ├─ _mtp_weights: 33 非专家权重 (GPU BF16)
   ├─ ExpertWeightCache: 256 专家 (CPU FP4 pinned)
-  ├─ _mtp_generate_draft: 自回归生成 draft
-  └─ _mtp_verify_batched: 批验证 (43 层, causal mask)
+  ├─ _mtp_generate_draft: 自回归生成 draft (默认 M=2, argmax 当 temperature=0)
+  └─ _mtp_verify_batched: 批验证 (43 层, causal mask, temperature 传播)
 
-_forward_layer 共享方法 (V21): 消除 generate/decode/MTP verify 间 5 处重复的层循环.
+_forward_layer 共享方法: 所有层 forward 走 self._forward_layer(h, lw, layer_idx, input_ids).
 ```
 
 Server: `home-seek server` / `home-seek cli` / `home-seek download`
@@ -158,6 +160,9 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 - **`_forward_layer` 共享方法**: 不要直接复制粘贴层循环; 所有层 forward 都走 `self._forward_layer(h, lw, layer_idx, input_ids)`
 - **`encoding_dsv4` 路径**: V21 使用 `_project_root` 绝对路径计算, 不依赖 `__file__` 相对层级
 - **日志**: 使用 `logging.getLogger(__name__)` 而非 `print()`. `_log` 方法内部调用 `_logger.info()`
+- **V21.4 Thread-safe cache**: `ExpertWeightCache.put()` 包装 KeyError 处理多线程并发 eviction
+- **V21.4 f8 scale**: `_make_raw_entry` 保持 float8_e8m0fnu scale 不转 fp32 (4x 内存节省). `load_fp4_weight` 内部自动 to(f32)
+- **V21.4 cache sizing**: `min(_max_by_ram // 2, total_experts)` — max 一半 RAM 给 CPU cache, 留另一半给 page cache
 
 ## Triton Kernel 铁律
 

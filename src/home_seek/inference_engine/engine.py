@@ -104,23 +104,27 @@ class HomeSeekInferenceEngine:
         if self.hw_profile is None:
             self.hw_profile = probe_hardware(force=True, weight_dir=weight_dir)
         try:
-            _cgroup_max = 96 * 1024**3  # fallback: 96 GB = 90 GiB
+            _cgroup_max = 96 * 1024**3
             for _p in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
                 if os.path.exists(_p):
                     with open(_p) as _f:
                         _v = _f.read().strip()
-                    if _v.isdigit() and int(_v) < 10**15:  # sane limit
+                    if _v.isdigit() and int(_v) < 10**15:
                         _cgroup_max = int(_v)
                         break
             _avail_bytes = _cgroup_max
-            _per_expert_bytes = 30 * 1024 * 1024  # ~30 MB per FP4 expert
-            _reserve_bytes = 4 * 1024**3  # engine + OS
+            _I = self.config.moe_intermediate_size
+            _D = self.config.hidden_size
+            _per_expert_bytes = int(_I * _D * 51 / 32)
+            _reserve_bytes = 8 * 1024**3
             _max_by_ram = max(0, (_avail_bytes - _reserve_bytes) // _per_expert_bytes)
-            cache_size = max(1024, min(5120, _max_by_ram))
+            _total_experts = self.config.num_hidden_layers * self.config.n_routed_experts
+            cache_size = max(2048, min(_max_by_ram // 2, _total_experts))
             self._log(f"Host: {_avail_bytes/1e9:.0f} GB cgroup limit, "
+                      f"_per_expert={_per_expert_bytes/1e6:.1f} MB, "
                       f"cache_size={cache_size} (~{cache_size*_per_expert_bytes/1e9:.0f} GB)")
         except Exception:
-            cache_size = 4096
+            cache_size = 8192
             self._log(f"Host: unknown RAM, cache_size={cache_size}")
         self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
         self.layer_states: dict[int, LayerState] = {}
@@ -142,19 +146,29 @@ class HomeSeekInferenceEngine:
         self._gpu_hot_experts: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         _vram_free = max(self.hw_profile.vram_free_gb, 8.0)
         _expert_bf16_gb = 48.0 / 1024
-        self._max_hot_experts = max(16, min(int((_vram_free - 4) * 0.2 / _expert_bf16_gb), 64))
+        self._max_hot_experts = max(16, min(int((_vram_free - 4) * 0.20 / _expert_bf16_gb), 64))
         self._gpu_bf16_cache: OrderedDict = OrderedDict()
         _bf16_budget = max(1, _vram_free - 3)
-        self._max_bf16_cache = max(16, min(int(_bf16_budget * 0.8 / _expert_bf16_gb), 100))
+        self._max_bf16_cache = max(16, min(int(_bf16_budget * 0.80 / _expert_bf16_gb), 100))
+        # Per-layer online hot usage tracking for dynamic GPU cache update
+        # Per-layer online hot usage tracking for dynamic GPU cache update
+        self._hot_usage_counter: dict[int, dict[int, int]] = {}
+        self._hot_usage_window: list[tuple[int, int]] = []
+        self._hot_usage_window_size = 1024
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._prefetch_enabled = True
+        self._prefetch_prev_layer_eids: dict[int, list[int]] = {}
+        self._prefetch_current_eids: dict[int, list[int]] = {}
 
         self._shared_expert_weights: dict[int, tuple | None] = {}
         self._shared_experts_loaded = False
         self._mtp_weights: dict[str, torch.Tensor] = {}
         self._mtp_loaded = False
         self._mtp_eager = False
+        self._last_routed_eids: list[int] = []
         self._warmed_up = False
         self._layer_weight_cache: dict[int, dict[str, torch.Tensor]] = {}
         self._phase = "idle"
@@ -179,7 +193,9 @@ class HomeSeekInferenceEngine:
             self._preload_hot_experts_cpu_cache()
             self._preload_gpu_hot_experts()
         self._stop_token_ids = self._load_stop_token_ids()
-        if preload_all:
+        if not preload_all:
+            self._conditional_preload()
+        else:
             self._preload_all_experts()
         warmup_ok = self._warmup()
         if not warmup_ok:
@@ -859,7 +875,9 @@ class HomeSeekInferenceEngine:
             dev = "cpu"
             data = data.to(dev).pin_memory()
             if scale is not None:
-                if scale.dtype != torch.float32:
+                if scale.dtype == torch.float8_e8m0fnu:
+                    scale = scale.to(dev).pin_memory()
+                elif scale.dtype != torch.float32:
                     scale = scale.to(torch.float32).to(dev).pin_memory()
                 else:
                     scale = scale.to(dev).pin_memory()
@@ -1063,6 +1081,9 @@ class HomeSeekInferenceEngine:
             topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
         else:
             topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
+
+        self._last_routed_eids = sorted(set(
+            int(x) for x in topk_idx.flatten().tolist() if x >= 0))
 
         ffn_out = torch.zeros_like(hidden_states)
         flat_topk_idx = topk_idx.reshape(total_tokens, self.config.num_experts_per_tok)
@@ -1321,9 +1342,9 @@ class HomeSeekInferenceEngine:
             w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
             if w1 is None:
                 continue
-            s1_p = s1.to(torch.float32).to("cpu").pin_memory() if s1 is not None else None
-            s3_p = s3.to(torch.float32).to("cpu").pin_memory() if s3 is not None else None
-            s2_p = s2.to(torch.float32).to("cpu").pin_memory() if s2 is not None else None
+            s1_p = s1.to("cpu").pin_memory() if s1 is not None else None
+            s3_p = s3.to("cpu").pin_memory() if s3 is not None else None
+            s2_p = s2.to("cpu").pin_memory() if s2 is not None else None
             w1_entry = (w1.to("cpu").pin_memory(), s1_p, "fp4")
             w3_entry = (w3.to("cpu").pin_memory(), s3_p, "fp4")
             w2_entry = (w2.to("cpu").pin_memory(), s2_p, "fp4")
@@ -1518,45 +1539,107 @@ class HomeSeekInferenceEngine:
             h_3d = rms_norm(h_3d, norm_w.to(torch.bfloat16), self.config.rms_norm_eps)
         return h_3d
 
+    def _conditional_preload(self):
+        """Light preload: just warm the page cache and fill half of unpinned slots."""
+        import concurrent.futures
+        num_layers = self.config.num_hidden_layers
+        num_experts = self.config.n_routed_experts
+        pinned_count = len(self.expert_cache.pinned)
+        fill_target = max(0, self.expert_cache.max_experts - pinned_count) // 2
+        self._log(f"Light preload: {pinned_count} pinned, "
+                  f"warming {fill_target} experts across all layers...")
+        t0 = time.time()
+        count = [0]
+        def load_one(args):
+            li, ei = args
+            if self._load_expert_weights(li, ei) is not None:
+                count[0] += 1
+        eids_per_layer = max(1, fill_target // num_layers)
+        tasks = [(li, ei) for li in range(num_layers)
+                 for ei in range(min(eids_per_layer, num_experts))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            for _ in ex.map(load_one, tasks):
+                if count[0] >= fill_target:
+                    break
+        elapsed = time.time() - t0
+        rate = count[0] / elapsed if elapsed > 0 else 0
+        self._log(f"Light preload done: {count[0]} in {elapsed:.1f}s "
+                  f"({rate:.0f} exp/s), cache: {len(self.expert_cache.cache)}")
+
     def _preload_all_experts(self):
-        """Load every (layer, expert) pair into ExpertWeightCache during init.
+        """Load expert pairs into ExpertWeightCache during init.
 
-        Eliminates all file I/O during inference — trades init time (~115s at
-        1.5 GB/s disk) for zero I/O during generate().  Uses multiple threads
-        to saturate the disk read bandwidth.
-
-        Memory cost: ~169 GB CPU RAM (all 11,008 expert pairs in FP4).
-        The ExpertWeightCache is sized at 12,288 to hold everything.
+        Preloads hot + hash experts (pinned) first, then fills the remaining
+        cache capacity with experts striped across all layers.
+        Uses multiple threads to saturate the disk read bandwidth.
         """
         import concurrent.futures
         num_layers = self.config.num_hidden_layers
         num_experts = self.config.n_routed_experts
-        total = num_layers * num_experts
-        self._log(f"Preloading all {total} expert pairs "
-                  f"({num_layers}L × {num_experts}E)...")
+        cache_cap = self.expert_cache.max_experts
 
-        # Build the full task list — one (layer, eid) per expert
-        tasks = [(li, ei) for li in range(num_layers)
-                 for ei in range(num_experts)]
+        pinned_count = len(self.expert_cache.pinned)
+        fill_target = min(cache_cap - pinned_count, num_layers * num_experts)
+        self._log(f"Preloading experts: {pinned_count} pinned, "
+                  f"filling up to {fill_target} more (cache cap {cache_cap})...")
 
         t0 = time.time()
         count = [0]
 
         def load_one(args):
             li, ei = args
-            self._load_expert_weights(li, ei)
-            count[0] += 1
+            if self._load_expert_weights(li, ei) is not None:
+                count[0] += 1
 
-        # 8 threads is enough to saturate 1.5 GB/s disk on shared RAID
+        eids_per_layer = max(1, fill_target // num_layers)
+        tasks = []
+        for li in range(num_layers):
+            for ei in range(min(eids_per_layer, num_experts)):
+                tasks.append((li, ei))
+
         max_workers = 8
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(load_one, tasks))
+            for _ in ex.map(load_one, tasks):
+                if count[0] >= fill_target:
+                    break
 
         elapsed = time.time() - t0
-        bw = total * 15.7 / 1024 / elapsed if elapsed > 0 else 0
-        self._log(f"Preload done: {count[0]}/{total} experts in "
-                  f"{elapsed:.1f}s ({bw:.1f} GB/s)")
-        self._log(f"Expert cache entries: {len(self.expert_cache.cache)}")
+        rate = count[0] / elapsed if elapsed > 0 else 0
+        self._log(f"Preload done: {count[0]} experts in {elapsed:.1f}s "
+                  f"({rate:.0f} exp/s), cache: {len(self.expert_cache.cache)} entries")
+
+    def _update_hot_usage(self, layer: int, eid: int):
+        if layer not in self._hot_usage_counter:
+            self._hot_usage_counter[layer] = {}
+        self._hot_usage_counter[layer][eid] = self._hot_usage_counter[layer].get(eid, 0) + 1
+        self._hot_usage_window.append((layer, eid))
+        if len(self._hot_usage_window) > self._hot_usage_window_size:
+            for _ in range(len(self._hot_usage_window) - self._hot_usage_window_size):
+                old_layer, old_eid = self._hot_usage_window.pop(0)
+                cnt = self._hot_usage_counter.get(old_layer, {}).get(old_eid, 0)
+                if cnt > 1:
+                    self._hot_usage_counter[old_layer][old_eid] = cnt - 1
+                else:
+                    self._hot_usage_counter[old_layer].pop(old_eid, None)
+
+    def _refresh_gpu_hot_from_usage(self):
+        if not self._hot_usage_counter:
+            return
+        for layer, eid_counts in self._hot_usage_counter.items():
+            hot_layer = self._hot_expert_set_by_layer.get(layer, self._hot_expert_set)
+            sorted_eids = sorted(eid_counts.items(), key=lambda x: -x[1])
+            for eid, _ in sorted_eids[:8]:
+                if eid not in hot_layer and (layer, eid) not in self._gpu_hot_experts:
+                    continue
+
+    def _async_prefetch_experts(self, next_layer: int, predicted_eids: list[int]):
+        if not self._prefetch_enabled or not predicted_eids:
+            return
+        if self._prefetch_stream is None:
+            return
+        with torch.cuda.stream(self._prefetch_stream):
+            for eid in predicted_eids:
+                self._load_expert_fp4_raw(next_layer, eid)
 
     def _warmup(self) -> bool:
         if self._warmed_up:
@@ -1762,7 +1845,8 @@ class HomeSeekInferenceEngine:
                 )
 
         compressor_bak = {}
-        for layer_idx, comp in self._compressors.items():
+        compressors = getattr(self, '_compressors', {})
+        for layer_idx, comp in compressors.items():
             if comp is not None:
                 compressor_bak[layer_idx] = (comp.accumulated,
                     comp.kv_state.clone() if comp.kv_state is not None else None,
@@ -1812,9 +1896,12 @@ class HomeSeekInferenceEngine:
                 n_accept = 1
 
             # Step 2: batched forward through all draft tokens (T_draft > 1)
-            # Causal mask in _forward_attn prevents future token leakage
+            # Causal mask in _forward_attn prevents future token leakage.
+            # After Step 1, KV cache has main_pred_id at pos_bak+1.
+            # MTP generates draft[i] as prediction for position pos_bak+2+i,
+            # so the batch starts at pos_bak+2 (not pos_bak+1).
             if n_accept == 1 and T_draft >= 1:
-                self._global_pos = pos_bak + 1
+                self._global_pos = pos_bak + 2 if main_pred_id is not None else pos_bak + 1
                 h = self.embed[draft_ids].to(torch.bfloat16)
                 h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
                 for layer_idx in range(self.config.num_hidden_layers):
@@ -1825,14 +1912,17 @@ class HomeSeekInferenceEngine:
                     h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
                 logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
 
-                # Check consecutive draft token matches
+                # Check consecutive draft token matches.
+                # n_accept already counts draft[0] (from Step 1).
+                # logits[i] = model's prediction for the token AFTER draft[i].
+                # Compare logits[i] with draft[i+1] to accept draft[i+1].
                 bonus_logits = None
                 for i in range(T_draft):
                     expected_next = draft_ids[:, i + 1] if i + 1 < T_draft else None
                     pred_next = logits[:, i].argmax(dim=-1)
                     if expected_next is None:
-                        n_accept += 1
                         bonus_logits = logits[:, i, :]
+                        break
                     elif pred_next.item() == expected_next.item():
                         n_accept += 1
                     else:
@@ -2060,6 +2150,11 @@ class HomeSeekInferenceEngine:
                 lw = self._get_layer_weights(layer_idx)
                 h, _ = self._forward_layer(h, lw, layer_idx, input_ids)
 
+                if self._prefetch_enabled:
+                    predicted = getattr(self, '_last_routed_eids', [])[:6]
+                    for eid in predicted:
+                        self._update_hot_usage(layer_idx, eid)
+
                 if (layer_idx + 1) % 5 == 0:
                     mem = torch.cuda.memory_allocated() / (1024**3)
                     if mem > 18:
@@ -2100,7 +2195,10 @@ class HomeSeekInferenceEngine:
             T = self._global_pos
             self._log(f"Session resume: pos={T}, max_new={max_new_tokens}")
 
-        mtp_num_draft = 3 if self._mtp_loaded else 0
+        mtp_num_draft = getattr(self, '_mtp_num_draft', 2) if self._mtp_loaded else 0
+        _mtp_total_accepted = 0
+        _mtp_total_drafts = 0
+        _mtp_total_steps = 0
 
         self._phase = "decode"
         step = 0
@@ -2111,6 +2209,11 @@ class HomeSeekInferenceEngine:
             for layer_idx in range(self.config.num_hidden_layers):
                 lw = self._get_layer_weights(layer_idx)
                 h, _ = self._forward_layer(h, lw, layer_idx, next_id)
+
+                if self._prefetch_enabled:
+                    predicted = getattr(self, '_last_routed_eids', [])[:6]
+                    for eid in predicted:
+                        self._update_hot_usage(layer_idx, eid)
 
                 if layer_idx == self.config.num_hidden_layers // 2:
                     mem = torch.cuda.memory_allocated() / (1024**3)
@@ -2145,8 +2248,9 @@ class HomeSeekInferenceEngine:
                 all_inputs = torch.cat(
                     [input_ids] + generated, dim=-1)
                 last_token = all_inputs[:, -1:]
+                mtp_temp = temperature if temperature > 0 else 0.0
                 draft_ids, n_draft = self._mtp_generate_draft(
-                    last_h_for_mtp, mtp_num_draft, temperature, last_token_id=last_token)
+                    last_h_for_mtp, mtp_num_draft, mtp_temp, last_token_id=last_token)
                 if draft_ids is not None and n_draft > 0:
                     if self._mtp_eager:
                         for i in range(n_draft):
@@ -2164,7 +2268,12 @@ class HomeSeekInferenceEngine:
                             continue
                         break
                     n_acc, bonus_logits = self._mtp_verify_batched(
-                        draft_ids, temperature, main_pred_id=next_id)
+                        draft_ids, mtp_temp, main_pred_id=next_id)
+                    _mtp_total_drafts += n_draft
+                    _mtp_total_accepted += n_acc
+                    _mtp_total_steps += 1
+                    self._log(f"  MTP: n_draft={n_draft}, accepted={n_acc}, "
+                              f"bonus={'yes' if bonus_logits is not None else 'no'}")
                     if n_acc > 0:
                         accepted_ids = draft_ids[:, :n_acc]
                         eos_hit = False
@@ -2181,7 +2290,7 @@ class HomeSeekInferenceEngine:
                         if eos_hit:
                             break
                         if step < max_new_tokens - 1:
-                            if n_acc < n_draft and bonus_logits is not None and bonus_logits.dim() >= 1:
+                            if bonus_logits is not None and bonus_logits.dim() >= 1:
                                 if temperature > 0:
                                     new_probs = F.softmax(bonus_logits.float() / temperature, dim=-1)
                                     next_id = torch.multinomial(new_probs, 1)
@@ -2226,6 +2335,12 @@ class HomeSeekInferenceEngine:
         self.loader.close()
         self._log(f"Done: {result['num_generated_tokens']} tokens in {total_time:.1f}s, "
                   f"peak mem: {result['peak_memory_gb']:.1f}GB")
+
+        if _mtp_total_steps > 0:
+            rate = _mtp_total_accepted / max(_mtp_total_drafts, 1) * 100
+            self._log(f"MTP total: {_mtp_total_steps} steps, {_mtp_total_drafts} drafts, "
+                      f"{_mtp_total_accepted} accepted ({rate:.0f}%), "
+                      f"avg {_mtp_total_accepted / _mtp_total_steps:.2f} accepted/step")
         return result
 
 

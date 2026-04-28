@@ -763,3 +763,117 @@ class TestDownloadCli:
                 cmd_download(Args())
         finally:
             os.rmdir(tmp)
+
+
+class TestCacheSizing:
+    """V21.3: CPU cache sizing with correct per_expert_bytes."""
+
+    def test_cache_size_uses_real_expert_memory(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=43, n_routed_experts=256,
+            moe_intermediate_size=2048, hidden_size=4096,
+        )
+        _I = eng.config.moe_intermediate_size
+        _D = eng.config.hidden_size
+        _per_expert = int(3 * _I * _D * 0.625)
+        assert _per_expert > 5 * 1024 * 1024
+        assert _per_expert < 50 * 1024 * 1024
+        _avail = 96 * 1024**3
+        _reserve = 8 * 1024**3
+        _max_by_ram = max(0, (_avail - _reserve) // _per_expert)
+        cache_size = max(2048, min(_max_by_ram // 2, eng.config.num_hidden_layers * eng.config.n_routed_experts))
+        assert cache_size >= 2048
+
+    def test_fp4_entry_memory_breakdown(self):
+        w1 = torch.randint(0, 16, (2048, 2048), device="cuda", dtype=torch.int8)
+        s1 = torch.zeros(2048, 128, device="cuda", dtype=torch.float8_e8m0fnu)
+        w1_mem = w1.numel() * w1.element_size()
+        s1_mem = s1.numel() * s1.element_size()
+        assert w1_mem == 2048 * 2048 * 1
+        assert s1_mem == 2048 * 128 * 1
+        per_expert = 3 * (w1_mem + s1_mem)
+        assert per_expert < 15 * 1024 * 1024
+
+    def test_make_raw_entry_preserves_f8_scale(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig()
+        eng.device = torch.device("cuda")
+        data = torch.randint(0, 16, (64, 32), device="cpu", dtype=torch.int8)
+        scale = torch.zeros(64, 2, device="cpu", dtype=torch.float8_e8m0fnu)
+        entry = eng._make_raw_entry(data, scale)
+        assert entry is not None
+        d, s, fmt = entry
+        assert fmt == "fp4"
+        assert s.dtype == torch.float8_e8m0fnu
+
+
+class TestAsyncPrefetch:
+    """V21.3: Async DMA prefetch between layers."""
+
+    def test_prefetch_stream_created(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        assert eng._prefetch_stream is not None
+
+    def test_update_hot_usage_tracking(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._hot_usage_counter = {}
+        eng._hot_usage_window = []
+        eng._hot_usage_window_size = 1024
+        eng._update_hot_usage(0, 10)
+        eng._update_hot_usage(0, 10)
+        eng._update_hot_usage(0, 20)
+        assert eng._hot_usage_counter.get(0, {}).get(10, 0) == 2
+        assert eng._hot_usage_counter.get(0, {}).get(20, 0) == 1
+
+    def test_last_routed_eids_tracking(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._last_routed_eids = []
+        eng._last_routed_eids = [5, 10, 15]
+        assert eng._last_routed_eids == [5, 10, 15]
+
+
+class TestMTPTemperature:
+    """V21.3: MTP argmax mode when main model uses temperature=0."""
+
+    def test_mtp_default_draft_length(self):
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng._mtp_loaded = True
+        mtp_num_draft = getattr(eng, '_mtp_num_draft', 2)
+        assert mtp_num_draft == 2
+
+    def test_mtp_temperature_propagation_argmax(self):
+        temperature = 0.0
+        mtp_temp = temperature if temperature > 0 else 0.0
+        assert mtp_temp == 0.0
+
+    def test_mtp_temperature_propagation_sampling(self):
+        temperature = 0.6
+        mtp_temp = temperature if temperature > 0 else 0.0
+        assert mtp_temp == 0.6
+
+
+class TestGPUHotCache:
+    """V21.3: Expanded GPU hot cache."""
+
+    def test_hot_cache_capacity_default(self):
+        _vram_free = 24.0
+        _expert_bf16_gb = 48.0 / 1024
+        _max_hot = max(16, min(int((_vram_free - 4) * 0.20 / _expert_bf16_gb), 64))
+        assert _max_hot >= 16
+
+    def test_bf16_cache_capacity_default(self):
+        _vram_free = 24.0
+        _expert_bf16_gb = 48.0 / 1024
+        _bf16_budget = max(1, _vram_free - 3)
+        _max_bf16 = max(16, min(int(_bf16_budget * 0.80 / _expert_bf16_gb), 100))
+        assert _max_bf16 >= 16

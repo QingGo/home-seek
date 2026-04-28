@@ -3,8 +3,6 @@ from collections import OrderedDict
 from typing import Callable
 import torch
 
-from home_seek._fp4 import unpack_from_e2m1fn_x2
-
 
 class ExpertWeightCache:
     """CPU FP4 expert cache with LRU eviction + pinned entries."""
@@ -21,8 +19,11 @@ class ExpertWeightCache:
     def get(self, key: str):
         if key not in self.cache:
             return None
-        self.cache.move_to_end(key)
-        return self.cache[key]
+        try:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        except KeyError:
+            return None
 
     def deq(self, key: str):
         if self._max_hot_deq > 0 and key in self._hot_deq:
@@ -68,13 +69,19 @@ class ExpertWeightCache:
 
     def put(self, key: str, w1_entry, w3_entry, w2_entry, pin: bool = False):
         if key in self.cache:
-            self.cache.move_to_end(key)
+            try:
+                self.cache.move_to_end(key)
+            except KeyError:
+                pass
             return
         if not pin and len(self.cache) >= self.max_experts:
             for k in list(self.cache.keys()):
                 if k not in self.pinned:
-                    self.cache.pop(k)
-                    self._hot_deq.pop(k, None)
+                    try:
+                        self.cache.pop(k)
+                        self._hot_deq.pop(k, None)
+                    except KeyError:
+                        pass
                     break
         self.cache[key] = (w1_entry, w3_entry, w2_entry)
         if pin:

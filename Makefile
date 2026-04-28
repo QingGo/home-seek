@@ -22,39 +22,10 @@ profile: $(PROFILE_DIR)
 	$(UV) python -m home_seek.profiling_runner \
 		--prompt "Hello" --max-tokens 20 --temperature 0 \
 		--output $(LAST_PROFILE)
-	@python3 -c "
-	import json
-	with open('$(LAST_PROFILE)') as f:
-		d = json.load(f)
-	p = d['performance']
-	print(f'\\n=== Profile saved to $(LAST_PROFILE) ===')
-	print(f'  Decode throughput: {p[\"tokens_per_second\"]:.2f} t/s')
-	print(f'  Peak memory: {p[\"peak_memory_gb\"]:.2f} GB')
-	"
+	@$(UV) python3 scripts/profile_show.py $(LAST_PROFILE)
 
 profile-compare: $(PROFILE_DIR)
-	@python3 -c "
-	import json, sys
-	try:
-		with open('$(PREV_PROFILE)') as f:
-			prev = json.load(f)['performance']
-	except (FileNotFoundError, json.JSONDecodeError):
-		print('No previous profile found at $(PREV_PROFILE). Run make profile first.')
-		sys.exit(1)
-	with open('$(LAST_PROFILE)') as f:
-		cur = json.load(f)['performance']
-	print(f'{\"Metric\":<35} {\"Previous\":<12} {\"Current\":<12} {\"Change\":<10}')
-	print('-' * 70)
-	for key in ['tokens_per_second', 'ms_per_token', 'peak_memory_gb']:
-		pv = prev.get(key, 0)
-		cv = cur.get(key, 0)
-		if pv == 0:
-			ch = 'N/A'
-		else:
-			pct = (cv - pv) / pv * 100
-			ch = f'{pct:+.1f}%'
-		print(f'{key:<35} {pv:<12.4f} {cv:<12.4f} {ch:<10}')
-	"
+	@if [ -f $(PREV_PROFILE) ]; then $(UV) python3 scripts/profile_compare.py $(PREV_PROFILE) $(LAST_PROFILE); else echo "No previous profile at $(PREV_PROFILE). Run make profile twice."; fi
 
 smoke:
 	$(UV) python -m home_seek.profiling_runner \
