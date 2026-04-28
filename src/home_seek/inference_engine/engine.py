@@ -1342,9 +1342,9 @@ class HomeSeekInferenceEngine:
             w2 = tensors.get(keys[4]); s2 = tensors.get(keys[5])
             if w1 is None:
                 continue
-            s1_p = s1.to("cpu").pin_memory() if s1 is not None else None
-            s3_p = s3.to("cpu").pin_memory() if s3 is not None else None
-            s2_p = s2.to("cpu").pin_memory() if s2 is not None else None
+            s1_p = s1.to(torch.float32).to("cpu").pin_memory() if s1 is not None else None
+            s3_p = s3.to(torch.float32).to("cpu").pin_memory() if s3 is not None else None
+            s2_p = s2.to(torch.float32).to("cpu").pin_memory() if s2 is not None else None
             w1_entry = (w1.to("cpu").pin_memory(), s1_p, "fp4")
             w3_entry = (w3.to("cpu").pin_memory(), s3_p, "fp4")
             w2_entry = (w2.to("cpu").pin_memory(), s2_p, "fp4")
@@ -1423,10 +1423,19 @@ class HomeSeekInferenceEngine:
         k_exp = k.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k.shape[-2], k.shape[-1])
         v_exp = k_exp
 
+        k_cache = getattr(self, '_mtp_kv_cache', None)
+        if k_cache is not None:
+            k_cache.append((k_exp, v_exp))
+            all_k = torch.cat([ck for ck, _ in k_cache], dim=-2)
+            all_v = torch.cat([cv for _, cv in k_cache], dim=-2)
+        else:
+            all_k = k_exp
+            all_v = v_exp
+
         scale_f = self.config.head_dim ** -0.5
-        attn = torch.matmul(q.float() * scale_f, k_exp.float().transpose(-2, -1))
-        attn_p = torch.softmax(attn, dim=-1).to(v_exp.dtype)
-        out = torch.matmul(attn_p, v_exp)
+        attn = torch.matmul(q.float() * scale_f, all_k.float().transpose(-2, -1))
+        attn_p = torch.softmax(attn, dim=-1).to(all_v.dtype)
+        out = torch.matmul(attn_p, all_v)
 
         out = apply_rotary_emb(out, freqs_cis, rd=rope_dim, inverse=True)
         out = out.transpose(1, 2).contiguous()
@@ -1693,44 +1702,45 @@ class HomeSeekInferenceEngine:
         h_main_proj_4d = F.linear(h_main_normed.to(h_proj_bf16.dtype), h_proj_bf16)
 
         draft_tokens: list[torch.Tensor] = []
-        for step in range(num_draft):
-            if step == 0 and last_token_id is not None:
-                tok_ids = last_token_id
-            elif step > 0:
-                tok_ids = draft_tokens[-1]
-            else:
-                tok_ids = None
+        self._mtp_kv_cache = []
+        try:
+            for step in range(num_draft):
+                if step == 0 and last_token_id is not None:
+                    tok_ids = last_token_id
+                elif step > 0:
+                    tok_ids = draft_tokens[-1]
+                else:
+                    tok_ids = None
 
-            if tok_ids is not None:
-                tok_emb = embed[tok_ids].to(torch.bfloat16)
-            else:
-                tok_emb = torch.zeros(B, 1, D, device=last_hidden.device, dtype=torch.bfloat16)
+                if tok_ids is not None:
+                    tok_emb = embed[tok_ids].to(torch.bfloat16)
+                else:
+                    tok_emb = torch.zeros(B, 1, D, device=last_hidden.device, dtype=torch.bfloat16)
 
-            # enorm → e_proj (2D → 2D) → unsqueeze to 4D
-            if enorm_w is not None:
-                tok_emb = rms_norm(tok_emb, enorm_w, self.config.rms_norm_eps)
-            emb_proj_2d = tok_emb.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
-            emb_proj_4d = emb_proj_2d.unsqueeze(2)  # [B,1,1,D] broadcasts with [B,1,hc,D]
+                if enorm_w is not None:
+                    tok_emb = rms_norm(tok_emb, enorm_w, self.config.rms_norm_eps)
+                emb_proj_2d = tok_emb.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
+                emb_proj_4d = emb_proj_2d.unsqueeze(2)
 
-            h_combined_4d = h_main_proj_4d + emb_proj_4d
+                h_combined_4d = h_main_proj_4d + emb_proj_4d
 
-            # Full MTP Block forward: MHC_attn → attn → MHC_ffn → FFN
-            mtp_pos = getattr(self, '_global_pos', 0) + step + 1
-            h_mtp_out = self._mtp_forward_draft(h_combined_4d, start_pos=mtp_pos)
+                mtp_pos = getattr(self, '_global_pos', 0) + step + 1
+                h_mtp_out = self._mtp_forward_draft(h_combined_4d, start_pos=mtp_pos)
 
-            # hc_head → norm → lm_head
-            h_3d = self._mtp_finalize(h_mtp_out)
+                h_3d = self._mtp_finalize(h_mtp_out)
 
-            logits = h_3d.to(lm_head.dtype) @ lm_head.t()
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1].float() / temperature, dim=-1)
-                next_id = torch.multinomial(probs, 1)
-            else:
-                next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
-            draft_tokens.append(next_id)
+                logits = h_3d.to(lm_head.dtype) @ lm_head.t()
+                if temperature > 0:
+                    probs = torch.softmax(logits[:, -1].float() / temperature, dim=-1)
+                    next_id = torch.multinomial(probs, 1)
+                else:
+                    next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+                draft_tokens.append(next_id)
 
-        draft_ids = torch.cat(draft_tokens, dim=-1)
-        return draft_ids, len(draft_tokens)
+            draft_ids = torch.cat(draft_tokens, dim=-1)
+            return draft_ids, len(draft_tokens)
+        finally:
+            self._mtp_kv_cache = None
 
     @torch.no_grad()
     def _mtp_accept_drafts(self, input_ids, draft_ids, temperature=0.6):
@@ -1823,11 +1833,11 @@ class HomeSeekInferenceEngine:
 
     @torch.no_grad()
     def _mtp_verify_batched(self, draft_ids, temperature=0.6, main_pred_id=None):
-        """Verify all draft tokens in a single batched forward pass.
+        """Verify all draft tokens in a single fused forward pass.
 
-        Uses causal mask in _forward_attn (added when T>1) to prevent future
-        token leakage. The first draft token (d_0) is verified against the main
-        model's prediction via a separate T=1 forward with main_pred_id.
+        Fuses old Step 1 (T=1, main_pred_id) + Step 2 (T=T_draft, draft_ids)
+        into one forward (T=1+T_draft). Causal mask in _forward_attn prevents
+        future token leakage within the batch.
         """
         if not isinstance(draft_ids, torch.Tensor) or draft_ids.shape[1] == 0:
             return 0, None
@@ -1857,80 +1867,41 @@ class HomeSeekInferenceEngine:
         n_accept = 0
         bonus_logits = None
         try:
-            # Step 1: verify d_0 via a single T=1 forward with main_pred_id
             if main_pred_id is not None:
-                self._global_pos = pos_bak + 1
-                self._phase = "verify"
-                h = self.embed[main_pred_id].to(torch.bfloat16)
-                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-                for layer_idx in range(self.config.num_hidden_layers):
-                    lw = self._get_layer_weights(layer_idx)
-                    h, _ = self._forward_layer(h, lw, layer_idx, main_pred_id)
-                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-                if self.norm_weight is not None:
-                    h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
-                logits_d0 = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
-
-                pred_next = logits_d0[:, -1].argmax(dim=-1)
-                if pred_next.item() != draft_ids[:, 0].item():
-                    self._global_pos = pos_bak
-                    for layer_idx, saved_kv in kv_snapshots.items():
-                        state = self.layer_states.get(layer_idx)
-                        if state is not None:
-                            state.kv_latent_cache = saved_kv
-                    for layer_idx, (data, idx) in compressed_data_bak.items():
-                        state = self.layer_states.get(layer_idx)
-                        if state is not None:
-                            state.compressed_kv_data = data
-                            state.compressed_kv_idx = idx
-                    for layer_idx, (acc, kv_s, sc_s) in compressor_bak.items():
-                        comp = self._compressors.get(layer_idx)
-                        if comp is not None:
-                            comp.accumulated = acc
-                            comp.kv_state = kv_s
-                            comp.score_state = sc_s
-                    return 0, None
-                n_accept = 1
-                bonus_logits = logits_d0[:, -1, :]
+                combined_ids = torch.cat([main_pred_id, draft_ids], dim=-1)
+                T_total = 1 + T_draft
             else:
-                n_accept = 1
+                combined_ids = draft_ids
+                T_total = T_draft
 
-            # Step 2: batched forward through all draft tokens (T_draft > 1)
-            # Causal mask in _forward_attn prevents future token leakage.
-            # After Step 1, KV cache has main_pred_id at pos_bak+1.
-            # MTP generates draft[i] as prediction for position pos_bak+2+i,
-            # so the batch starts at pos_bak+2 (not pos_bak+1).
-            if n_accept == 1 and T_draft >= 1:
-                self._global_pos = pos_bak + 2 if main_pred_id is not None else pos_bak + 1
-                h = self.embed[draft_ids].to(torch.bfloat16)
-                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-                for layer_idx in range(self.config.num_hidden_layers):
-                    lw = self._get_layer_weights(layer_idx)
-                    h, _ = self._forward_layer(h, lw, layer_idx, draft_ids)
-                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-                if self.norm_weight is not None:
-                    h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
-                logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
+            self._global_pos = pos_bak + 1
+            self._phase = "verify"
+            h = self.embed[combined_ids].to(torch.bfloat16)
+            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            for layer_idx in range(self.config.num_hidden_layers):
+                lw = self._get_layer_weights(layer_idx)
+                h, _ = self._forward_layer(h, lw, layer_idx, combined_ids)
+            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+            if self.norm_weight is not None:
+                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
+            logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
 
-                # Check consecutive draft token matches.
-                # n_accept already counts draft[0] (from Step 1).
-                # logits[i] = model's prediction for the token AFTER draft[i].
-                # Compare logits[i] with draft[i+1] to accept draft[i+1].
-                bonus_logits = None
-                for i in range(T_draft):
-                    expected_next = draft_ids[:, i + 1] if i + 1 < T_draft else None
-                    pred_next = logits[:, i].argmax(dim=-1)
-                    if expected_next is None:
-                        bonus_logits = logits[:, i, :]
-                        break
-                    elif pred_next.item() == expected_next.item():
-                        n_accept += 1
-                    else:
-                        bonus_logits = logits[:, i, :]
-                        break
+            # Comparison: logits[i] predicts the token after combined_ids[i].
+            # Accept combined_ids[i+1] if argmax matches.
+            for i in range(T_total):
+                pred = logits[:, i].argmax(dim=-1)
+                if i == T_total - 1:
+                    bonus_logits = logits[:, i, :]
+                    break
+                expected = combined_ids[:, i + 1]
+                if pred.item() == expected.item():
+                    n_accept += 1
+                else:
+                    bonus_logits = logits[:, i, :]
+                    break
 
-            # Step 3: trim state if partial rejection
-            if n_accept < T_draft + 1:
+            # Trim: keep orig + n_accept entries (n_accept = main_pred + matched drafts)
+            if n_accept < T_total:
                 for layer_idx in kv_snapshots:
                     state = self.layer_states.get(layer_idx)
                     if state is not None and state.kv_latent_cache is not None:

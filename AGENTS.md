@@ -5,7 +5,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.4 — CPU cache + MTP optim
 ## 纪律
 
 1. 修 bug 必须先写复现该 bug 的快速单元测试 (L1), 再修代码
-2. 功能里程碑完成后，或实现某个性能优化后，必须 `make profile`, 对照 `.agent_memory.md` 基线检查，并确认推理结果无异常。
+2. 功能里程碑完成后，或实现某个性能优化后，必须 `make profile`(看全，不要只看其中一部分), 对照 `.agent_memory.md` 基线检查，并确认推理结果无异常。
 3. 提交前必须通过 `make lint test-unit`
 
 ## 命令
