@@ -195,12 +195,14 @@ def cmd_cli(args):
                 break
         yield "", stats
 
+    # readline + ANSI prompt: wrap escape sequences in \001/\002
+    # so readline doesn't count them as visible characters (prevents
+    # cursor corruption & backspace eating the prompt).
     try:
         import readline
     except ImportError:
-        pass
+        readline = None
 
-    # ANSI diagnostic
     import logging
     _lg = logging.getLogger("home-seek")
     _lg.info(f"ANSI: TERM={os.environ.get('TERM','')!r} "
@@ -220,12 +222,19 @@ def cmd_cli(args):
     print(f"{banner}")
     print()
 
+    # Ensure stdout can handle UTF-8 (emojis, CJK, etc.)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+
+    # Wrap ANSI codes in \001/\002 for readline cursor accounting.
+    # Without readline, use plain ANSI codes (no \001/\002 needed).
+    _PROMPT = (f"\001{GREEN}\002>>>\001{RESET}\002 " if readline
+               else f"{GREEN}>>>{RESET} ")
+
     last_s = None
     while True:
         try:
-            sys.stdout.write(f"{GREEN}>>>{RESET} ")
-            sys.stdout.flush()
-            raw = input().strip()
+            raw = input(_PROMPT).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
