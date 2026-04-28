@@ -20,7 +20,7 @@ test-integration:
 
 profile: $(PROFILE_DIR)
 	$(UV) python -m home_seek.profiling_runner \
-		--prompt "Hello" --max-tokens 20 --temperature 0 \
+		--rounds 5 --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" --max-tokens 30 --temperature 0 \
 		--output $(LAST_PROFILE)
 	@$(UV) python3 scripts/profile_show.py $(LAST_PROFILE)
 
@@ -29,7 +29,7 @@ profile-compare: $(PROFILE_DIR)
 
 smoke:
 	$(UV) python -m home_seek.profiling_runner \
-		--prompt "Hello" --max-tokens 20 --temperature 0
+		--rounds 5 --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" --max-tokens 30 --temperature 0
 
 server:
 	$(UV) python -m home_seek server --port 8000

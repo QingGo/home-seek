@@ -877,3 +877,99 @@ class TestGPUHotCache:
         _bf16_budget = max(1, _vram_free - 3)
         _max_bf16 = max(16, min(int(_bf16_budget * 0.80 / _expert_bf16_gb), 100))
         assert _max_bf16 >= 16
+
+
+class TestGQAFusedAttention:
+    """GQA fused kernel correctness: eliminates 64x KV expand for n_kv=1."""
+
+    def _reference_attn(self, q, kv, causal_mask=None, attn_sink=None):
+        B, H, T_q, D = q.shape
+        T_kv = kv.shape[-2]
+        scale = D ** -0.5
+        k_exp = kv.unsqueeze(1).expand(-1, H, -1, -1, -1).reshape(B, H, T_kv, D)
+        v_exp = k_exp
+        attn = torch.matmul(q.float() * scale, k_exp.float().transpose(-2, -1))
+        if causal_mask is not None:
+            attn = attn + causal_mask
+        if attn_sink is not None:
+            sink_val = attn_sink.view(1, -1, 1, 1).float()
+            attn_cat = torch.cat([attn, sink_val.expand(-1, -1, T_q, -1)], dim=-1)
+            P = F.softmax(attn_cat, dim=-1)
+            P_real = P[:, :, :, :-1]
+        else:
+            P_real = F.softmax(attn, dim=-1)
+        out = torch.matmul(P_real, v_exp.float())
+        return out
+
+    def test_decode_t1_no_mask(self):
+        B, H, T_q, T_kv, D = 1, 64, 1, 128, 512
+        q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+        ref = self._reference_attn(q, kv)
+        from home_seek.gqa_attention import gqa_fused_attn
+        out = gqa_fused_attn(q.float(), kv)
+        assert out.shape == ref.shape
+        assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
+            f"T=1 decode mismatch: maxdiff={(out - ref).abs().max().item():.6f}"
+
+    def test_decode_t1_various_kv_lengths(self):
+        B, H, T_q, D = 1, 64, 1, 512
+        from home_seek.gqa_attention import gqa_fused_attn
+        for T_kv in [1, 4, 16, 64, 128, 256, 512]:
+            q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+            kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+            ref = self._reference_attn(q, kv)
+            out = gqa_fused_attn(q.float(), kv)
+            assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
+                f"T_kv={T_kv} mismatch: maxdiff={(out-ref).abs().max().item():.6f}"
+
+    def test_verify_t3_with_causal_mask(self):
+        B, H, T_q, T_kv, D = 1, 64, 3, 132, 512
+        q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+        k_sw_len = 128
+        new_start = k_sw_len - T_q
+        triu = torch.triu(torch.full((T_q, T_q), float('-inf'), device='cuda', dtype=torch.float32), diagonal=1)
+        causal_mask = torch.zeros(T_q, T_kv, device='cuda', dtype=torch.float32)
+        causal_mask[:, new_start:k_sw_len] = triu
+        ref = self._reference_attn(q, kv, causal_mask=causal_mask)
+        from home_seek.gqa_attention import gqa_fused_attn
+        out = gqa_fused_attn(q.float(), kv, causal_mask=causal_mask)
+        assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
+            f"T=3 causal mask mismatch: maxdiff={(out-ref).abs().max().item():.6f}"
+
+    def test_attn_sink_single_head(self):
+        B, H, T_q, T_kv, D = 1, 4, 1, 16, 64
+        q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+        attn_sink = torch.randn(H, device='cuda', dtype=torch.bfloat16)
+        ref = self._reference_attn(q, kv, attn_sink=attn_sink)
+        from home_seek.gqa_attention import gqa_fused_attn
+        out = gqa_fused_attn(q.float(), kv, attn_sink=attn_sink.float())
+        assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
+            f"attn_sink mismatch: maxdiff={(out-ref).abs().max().item():.6f}"
+
+    def test_deterministic_across_calls(self):
+        B, H, T_q, T_kv, D = 1, 64, 1, 128, 512
+        from home_seek.gqa_attention import gqa_fused_attn
+        q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+        out1 = gqa_fused_attn(q.float(), kv)
+        out2 = gqa_fused_attn(q.float(), kv)
+        assert torch.equal(out1, out2), "Fused kernel should be deterministic"
+
+    def test_all_close_to_expand_softmax(self):
+        """End-to-end: fused kernel output must match the full expand+softmax+matmul path."""
+        B, H, T_q, T_kv, D = 1, 64, 1, 128, 512
+        q = torch.randn(B, H, T_q, D, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(B, 1, T_kv, D, device='cuda', dtype=torch.bfloat16)
+        scale = D ** -0.5
+        k_exp = kv.unsqueeze(1).expand(-1, H, -1, -1, -1).reshape(B, H, T_kv, D)
+        v_exp = k_exp
+        attn = torch.matmul(q.float() * scale, k_exp.float().transpose(-2, -1))
+        attn_p = F.softmax(attn, dim=-1)
+        ref = torch.matmul(attn_p, v_exp.float())
+        from home_seek.gqa_attention import gqa_fused_attn
+        out = gqa_fused_attn(q.float(), kv)
+        assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
+            f"Full path mismatch: maxdiff={(out-ref).abs().max().item():.6f}"

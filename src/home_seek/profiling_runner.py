@@ -541,6 +541,7 @@ def run_profile(args):
         if not os.path.exists(args.hot_experts) else args.hot_experts,
         preload_all=args.preload_all,
         use_triton=not args.no_triton,
+        use_gqa_fusion=args.use_gqa_fusion,
     )
     if use_mtp:
         engine._mtp_loaded = True
@@ -769,6 +770,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--use-mtp", action="store_true")
+    parser.add_argument("--use-gqa-fusion", action="store_true",
+                        help="Use GQA fused attention kernel (experimental, no throughput gain in current profile)")
     parser.add_argument("--mtp-eager", action="store_true",
                         help="MTP eager: accept all draft tokens without verification")
     parser.add_argument("--verbose", action="store_true")

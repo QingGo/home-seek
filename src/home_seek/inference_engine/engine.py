@@ -92,7 +92,8 @@ def _fp8_simulate(x, block_size=64):
 class HomeSeekInferenceEngine:
     def __init__(self, weight_dir: str = "weights", device: str = "cuda", verbose: bool = False,
                  hot_experts_path: str = "hot_experts.json", preload_all: bool = False,
-                 reprobe: bool = False, use_triton: bool = True):
+                 reprobe: bool = False, use_triton: bool = True,
+                 use_gqa_fusion: bool = False):
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig.from_json(config_path)
         self.weight_dir = weight_dir
@@ -135,6 +136,7 @@ class HomeSeekInferenceEngine:
         self._global_pos = 0
         self._load_global_weights()
         self._use_triton = use_triton
+        self._use_gqa_fusion = use_gqa_fusion
         from home_seek.expert_predictor import RecordingPredictor, HeuristicPredictor
         self.predictor = RecordingPredictor(
             HeuristicPredictor(self.config.num_hidden_layers, self.config.num_experts_per_tok))
@@ -789,42 +791,56 @@ class HomeSeekInferenceEngine:
             if compressed_kv.shape[3] != k_sw.shape[3]:
                 compressed_kv = compressed_kv[:, :, :, :k_sw.shape[3]]
             k_all = torch.cat([k_sw, compressed_kv.to(k_sw.dtype)], dim=-2)
-            v_all = torch.cat([v_sw, compressed_kv.to(v_sw.dtype)], dim=-2)
         else:
-            k_all, v_all = k_sw, v_sw
+            k_all = k_sw
 
-        n_kv = self.config.num_key_value_heads
-        n_groups = self.config.num_attention_heads // n_kv
-        scale_f = self.config.head_dim ** -0.5
+        if self._use_gqa_fusion:
+            from home_seek.gqa_attention import gqa_fused_attn
 
-        k_expanded = k_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k_all.shape[-2], k_all.shape[-1])
-        v_expanded = v_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, v_all.shape[-2], v_all.shape[-1])
+            _has_sink = attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads
+            _causal_mask = None
+            if T > 1 and not _has_sink:
+                _k_sw_len = k_sw.shape[-2]
+                _new_start = _k_sw_len - T
+                if _new_start >= 0:
+                    _triu = torch.triu(torch.full((T, T), float('-inf'), device=q.device, dtype=torch.float32), diagonal=1)
+                    _causal_mask = torch.zeros(T, k_all.shape[-2], device=q.device, dtype=torch.float32)
+                    _causal_mask[:, _new_start:_k_sw_len] = _triu
 
-        attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
-
-        # Causal mask for batched verify (T>1): prevent attending to future batch positions.
-        # The new batch tokens are the last T positions of kv_sw (sliding window).
-        if T > 1 and not (attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads):
-            k_sw_len = k_sw.shape[-2]
-            new_start = k_sw_len - T
-            if new_start >= 0:
-                triu = torch.triu(torch.full((T, T), float('-inf'), device=q.device, dtype=attn.dtype), diagonal=1)
-                mask = torch.zeros(T, k_all.shape[-2], device=q.device, dtype=attn.dtype)
-                mask[:, new_start:k_sw_len] = triu
-                attn = attn + mask
-
-        if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
-            # Virtual softmax entry: attn_sink absorbs probability mass without KV
-            # Matches official demo's sparse_attn kernel behavior:
-            #   sum_exp += exp(attn_sink - running_max)
-            sink_val = attn_sink.view(1, -1, 1, 1).to(attn.dtype)
-            attn_with_sink = torch.cat(
-                [attn, sink_val.expand(-1, -1, T, -1)], dim=-1)
-            P_all = F.softmax(attn_with_sink, dim=-1)
-            attn_p = P_all[:, :, :, :-1].to(v_expanded.dtype)
+            out = gqa_fused_attn(
+                q.float(),
+                k_all.to(q.dtype),
+                causal_mask=_causal_mask,
+                attn_sink=attn_sink.float() if _has_sink else None,
+            ).to(torch.bfloat16)
         else:
-            attn_p = F.softmax(attn, dim=-1).to(v_expanded.dtype)
-        out = torch.matmul(attn_p, v_expanded)
+            n_kv = self.config.num_key_value_heads
+            n_groups = self.config.num_attention_heads // n_kv
+            scale_f = self.config.head_dim ** -0.5
+            v_all = k_all
+
+            k_expanded = k_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k_all.shape[-2], k_all.shape[-1])
+            v_expanded = v_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, v_all.shape[-2], v_all.shape[-1])
+
+            attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
+
+            if T > 1 and not (attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads):
+                k_sw_len = k_sw.shape[-2]
+                new_start = k_sw_len - T
+                if new_start >= 0:
+                    triu = torch.triu(torch.full((T, T), float('-inf'), device=q.device, dtype=attn.dtype), diagonal=1)
+                    mask = torch.zeros(T, k_all.shape[-2], device=q.device, dtype=attn.dtype)
+                    mask[:, new_start:k_sw_len] = triu
+                    attn = attn + mask
+
+            if attn_sink is not None and attn_sink.numel() == self.config.num_attention_heads:
+                sink_val = attn_sink.view(1, -1, 1, 1).to(attn.dtype)
+                attn_with_sink = torch.cat([attn, sink_val.expand(-1, -1, T, -1)], dim=-1)
+                P_all = F.softmax(attn_with_sink, dim=-1)
+                attn_p = P_all[:, :, :, :-1].to(v_expanded.dtype)
+            else:
+                attn_p = F.softmax(attn, dim=-1).to(v_expanded.dtype)
+            out = torch.matmul(attn_p, v_expanded)
 
         out = apply_rotary_emb(out, freqs_cis, rd=self.config.qk_rope_head_dim, inverse=True)
 
@@ -1417,25 +1433,37 @@ class HomeSeekInferenceEngine:
         q = apply_rotary_emb(q, freqs_cis, rd=rope_dim)
         kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=rope_dim)
 
-        n_kv = self.config.num_key_value_heads
-        n_groups = self.config.num_attention_heads // n_kv
-        k = kv_latent.unsqueeze(2).transpose(1, 2)
-        k_exp = k.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k.shape[-2], k.shape[-1])
-        v_exp = k_exp
+        if self._use_gqa_fusion:
+            from home_seek.gqa_attention import gqa_fused_attn
 
-        k_cache = getattr(self, '_mtp_kv_cache', None)
-        if k_cache is not None:
-            k_cache.append((k_exp, v_exp))
-            all_k = torch.cat([ck for ck, _ in k_cache], dim=-2)
-            all_v = torch.cat([cv for _, cv in k_cache], dim=-2)
+            k = kv_latent.unsqueeze(2).transpose(1, 2)
+            k_cache = getattr(self, '_mtp_kv_cache', None)
+            if k_cache is not None:
+                k_cache.append(k)
+                all_kv = torch.cat(k_cache, dim=-2)
+            else:
+                all_kv = k
+            out = gqa_fused_attn(q.float(), all_kv).to(torch.bfloat16)
         else:
-            all_k = k_exp
-            all_v = v_exp
+            n_kv = self.config.num_key_value_heads
+            n_groups = self.config.num_attention_heads // n_kv
+            k = kv_latent.unsqueeze(2).transpose(1, 2)
+            k_exp = k.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k.shape[-2], k.shape[-1])
+            v_exp = k_exp
 
-        scale_f = self.config.head_dim ** -0.5
-        attn = torch.matmul(q.float() * scale_f, all_k.float().transpose(-2, -1))
-        attn_p = torch.softmax(attn, dim=-1).to(all_v.dtype)
-        out = torch.matmul(attn_p, all_v)
+            k_cache = getattr(self, '_mtp_kv_cache', None)
+            if k_cache is not None:
+                k_cache.append((k_exp, v_exp))
+                all_k = torch.cat([ck for ck, _ in k_cache], dim=-2)
+                all_v = torch.cat([cv for _, cv in k_cache], dim=-2)
+            else:
+                all_k = k_exp
+                all_v = v_exp
+
+            scale_f = self.config.head_dim ** -0.5
+            attn = torch.matmul(q.float() * scale_f, all_k.float().transpose(-2, -1))
+            attn_p = torch.softmax(attn, dim=-1).to(all_v.dtype)
+            out = torch.matmul(attn_p, all_v)
 
         out = apply_rotary_emb(out, freqs_cis, rd=rope_dim, inverse=True)
         out = out.transpose(1, 2).contiguous()
@@ -2324,13 +2352,16 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--hot-experts", default="hot_experts.json", help="Hot experts JSON path")
     parser.add_argument("--use-mtp", action="store_true", help="Enable MTP speculative decoding")
+    parser.add_argument("--use-gqa-fusion", action="store_true",
+                        help="Use GQA fused attention kernel (experimental)")
     parser.add_argument("--mtp-eager", action="store_true",
                         help="Eager MTP: accept all drafts without verification (fast, risky)")
     parser.add_argument("--reprobe", action="store_true",
                         help="Force re-probe hardware profile, overwrite hw_profile.json")
     args = parser.parse_args()
     engine = HomeSeekInferenceEngine(args.weight_dir, verbose=args.verbose,
-                                     hot_experts_path=args.hot_experts, reprobe=args.reprobe)
+                                     hot_experts_path=args.hot_experts, reprobe=args.reprobe,
+                                     use_gqa_fusion=args.use_gqa_fusion)
     if args.use_mtp:
         engine._mtp_loaded = True
     if args.mtp_eager:

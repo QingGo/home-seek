@@ -62,6 +62,7 @@ def _make_mock_engine():
     eng.norm_weight = torch.randn(_HS, device="cuda", dtype=torch.bfloat16)
 
     # MTP weights — full module (attention, FFN, projections, MHC)
+    eng._use_gqa_fusion = False
     q_lora = _HS // 2
     n_heads_head_dim = eng.config.num_attention_heads * eng.config.head_dim  # 8*256=2048
     o_dim = eng.config.o_groups * eng.config.o_lora_rank  # 2*128=256
