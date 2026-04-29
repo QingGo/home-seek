@@ -171,13 +171,12 @@ class HardwareConfig:
             "mtp": False,
             "devices": ("cuda:0", "cuda:1"),
         },
-        # ── 未识别 GPU 的保守 fallback ──────────────
+        # ── 未识别 GPU: 不压制 VRAM/SM 公式, 让 _compute 自动适配 ──
+        #    gpu_hot_cap/gpu_bf16_cap 用默认值 64/100
+        #    triton_preset=auto → _pick_triton_blocks 按 SM 选择
+        #    kv_offload_gb → vram-6 (由 _compute 自动)
+        #    _validate 确保安全钳位 (hot≤40%VRAM, hot+bf16≤85%VRAM)
         "fallback": {
-            "gpu_hot_cap": 32,
-            "gpu_bf16_cap": 64,
-            "kv_offload_gb": 8,
-            "cublas_max_tokens": 4,
-            "triton_preset": (16, 16, 32),
             "prefetch": True,
             "mtp": False,
         },

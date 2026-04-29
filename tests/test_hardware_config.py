@@ -118,10 +118,14 @@ def test_unknown_gpu_fallback():
     hw = HWProfile(vram_free_gb=4, sm_count=32,
                    gpu_name="Unknown GPU")
     cfg = HardwareConfig.auto(hw, _test_config())
-    # vram clamped to 8 min, cap 32 → (8-4)*0.20/(48/1024)=17, min(17,32)=17, max(16,17)=17
+    # vram clamped to 8, cap 64 → (8-4)*0.20/(48/1024)=17
     assert cfg.gpu_hot_max == 17
-    assert cfg.gpu_bf16_max == 64
+    # (8-3)*0.80/(48/1024)=85, cap 100 → 85
+    assert cfg.gpu_bf16_max == 85
+    # SM=32 < 70 → (16, 16, 32)
     assert cfg.triton_blocks == (16, 16, 32)
+    # kv_offload = vram-6 = 8-6 = 2 (validation 只钳位上限)
+    assert cfg.kv_offload_threshold_gb == 2.0
 
 
 def test_low_vram_clamp():
@@ -132,6 +136,7 @@ def test_low_vram_clamp():
     max_hot = int(8 * 0.4 / per_exp)
     assert cfg.gpu_hot_max <= max_hot
     assert cfg.gpu_hot_max >= 16
+    assert cfg.gpu_hot_max == 17
 
 
 def test_device_map_length_enforced():
@@ -202,16 +207,16 @@ def test_auto_multi_gpu_4x_unknown():
                    vram_total_gb=24,
                    n_gpu=4)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # fallback: gpu_hot_cap=32, (22-4)*0.20/(48/1024)=76 → min(76,32)=32
-    assert cfg.gpu_hot_max == 32
+    # fallback 不设 cap, 公式计算: (22-4)*0.20/(48/1024)=76, cap 64 → 64
+    assert cfg.gpu_hot_max == 64
     assert cfg.devices == tuple(f"cuda:{i}" for i in range(4))
     assert len(cfg.device_map) == 43
     # (43+4-1)//4 = 11 → 前 3 卡各 11 层, 末卡 10
     counts = [cfg.device_map.count(d) for d in range(4)]
     assert counts == [11, 11, 11, 10], f"unexpected dist: {counts}"
     assert sum(counts) == 43
-    # fallback 显式设置 triton_preset=(16,16,32), 不走 SM 自动
-    assert cfg.triton_blocks == (16, 16, 32)
+    # SM=82, fallback triton_preset=auto → (16, 32, 32)
+    assert cfg.triton_blocks == (16, 32, 32)
 
 
 def test_auto_multi_gpu_does_not_trigger_on_n_gpu_1():
