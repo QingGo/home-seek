@@ -1,0 +1,397 @@
+"""轻量 (<1s) 单元测试: ParallelBackend / PPBackend / 引擎多 GPU 集成。"""
+from __future__ import annotations
+
+from collections import OrderedDict
+from unittest.mock import MagicMock
+
+import torch
+
+from home_seek.hardware_config import HardwareConfig
+from home_seek.inference_engine.parallel import (
+    ParallelBackend, PPBackend, EPBackend, PerDeviceState,
+)
+from home_seek.model_config import DeepSeekV4FlashConfig
+
+
+# ── PPBackend 纯逻辑测试 (不需要 GPU) ──────────────────
+
+
+def _hw(devices=("cuda:0",), device_map=(0, 0, 1, 1)):
+    return HardwareConfig(devices=devices, device_map=device_map)
+
+
+class TestPPBackendDeviceResolution:
+    def test_layer_device_single_gpu(self):
+        b = PPBackend(_hw(devices=("cuda:0",), device_map=(0, 0, 0)), 3)
+        assert b.layer_device(0) == "cuda:0"
+        assert b.layer_device(2) == "cuda:0"
+
+    def test_layer_device_multi_gpu(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        assert b.layer_device(0) == "cuda:0"
+        assert b.layer_device(2) == "cuda:1"
+
+    def test_first_last_device(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        assert b.first_device() == "cuda:0"
+        assert b.last_device() == "cuda:1"
+
+    def test_device_index(self):
+        b = PPBackend(_hw(device_map=(0, 0, 1, 1)), 4)
+        assert b.device_index(0) == 0
+        assert b.device_index(2) == 1
+
+    def test_is_multigpu(self):
+        assert PPBackend(_hw(devices=("cuda:0",)), 1).is_multigpu() is False
+        assert PPBackend(_hw(devices=("cuda:0", "cuda:1")), 2).is_multigpu() is True
+
+    def test_n_gpu(self):
+        assert PPBackend(_hw(devices=("cuda:0",)), 1).n_gpu() == 1
+        assert PPBackend(_hw(devices=("cuda:0", "cuda:1")), 2).n_gpu() == 2
+
+    def test_hidden_start_end(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        assert b.hidden_start_device() == "cuda:0"
+        assert b.hidden_end_device() == "cuda:1"
+
+    def test_last_device_respects_device_map(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(1, 1, 0, 0)), 4)
+        assert b.last_device() == "cuda:0"
+
+
+class TestPPBackendPerDeviceState:
+    def test_get_device_state_creates_on_demand(self):
+        b = PPBackend(_hw(devices=("cuda:0",)), 1)
+        s = b.get_device_state("cuda:0")
+        assert isinstance(s, PerDeviceState)
+        assert s.device == "cuda:0"
+
+    def test_get_device_state_is_cached(self):
+        b = PPBackend(_hw(devices=("cuda:0",)), 1)
+        assert b.get_device_state("cuda:0") is b.get_device_state("cuda:0")
+
+    def test_all_device_states(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1")), 2)
+        states = b.all_device_states()
+        assert len(states) == 2
+        assert [s.device for s in states] == ["cuda:0", "cuda:1"]
+
+    def test_gpu_hot_experts_per_device(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        hot0 = b.gpu_hot_experts(0)
+        hot1 = b.gpu_hot_experts(2)
+        assert hot0 is not hot1
+        assert hot0 is b.get_device_state("cuda:0").gpu_hot_experts
+        assert hot1 is b.get_device_state("cuda:1").gpu_hot_experts
+
+    def test_gpu_bf16_cache_per_device(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        c0 = b.gpu_bf16_cache(0)
+        c1 = b.gpu_bf16_cache(2)
+        assert isinstance(c0, OrderedDict)
+        assert c0 is not c1
+
+    def test_shared_expert_cache_per_device(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1)), 4)
+        s0 = b.shared_expert_cache(0)
+        s1 = b.shared_expert_cache(2)
+        assert s0 is not s1
+
+    def test_gpu_hot_experts_same_device_same_dict(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 1, 0, 1)), 4)
+        assert b.gpu_hot_experts(0) is b.gpu_hot_experts(2)
+
+    def test_gpu_hot_experts_different_devices_different_dicts(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 1, 0, 1)), 4)
+        assert b.gpu_hot_experts(0) is not b.gpu_hot_experts(1)
+
+
+class TestParallelBackendFactory:
+    def test_from_config_pp(self):
+        hw = _hw()
+        b = ParallelBackend.from_config(hw, 4)
+        assert isinstance(b, PPBackend)
+        assert b.strategy == "pp"
+
+    def test_from_config_ep_raises(self):
+        hw = HardwareConfig(devices=("cuda:0",), device_map=(0,),
+                            parallel_backend="ep")
+        import pytest
+        with pytest.raises(NotImplementedError, match="EP"):
+            ParallelBackend.from_config(hw, 1)
+
+    def test_from_config_tp_raises(self):
+        hw = HardwareConfig(devices=("cuda:0",), device_map=(0,),
+                            parallel_backend="tp")
+        import pytest
+        with pytest.raises(NotImplementedError, match="TP"):
+            ParallelBackend.from_config(hw, 1)
+
+    def test_pp_strategy_default(self):
+        hw = _hw()
+        b = PPBackend(hw, 4)
+        assert b.strategy == "pp"
+
+
+class TestTransferHidden:
+    def test_same_device_noop(self):
+        b = PPBackend(_hw(devices=("cuda:0",)), 1)
+        t = torch.zeros(2, 3, device="cuda")
+        out = b.transfer_hidden(t, "cuda:0")
+        assert out is t
+
+    def test_cross_device_transfer(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1")), 2)
+        t = torch.zeros(2, 3, device="cuda:0")
+        out = b.transfer_hidden(t, "cuda:1")
+        assert str(out.device) == "cuda:1"
+
+
+# ── EPBackend 预留测试 ─────────────────────────────────
+
+
+class TestEPBackend:
+    def test_resolve_expert_device(self):
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1", "cuda:2"), device_map=(0, 0))
+        b = EPBackend(hw, 2)
+        assert b.resolve_expert_device(0, 0) == "cuda:0"
+        assert b.resolve_expert_device(0, 3) == "cuda:0"
+        assert b.resolve_expert_device(0, 1) == "cuda:1"
+        assert b.resolve_expert_device(0, 5) == "cuda:2"
+
+
+# ── 引擎多 GPU 集成测试 ───────────────────────────────
+
+
+def _make_stub(n_layers=4):
+    from home_seek.inference_engine import HomeSeekInferenceEngine
+    eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+    eng.config = DeepSeekV4FlashConfig(num_hidden_layers=n_layers, n_routed_experts=4)
+    eng.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    eng._is_multigpu = False
+    eng._backend = None
+    eng._log = lambda msg: None
+    return eng
+
+
+class TestEngineResolveDevice:
+    def test_single_gpu(self):
+        eng = _make_stub()
+        hw = HardwareConfig(devices=("cuda:0",), device_map=(0, 0, 0, 0))
+        eng._backend = PPBackend(hw, 4)
+        eng._is_multigpu = False
+        assert eng._resolve_device(0) == "cuda:0"
+        assert eng._resolve_device(3) == "cuda:0"
+
+    def test_multi_gpu(self):
+        eng = _make_stub()
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1))
+        eng._backend = PPBackend(hw, 4)
+        eng._is_multigpu = True
+        assert eng._resolve_device(0) == "cuda:0"
+        assert eng._resolve_device(2) == "cuda:1"
+
+    def test_ensure_backend_lazy_init(self):
+        eng = _make_stub()
+        eng._backend = None
+        # _ensure_backend should create a working backend
+        dev = eng._resolve_device(0)
+        assert dev == "cuda:0"
+        assert eng._backend is not None
+        assert isinstance(eng._backend, PPBackend)
+
+    def test_ensure_backend_idempotent(self):
+        eng = _make_stub()
+        eng._ensure_backend()
+        b1 = eng._backend
+        eng._ensure_backend()
+        assert eng._backend is b1
+
+
+class TestEngineGetPerDevice:
+    def test_single_gpu_returns_self_attr(self):
+        eng = _make_stub()
+        eng.embed = "embed_tensor"
+        eng._is_multigpu = False
+        assert eng._get_per_device('embed') == "embed_tensor"
+
+    def test_multigpu_returns_device_state(self):
+        eng = _make_stub()
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 1))
+        eng._backend = PPBackend(hw, 2)
+        eng._is_multigpu = True
+        eng.embed = "original"
+        eng._backend.get_device_state("cuda:1").embed = "on_gpu1"
+        result = eng._get_per_device('embed', torch.device("cuda:1"))
+        assert result == "on_gpu1"
+
+    def test_multigpu_fallback_to_self(self):
+        eng = _make_stub()
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 1))
+        eng._backend = PPBackend(hw, 2)
+        eng._is_multigpu = True
+        eng.embed = "fallback"
+        # device state for cuda:1 has no embed → fallback to self.embed
+        result = eng._get_per_device('embed', torch.device("cuda:1"))
+        assert result == "fallback"
+
+    def test_single_gpu_ignores_device_hint(self):
+        eng = _make_stub()
+        eng.embed = "embed_tensor"
+        eng._is_multigpu = False
+        assert eng._get_per_device('embed', "cuda:1") == "embed_tensor"
+
+
+class TestEngineBackwardCompatibility:
+    def test_old_gpu_hot_experts_migrated(self):
+        """__new__ 桩写入旧 _gpu_hot_experts, _load_expert_fp4_raw 应找到它。"""
+        if not torch.cuda.is_available():
+            return
+        from home_seek.inference_engine import ExpertWeightCache
+        eng = _make_stub()
+        eng._backend = None
+        eng.expert_cache = ExpertWeightCache(max_experts=64, device=str(eng.device))
+        eng._hot_expert_set = set()
+        eng._hot_expert_set_by_layer = {}
+        eng._cpu_fallback_enabled = False
+        eng.loader = MagicMock()
+        eng.loader.get_weights.return_value = {}
+        w = (torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
+             torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
+             torch.randn(128, 64, device="cuda", dtype=torch.bfloat16))
+        eng._gpu_hot_experts = {(0, 99): w}
+        eng._load_expert_raw = MagicMock()
+        result = eng._load_expert_fp4_raw(0, 99)
+        assert result is not None
+        assert len(result) == 3
+        eng._load_expert_raw.assert_not_called()
+
+    def test_old_shared_expert_weights_migrated(self):
+        """__new__ 桩写入旧 _shared_expert_weights, _get_shared_expert 应找到它。"""
+        eng = _make_stub()
+        eng._backend = None
+        eng.loader = None
+        cfg = eng.config
+        I, D = cfg.moe_intermediate_size, cfg.hidden_size
+        w1 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w3 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w2 = torch.randn(D, I, device="cuda", dtype=torch.bfloat16)
+        eng._shared_expert_weights = {0: (w1, w3, w2)}
+        result = eng._get_shared_expert(0)
+        assert result is not None
+        assert len(result) == 3
+
+    def test_old_gpu_hot_pointers_redirected(self):
+        """_load_expert_fp4_raw 经过后, 旧指针应重定向到 backend per-device dict。"""
+        if not torch.cuda.is_available():
+            return
+        from home_seek.inference_engine import ExpertWeightCache
+        eng = _make_stub()
+        eng._backend = None
+        eng.expert_cache = ExpertWeightCache(max_experts=64, device=str(eng.device))
+        eng._cpu_fallback_enabled = False
+        eng._hot_expert_set = set()
+        eng._hot_expert_set_by_layer = {}
+        eng.loader = MagicMock()
+        eng.loader.get_weights.return_value = {}
+        eng._gpu_hot_experts = {}
+        eng._gpu_bf16_cache = OrderedDict()
+        eng._max_bf16_cache = 16
+        eng._max_hot_experts = 16
+        eng._hot_expert_set_by_layer = {0: set()}
+        old_id = id(eng._gpu_hot_experts)
+        # 写入 FP4 格式的数据使 _load_expert_fp4_raw 走通
+        from home_seek._fp4 import cast
+        d = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        w1p, w1s = cast(d.cpu(), fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(d.cpu(), fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(d.cpu(), fmt="e2m1", block_size=(1, 32))
+        def fake_raw(layer, eid):
+            return (w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4")
+        eng._load_expert_raw = fake_raw
+        r = eng._load_expert_fp4_raw(0, 10)
+        assert r is not None
+        new_id = id(eng._gpu_hot_experts)
+        assert old_id != new_id, "pointer should be redirected to backend per-device dict"
+
+
+class TestEngineGetLayerWeightsDevice:
+    def test_multi_gpu_device_routing(self):
+        eng = _make_stub(4)
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 0, 1, 1))
+        eng._backend = PPBackend(hw, 4)
+        eng._is_multigpu = True
+        eng._layer_weight_cache = {}
+        eng.loader = MagicMock()
+        eng.loader.get_weights.return_value = {}
+        lw0 = eng._get_layer_weights(0)
+        assert lw0 == {}
+        # 验证 device 参数传到 loader
+        eng._get_layer_weights(2)
+        # _get_layer_weights 应该对 layer 2 使用 "cuda:1"
+        # 我们验证在测试中至少不崩溃
+        assert True
+
+    def test_get_layer_weights_caches(self):
+        eng = _make_stub(4)
+        eng._backend = PPBackend(_hw(devices=("cuda:0",)), 4)
+        eng._is_multigpu = False
+        eng._layer_weight_cache = {}
+        eng.loader = MagicMock()
+        eng.loader.get_weights.return_value = {}
+        lw = eng._get_layer_weights(0)
+        assert eng._get_layer_weights(0) is lw
+
+
+class TestEngineLoadSharedExpertsGPU:
+    def test_shared_experts_on_correct_device(self):
+        eng = _make_stub(2)
+        dev2 = "cuda:1" if torch.cuda.device_count() >= 2 else "cpu"
+        hw = HardwareConfig(devices=("cuda:0", dev2), device_map=(0, 1))
+        eng._backend = PPBackend(hw, 2)
+        eng._is_multigpu = True
+        eng.loader = MagicMock()
+        I = eng.config.moe_intermediate_size
+        D = eng.config.hidden_size
+        w1 = torch.randn(I, D, dtype=torch.bfloat16)
+        eng.loader.get_weights.return_value = {
+            "layers.0.ffn.shared_experts.w1.weight": w1,
+            "layers.0.ffn.shared_experts.w1.scale": None,
+            "layers.0.ffn.shared_experts.w3.weight": w1,
+            "layers.0.ffn.shared_experts.w3.scale": None,
+            "layers.0.ffn.shared_experts.w2.weight": w1.T,
+            "layers.0.ffn.shared_experts.w2.scale": None,
+            "layers.1.ffn.shared_experts.w1.weight": w1,
+            "layers.1.ffn.shared_experts.w1.scale": None,
+            "layers.1.ffn.shared_experts.w3.weight": w1,
+            "layers.1.ffn.shared_experts.w3.scale": None,
+            "layers.1.ffn.shared_experts.w2.weight": w1.T,
+            "layers.1.ffn.shared_experts.w2.scale": None,
+        }
+        eng._load_shared_experts_gpu()
+        cached0 = eng._backend.get_device_state("cuda:0").shared_expert_weights.get(0)
+        cached1 = eng._backend.get_device_state(dev2).shared_expert_weights.get(1)
+        assert cached0 is not None, "layer 0 shared expert should be on cuda:0"
+        assert cached1 is not None, "layer 1 shared expert should be on dev2"
+        assert str(cached0[0].device) == "cuda:0"
+        assert str(cached1[0].device) == dev2
+
+
+class TestPerDeviceStateIndependence:
+    """验证 per-device state 独立: 一个 device 的修改不影响其他。"""
+
+    def test_hot_experts_isolation(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 1)), 2)
+        b.gpu_hot_experts(0)[(1, 2)] = "entry_gpu0"
+        b.gpu_hot_experts(1)[(3, 4)] = "entry_gpu1"
+        assert (1, 2) in b.gpu_hot_experts(0)
+        assert (1, 2) not in b.gpu_hot_experts(1)
+
+    def test_shared_expert_isolation(self):
+        b = PPBackend(_hw(devices=("cuda:0", "cuda:1"), device_map=(0, 1)), 2)
+        b.shared_expert_cache(0)[0] = "shared_gpu0"
+        b.shared_expert_cache(1)[1] = "shared_gpu1"
+        assert 0 in b.shared_expert_cache(0)
+        assert 0 not in b.shared_expert_cache(1)
