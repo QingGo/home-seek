@@ -754,7 +754,8 @@ class TestDownloadCli:
     """home-seek download CLI contract."""
 
     def test_error_on_existing_dir(self):
-        import tempfile, os
+        import tempfile
+        import os
         from home_seek.__main__ import cmd_download
         tmp = tempfile.mkdtemp()
         class Args: dir = tmp; source = "modelscope"
@@ -973,3 +974,104 @@ class TestGQAFusedAttention:
         out = gqa_fused_attn(q.float(), kv)
         assert torch.allclose(out, ref, atol=1e-3, rtol=1e-2), \
             f"Full path mismatch: maxdiff={(out-ref).abs().max().item():.6f}"
+
+
+class TestTokenBuffer:
+    """_TokenBuffer ensures byte-level BPE partial sequences are never emitted."""
+
+    def test_normal_text_emitted_immediately(self):
+        from home_seek.api_server import _TokenBuffer
+
+        TEXT = "Hello"
+
+        class _Tok:
+            def decode(self, ids, skip_special_tokens=True):
+                return TEXT[:len(ids)]
+
+        buf = _TokenBuffer(_Tok())
+        out = []
+        for i in range(5):
+            out.append(buf.add(i))
+        assert out == ["H", "e", "l", "l", "o"], f"Got {out}"
+
+    def test_byte_tokens_held_back_then_resolved(self):
+        from home_seek.api_server import _TokenBuffer
+
+        class _Tok:
+            _BL = {0: b'\xe3', 1: b'\x81', 2: b'\x8a'}
+
+            def decode(self, ids, skip_special_tokens=True):
+                bs = b''.join(self._BL[i] for i in ids if i in self._BL)
+                return bs.decode('utf-8', errors='replace')
+
+        buf = _TokenBuffer(_Tok())
+        assert buf.add(0) == ""   # single byte → "�", held back
+        assert buf.add(1) == ""   # two bytes → "��", held back
+        assert buf.add(2) == "お"  # three bytes → valid CJK
+
+    def test_mixed_tokens(self):
+        from home_seek.api_server import _TokenBuffer
+
+        class _Tok:
+            _M = {0: b'\xe3', 1: b'\x81', 2: b'\x8a', 3: b'W', 4: b'o', 5: b'r', 6: b'l', 7: b'd'}
+
+            def decode(self, ids, skip_special_tokens=True):
+                bs = b''.join(self._M[i] for i in ids)
+                return bs.decode('utf-8', errors='replace')
+
+        buf = _TokenBuffer(_Tok())
+        out = []
+        for i in range(8):
+            out.append(buf.add(i))
+        assert out == ["", "", "お", "W", "o", "r", "l", "d"], f"Got {out}"
+
+    def test_flush_returns_held_back_text(self):
+        from home_seek.api_server import _TokenBuffer
+
+        class _Tok:
+            _M = {0: b'\xe3', 1: b'\x81', 2: b'\x8a'}
+
+            def decode(self, ids, skip_special_tokens=True):
+                bs = b''.join(self._M[i] for i in ids if i in self._M)
+                return bs.decode('utf-8', errors='replace')
+
+        buf = _TokenBuffer(_Tok())
+        assert buf.add(0) == ""   # single byte → "�"
+        assert buf.add(1) == ""   # two bytes → "��", held back
+        # Without third byte, flush returns the incomplete text
+        rest = buf.flush()
+        assert rest == "�", f"Got {rest!r}"
+
+    def test_reset_clears_buffer(self):
+        from home_seek.api_server import _TokenBuffer
+
+        class _Tok:
+            _M = {0: b'\xe3', 1: b'\x81', 2: b'\x8a'}
+
+            def decode(self, ids, skip_special_tokens=True):
+                bs = b''.join(self._M[i] for i in ids if i in self._M)
+                return bs.decode('utf-8', errors='replace')
+
+        buf = _TokenBuffer(_Tok())
+        buf.add(0)
+        buf.add(1)
+        buf.reset()
+        assert buf.add(2) == ""   # after reset, only id 2 is in buffer → single byte
+        assert buf.flush() != ""  # but flush should still return whatever is there
+
+    def test_eos_token_resets_and_skips(self):
+        """Token ID 1 (EOS) should reset buffer and not be added."""
+        from home_seek.api_server import _TokenBuffer
+
+        class _Tok:
+            _M = {0: b'\xe3', 1: b'\x81', 2: b'\x8a'}
+
+            def decode(self, ids, skip_special_tokens=True):
+                bs = b''.join(self._M[i] for i in ids if i in self._M)
+                return bs.decode('utf-8', errors='replace')
+
+        buf = _TokenBuffer(_Tok())
+        buf.add(0)
+        buf.add(1)
+        buf.add(1)  # reset
+        assert buf.flush() == ""  # buffer was reset, nothing to flush

@@ -22,8 +22,53 @@ import torch
 _logger = logging.getLogger("home-seek")
 _log = _logger.info
 
+
+class _TokenBuffer:
+    """Buffer token IDs so the tokenizer can properly assemble
+    multi-byte UTF-8 sequences from byte-level BPE tokens.
+
+    The tokenizers library uses ``String::from_utf8_lossy`` under the hood,
+    which replaces invalid byte sequences with U+FFFD (replacement character).
+    When we decode a partial multi-byte sequence, the decoded text contains
+    U+FFFD. As more bytes arrive the text can *shrink* (e.g. "��" → "お").
+    This class tracks the first U+FFFD position and never emits text
+    near unresolved byte sequences.
+    """
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self._ids: list[int] = []
+        self._emitted: int = 0
+
+    def reset(self):
+        self._ids.clear()
+        self._emitted = 0
+
+    def add(self, tok_id: int) -> str:
+        self._ids.append(tok_id)
+        text = self.tokenizer.decode(self._ids, skip_special_tokens=True)
+
+        first_bad = text.find('\ufffd')
+        safe_end = first_bad if first_bad >= 0 else len(text)
+
+        if safe_end <= self._emitted:
+            return ""
+        new_text = text[self._emitted:safe_end]
+        self._emitted = safe_end
+        return new_text
+
+    def flush(self) -> str:
+        """Emit any remaining text (call at end of generation)."""
+        if not self._ids:
+            return ""
+        text = self.tokenizer.decode(self._ids, skip_special_tokens=True)
+        if len(text) <= self._emitted:
+            return ""
+        new_text = text[self._emitted:]
+        self._emitted = len(text)
+        return new_text
+
+
 from home_seek.inference_engine import HomeSeekInferenceEngine
-from home_seek.model_config import DeepSeekV4FlashConfig
 
 
 # ── Statistics ──────────────────────────────────────────────────────────
@@ -77,7 +122,7 @@ class InferenceEngine:
         self.hot_experts_path = os.path.abspath(hot_experts)
         if not os.path.exists(self.hot_experts_path):
             _log(f"WARNING: hot_experts file not found: {self.hot_experts_path}")
-            _log(f"  Only hash-layer experts will be pinned at startup.")
+            _log("  Only hash-layer experts will be pinned at startup.")
         else:
             _log(f"Hot experts file: {self.hot_experts_path}")
         self._init_tokenizer()
@@ -189,9 +234,14 @@ async def build_stream_chunks(engine: InferenceEngine, messages: list[dict],
         stream_callback=stream_callback,
     )
 
-    # Yield each token as SSE
-    for i, tid in enumerate(collected_ids):
-        content = engine.tokenizer.decode([tid], skip_special_tokens=True) if tid != 1 else ""
+    # Yield each token as SSE (buffer IDs to properly assemble multi-byte UTF-8)
+    buf = _TokenBuffer(engine.tokenizer)
+    for tid in collected_ids:
+        if tid == 1:
+            continue
+        content = buf.add(tid)
+        if not content:
+            continue
         chunk = {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion.chunk",
@@ -200,6 +250,22 @@ async def build_stream_chunks(engine: InferenceEngine, messages: list[dict],
             "choices": [{
                 "index": 0,
                 "delta": {"content": content},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    # Flush any held-back text (incomplete byte sequences at end of generation)
+    rest = buf.flush()
+    if rest:
+        chunk = {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": rest},
                 "finish_reason": None,
             }],
         }
@@ -328,7 +394,7 @@ def start_http_server(engine: InferenceEngine, host: str = "0.0.0.0", port: int 
                     "data": [{"id": "home-seek", "object": "model", "created": int(time.time()),
                               "owned_by": "home-seek"}],
                 })
-                _log(f"200 GET /v1/models")
+                _log("200 GET /v1/models")
             else:
                 self._send_json({"error": "not found"}, 404)
                 _log(f"404 GET {self.path}")
@@ -378,13 +444,23 @@ def start_http_server(engine: InferenceEngine, host: str = "0.0.0.0", port: int 
                         self.wfile.write(f"data: {json.dumps(c, ensure_ascii=False)}\n\n".encode())
                         self.wfile.flush()
 
+                    tok_buf = _TokenBuffer(engine.tokenizer)
                     def cb(tok_id):
-                        _write_chunk(engine.tokenizer.decode([tok_id], skip_special_tokens=True))
+                        nonlocal tok_buf
+                        if tok_id == 1:
+                            tok_buf.reset()
+                            return
+                        content = tok_buf.add(tok_id)
+                        if content:
+                            _write_chunk(content)
 
                     new_ids, req_stats = engine.generate(input_ids,
                         max_new_tokens=body_data.get("max_tokens", 2048),
                         temperature=body_data.get("temperature", 0.0),
                         stream_callback=cb)
+                    rest = tok_buf.flush()
+                    if rest:
+                        _write_chunk(rest)
                     dt = time.time() - t0
                     _log(f"200 stream done in {dt:.1f}s  (gen={len(new_ids)} tok)")
                     stats_dict = {
@@ -428,9 +504,9 @@ def start_http_server(engine: InferenceEngine, host: str = "0.0.0.0", port: int 
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"\nAPI server on http://{host}:{port}")
-    print(f"  POST /v1/chat/completions  (OpenAI-compatible)")
-    print(f"  GET  /v1/models")
-    print(f"  Thinking mode: send thinking=true in request body")
+    print("  POST /v1/chat/completions  (OpenAI-compatible)")
+    print("  GET  /v1/models")
+    print("  Thinking mode: send thinking=true in request body")
     try:
         while True:
             time.sleep(3600)
@@ -443,14 +519,13 @@ def start_http_server(engine: InferenceEngine, host: str = "0.0.0.0", port: int 
 
 def interactive_mode(engine: InferenceEngine, show_stats: bool = True):
     """REPL loop with commands."""
-    import readline
     print(f"\n{'='*60}")
-    print(f"Home-Seek Interactive")
+    print("Home-Seek Interactive")
     print(f"{'='*60}")
     print(f"Commands:  /think     toggle thinking mode (current: {engine.thinking_mode})")
-    print(f"           /stats     show statistics summary")
-    print(f"           /help      this help")
-    print(f"           /quit      exit")
+    print("           /stats     show statistics summary")
+    print("           /help      this help")
+    print("           /quit      exit")
     print(f"{'='*60}\n")
 
     history = []
@@ -507,10 +582,14 @@ def interactive_mode(engine: InferenceEngine, show_stats: bool = True):
             print("  ", end="", flush=True)
 
         collected = []
+        tok_buf = _TokenBuffer(engine.tokenizer)
         def cb(tok_id):
             collected.append(tok_id)
             if show_stats:
-                text = engine.tokenizer.decode([tok_id], skip_special_tokens=True)
+                if tok_id == 1:
+                    tok_buf.reset()
+                    return
+                text = tok_buf.add(tok_id)
                 if text:
                     print(text, end="", flush=True)
 
@@ -518,6 +597,10 @@ def interactive_mode(engine: InferenceEngine, show_stats: bool = True):
             input_ids, max_new_tokens=2048, temperature=0.0,
             stream_callback=cb if show_stats else None,
         )
+        if show_stats:
+            rest = tok_buf.flush()
+            if rest:
+                print(rest, end="", flush=True)
         total_s = time.perf_counter() - t_start
 
         if not show_stats:

@@ -49,7 +49,7 @@ def cmd_download(args):
     dest = os.path.abspath(args.dir)
     if os.path.exists(dest):
         print(f"Error: directory already exists: {dest}")
-        print(f"  Remove it first, or choose a different path with --dir")
+        print("  Remove it first, or choose a different path with --dir")
         sys.exit(1)
 
     source = args.source
@@ -58,8 +58,8 @@ def cmd_download(args):
 
     print(f"Downloading {repo} from {service} ...")
     print(f"  Target: {dest}")
-    print(f"  Size:   ~150 GB (46 safetensor files)")
-    print(f"  This may take a long time depending on your connection.")
+    print("  Size:   ~150 GB (46 safetensor files)")
+    print("  This may take a long time depending on your connection.")
     print()
 
     try:
@@ -72,8 +72,8 @@ def cmd_download(args):
         print(f"\nDone! Weights saved to {dest}")
     except ImportError as e:
         print(f"Error: missing dependency: {e}")
-        print(f"  For ModelScope: pip install modelscope")
-        print(f"  For HuggingFace: pip install huggingface-hub")
+        print("  For ModelScope: pip install modelscope")
+        print("  For HuggingFace: pip install huggingface-hub")
         sys.exit(1)
     except Exception as e:
         print(f"Error downloading: {e}")
@@ -92,7 +92,7 @@ def cmd_server(args):
         sys.exit(1)
     if not os.path.isfile(config_path):
         print(f"Error: {config_path} not found")
-        print(f"  The directory exists but doesn't contain model weights.")
+        print("  The directory exists but doesn't contain model weights.")
         _print_download_help()
         sys.exit(1)
 
@@ -103,7 +103,7 @@ def cmd_server(args):
 
     print("Home-Seek Server", flush=True)
     print(f"  Model: {weight_dir}", flush=True)
-    print(f"  Initializing...", end=" ", flush=True)
+    print("  Initializing...", end=" ", flush=True)
     t0 = time.time()
 
     hot_path = os.path.join(weight_dir, "..", "hot_experts.json")
@@ -123,10 +123,10 @@ def cmd_server(args):
 
 def _print_download_help():
     print()
-    print(f"  To download model weights:")
-    print(f"    home-seek download                     # ModelScope (China, fast)")
-    print(f"    home-seek download --source huggingface # Hugging Face")
-    print(f"    home-seek download --dir /path/to/weights")
+    print("  To download model weights:")
+    print("    home-seek download                     # ModelScope (China, fast)")
+    print("    home-seek download --source huggingface # Hugging Face")
+    print("    home-seek download --dir /path/to/weights")
     print()
 
 
@@ -143,11 +143,11 @@ def cmd_cli(args):
     except urllib.error.URLError as e:
         print(f"Error: cannot connect to Home-Seek server at {base}")
         if isinstance(e.reason, ConnectionRefusedError):
-            print(f"  The server is not running.")
+            print("  The server is not running.")
         else:
             print(f"  {e.reason}")
         print()
-        print(f"  Start the server first:")
+        print("  Start the server first:")
         print(f"    home-seek server --port {port}")
         sys.exit(1)
     except Exception as e:
@@ -275,7 +275,8 @@ def cmd_cli(args):
             collected = []
             for token_text, stats in stream_chat(raw):
                 if token_text:
-                    print(token_text, end="", flush=True)
+                    sys.stdout.buffer.write(token_text.encode('utf-8'))
+                    sys.stdout.buffer.flush()
                     collected.append(token_text)
                 if stats:
                     last_s = stats
