@@ -234,9 +234,6 @@ class HomeSeekInferenceEngine:
                       f"{self._backend.n_gpu()} devices, "
                       f"device_map={self._backend.device_map}")
 
-        # 多 GPU: 复制 embed/lm_head/norm 到所有相关 device
-        self._replicate_global_weights()
-
         if self._hot_expert_ids:
             self._preload_hot_experts_cpu_cache()
             self._preload_gpu_hot_experts()
@@ -2273,7 +2270,7 @@ class HomeSeekInferenceEngine:
         start = time.time()
 
         if not skip_prefill:
-            h = self._get_per_device('embed').to(torch.bfloat16)
+            h = self._get_per_device('embed')[input_ids].to(torch.bfloat16)
             h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
             self._phase = "prefill"
@@ -2337,7 +2334,7 @@ class HomeSeekInferenceEngine:
         step = 0
         while step < max_new_tokens - 1:
             self._global_pos = T + step
-            h = self._get_per_device('embed', next_id.device).to(torch.bfloat16)
+            h = self._get_per_device('embed', next_id.device)[next_id].to(torch.bfloat16)
             h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):
                 lw = self._get_layer_weights(layer_idx)
