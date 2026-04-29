@@ -50,6 +50,10 @@ class HardwareConfig:
     device_map: tuple[int, ...] = ()
     """每层对应的 devices 索引。空元组 = 全部用 devices[0] (单卡)。"""
 
+    # ── 并行后端 ────────────────────────────────────
+    parallel_backend: str = "pp"
+    """并行策略: pp (Pipeline Parallel), ep/tp (预留)。"""
+
     # ── 功能开关 ────────────────────────────────────
     prefetch_enabled: bool = True
     """异步预取下一层专家。高 VRAM 时可关闭。"""
@@ -280,6 +284,7 @@ class HardwareConfig:
             "cublas_max_tokens": strategy.get("cublas_max_tokens", 8),
             "devices": devices,
             "device_map": device_map,
+            "parallel_backend": strategy.get("parallel_backend", "pp"),
             "prefetch_enabled": strategy.get("prefetch", True),
             "mtp_enabled": strategy.get("mtp", False),
             "mtp_num_draft": strategy.get("mtp_draft", 2),
