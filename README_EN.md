@@ -1,6 +1,6 @@
 # Home-Seek
 
-**DeepSeek-V4-Flash (284B MoE) Inference Engine on a Single RTX 4090**
+**DeepSeek-V4-Flash (284B MoE) Inference Engine — Single & Multi-GPU, Auto-Adapting**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -275,7 +275,8 @@ During prefill, all T tokens are processed in parallel through the FFN: each uni
 | **MTP argmax (t=0)** | stable acceptance | Draft uses argmax when temperature=0, eliminating random noise. |
 | **MTP KV cache + fused verify** | +44% (0.96→1.38) | Cross-step KV cache + `torch.cat` single forward |
 | **4-tier cache hierarchy** | core architecture | CPU FP4 LRU + GPU hot FIFO + GPU BF16 FIFO + page cache, makes single-GPU 284B feasible |
-| **KV cache CPU offload** | enables long context | Auto-offloads old KV to CPU when VRAM >18GB (`generate()` L2157) |
+| **HardwareConfig** | multi-hardware adaptation | Centralized config, 6 presets (`4090`/`a100`/`h20`/`rtx pro 6000`/`2080`/fallback), auto multi-GPU device_map |
+| **KV cache CPU offload** | enables long context | Auto-offloads to CPU when VRAM exceeds `HardwareConfig.kv_offload_threshold_gb` |
 
 ---
 
@@ -424,6 +425,7 @@ src/home_seek/
 ├── profiling_runner.py        # Profiling entry point
 ├── expert_predictor.py        # Expert prediction (HeuristicPredictor)
 ├── hw_profile.py              # Hardware performance probing
+├── hardware_config.py         # HardwareConfig — centralized hardware parameters
 └── encoding_dsv4.py           # Message encoding (DeepSeek V4 format)
 
 tests/

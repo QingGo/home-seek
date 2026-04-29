@@ -1,6 +1,6 @@
 # Home-Seek
 
-**单卡 RTX 4090 推理 DeepSeek-V4-Flash (284B MoE)**
+**单卡/多卡 RTX 4090 推理 DeepSeek-V4-Flash (284B MoE)，自动多 GPU 适配**
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -274,8 +274,9 @@ Prefill 是 43 层全序列前向。得益于混合注意力设计（SWA 线性 
 | **热专家预装** | 减少冷 miss | 启动时从 `hot_experts.json` 预装每层 hot 到 GPU FIFO |
 | **MTP argmax (t=0)** | 稳定接受率 | temperature=0 时 draft 也 argmax, 消除随机噪声 |
 | **MTP KV cache + 融合验证** | +44% (0.96→1.38) | 跨步注意力 KV cache + torch.cat 单次 forward |
-| **四级缓存体系** | 核心架构 | CPU FP4 LRU + GPU hot FIFO + GPU BF16 FIFO + page cache, 单卡跑 284B 成为可能 |
-| **KV cache CPU offload** | 支持长上下文 | 显存 >18GB 时自动将旧 KV 移出 GPU (`generate()` 第 2157 行) |
+| **四级缓存体系** | 核心架构 | CPU FP4 LRU + GPU hot FIFO + GPU BF16 FIFO + page cache, 单卡跑 284B 成可能 |
+| **HardwareConfig** | 多硬件适配 | 参数集中管理, 6 种预设策略 (`4090`/`a100`/`h20`/`rtx pro 6000`/`2080`/fallback), 自动多卡 device_map |
+| **KV cache CPU offload** | 支持长上下文 | 显存超阈值时自动将旧 KV 移出 GPU, 阈值由 `HardwareConfig.kv_offload_threshold_gb` 控制 |
 
 ---
 
@@ -428,6 +429,7 @@ src/home_seek/
 ├── profiling_runner.py        # 性能分析入口
 ├── expert_predictor.py        # 专家预测 (HeuristicPredictor)
 ├── hw_profile.py              # 硬件性能探测
+├── hardware_config.py         # HardwareConfig — 所有硬件参数集中管理
 └── encoding_dsv4.py           # 消息编码 (DeepSeek V4 格式)
 
 tests/
