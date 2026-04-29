@@ -195,11 +195,11 @@ def test_auto_multi_gpu_8x4090():
     assert sum(counts) == 43
 
 
-def test_auto_multi_gpu_4x3090():
-    """4×3090 (fallback, 无预设): n_gpu=4, fallback 策略 + 自动多卡."""
+def test_auto_multi_gpu_4x_unknown():
+    """4×未知 GPU: n_gpu=4, fallback 策略 + 自动多卡."""
     hw = HWProfile(vram_free_gb=22, sm_count=82,
-                   gpu_name="NVIDIA GeForce RTX 3090",
-                   vram_total_gb=24, mem_bw_gb_s=936,
+                   gpu_name="Unknown GPU Model",
+                   vram_total_gb=24,
                    n_gpu=4)
     cfg = HardwareConfig.auto(hw, _test_config())
     # fallback: gpu_hot_cap=32, (22-4)*0.20/(48/1024)=76 → min(76,32)=32
@@ -255,3 +255,96 @@ def test_auto_multi_gpu_device_map_distributes_evenly():
         hw, DeepSeekV4FlashConfig(num_hidden_layers=4, n_routed_experts=4))
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert cfg.device_map == (0, 0, 1, 1)
+
+
+# ── 新 GPU 策略 ───────────────────────────────────────
+
+
+def test_4090d_defaults():
+    """RTX 4090 D: 与 4090 基线相同, 但通过 '4090 d' 匹配."""
+    hw = HWProfile(vram_free_gb=22, sm_count=128,
+                   gpu_name="NVIDIA GeForce RTX 4090 D",
+                   vram_total_gb=24, n_gpu=1)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    assert cfg.gpu_hot_max == 64
+    assert cfg.gpu_bf16_max == 100
+    assert cfg.devices == ("cuda:0",)
+
+
+def test_4090d_does_not_trigger_on_plain_4090():
+    """RTX 4090 (无 D) 不匹配 '4090 d', 走 '4090' 策略."""
+    hw = HWProfile(vram_free_gb=22, sm_count=128,
+                   gpu_name="NVIDIA GeForce RTX 4090",
+                   vram_total_gb=24)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    assert cfg.gpu_hot_max == 64
+
+
+def test_5090_defaults():
+    """RTX 5090 (32GB, 170+SM, high BW): 大缓存 + MTP."""
+    hw = HWProfile(vram_free_gb=30, sm_count=170,
+                   gpu_name="NVIDIA GeForce RTX 5090",
+                   vram_total_gb=32, mem_bw_gb_s=1800)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    # (30-4)*0.20/(48/1024)=110, cap 128
+    assert cfg.gpu_hot_max == 110
+    # (30-3)*0.80/(48/1024)=461, cap 256
+    assert cfg.gpu_bf16_max == 256
+    assert cfg.cublas_max_tokens == 4
+    assert cfg.prefetch_enabled is False
+    assert cfg.mtp_enabled is True
+    assert cfg.mtp_num_draft == 3
+    assert cfg.triton_blocks == (16, 32, 64)
+
+
+def test_3090_defaults():
+    """RTX 3090 (24GB, 82SM): 同 4090 缓存但 SM 82 → (16,32,32)."""
+    hw = HWProfile(vram_free_gb=22, sm_count=82,
+                   gpu_name="NVIDIA GeForce RTX 3090",
+                   vram_total_gb=24, mem_bw_gb_s=936)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    assert cfg.gpu_hot_max == 64
+    assert cfg.gpu_bf16_max == 100
+    assert cfg.triton_blocks == (16, 32, 32)  # SM=82 auto
+    assert cfg.mtp_enabled is False
+
+
+def test_3080_ti_defaults():
+    """RTX 3080 Ti (12GB, 80SM): 匹配 '3080 ti' 策略 (先于 '3080')."""
+    hw = HWProfile(vram_free_gb=10, sm_count=80,
+                   gpu_name="NVIDIA GeForce RTX 3080 Ti",
+                   vram_total_gb=12, mem_bw_gb_s=912)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    # 10GB free → (10-4)*0.20/(48/1024)=25, cap 48
+    assert cfg.gpu_hot_max == 25
+    assert cfg.gpu_bf16_max == 80  # cap
+    assert cfg.triton_blocks == (16, 32, 32)  # SM=80 auto
+
+
+def test_3080_defaults():
+    """RTX 3080 (10GB, 68SM): 保守缓存 + (16,16,32)."""
+    hw = HWProfile(vram_free_gb=8, sm_count=68,
+                   gpu_name="NVIDIA GeForce RTX 3080",
+                   vram_total_gb=10, mem_bw_gb_s=760)
+    cfg = HardwareConfig.auto(hw, _test_config())
+    # vram clamped to 8 → (8-4)*0.20/(48/1024)=17, cap 32
+    assert cfg.gpu_hot_max == 17
+    # (8-3)*0.80/(48/1024)=85, cap 64
+    assert cfg.gpu_bf16_max == 64
+    assert cfg.triton_blocks == (16, 16, 32)  # SM=68 + preset
+    assert cfg.cublas_max_tokens == 4
+
+
+def test_3080_ti_matches_before_3080():
+    """gpu_name='RTX 3080 Ti' 应匹配 3080 Ti, 不是 3080."""
+    hw_ti = HWProfile(vram_free_gb=10, sm_count=80,
+                       gpu_name="RTX 3080 Ti",
+                       vram_total_gb=12)
+    cfg_ti = HardwareConfig.auto(hw_ti, _test_config())
+    hw_plain = HWProfile(vram_free_gb=8, sm_count=68,
+                          gpu_name="RTX 3080",
+                          vram_total_gb=10)
+    cfg_plain = HardwareConfig.auto(hw_plain, _test_config())
+    assert cfg_ti.gpu_hot_max > cfg_plain.gpu_hot_max  # Ti 更激进
+    assert cfg_ti.triton_blocks == (16, 32, 32)
+    assert cfg_plain.triton_blocks == (16, 16, 32)

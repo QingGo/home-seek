@@ -71,7 +71,17 @@ class HardwareConfig:
     # ────────────────────────────────────────────────
 
     _STRATEGIES: ClassVar[dict[str, dict]] = {
-        # ── 当前基线 ──────────────────────────────────
+        # ── 4090 D (24GB, 128SM, ~0.95 TB/s) ──────────
+        # 必须先于 "4090" 匹配, 避免 "4090 D" 误配到 4090
+        "4090 d": {
+            "gpu_hot_cap": 64,
+            "gpu_bf16_cap": 100,
+            "kv_offload_gb": 18,
+            "cublas_max_tokens": 8,
+            "prefetch": True,
+            "mtp": False,
+        },
+        # ── 当前基线: 4090 (24GB, 128SM, 1.0 TB/s) ────
         "4090": {
             "gpu_hot_cap": 64,
             "gpu_bf16_cap": 100,
@@ -80,7 +90,46 @@ class HardwareConfig:
             "prefetch": True,
             "mtp": False,
         },
-        # ── 配置 1: A100-40GB ────────────────────────
+        # ── 5090 (32GB, 170+SM, ~1.8 TB/s) ────────────
+        "5090": {
+            "gpu_hot_cap": 128,
+            "gpu_bf16_cap": 256,
+            "kv_offload_gb": 26,
+            "cublas_max_tokens": 4,
+            "prefetch": False,
+            "mtp": True,
+            "mtp_draft": 3,
+        },
+        # ── 3090 (24GB, 82SM, 936 GB/s) ───────────────
+        "3090": {
+            "gpu_hot_cap": 64,
+            "gpu_bf16_cap": 100,
+            "kv_offload_gb": 18,
+            "cublas_max_tokens": 8,
+            "prefetch": True,
+            "mtp": False,
+        },
+        # ── 3080 Ti (12GB, 80SM, 912 GB/s) ────────────
+        # 必须先于 "3080" 匹配
+        "3080 ti": {
+            "gpu_hot_cap": 48,
+            "gpu_bf16_cap": 80,
+            "kv_offload_gb": 7,
+            "cublas_max_tokens": 4,
+            "prefetch": True,
+            "mtp": False,
+        },
+        # ── 3080 (10/12GB, 68SM, 760 GB/s) ────────────
+        "3080": {
+            "gpu_hot_cap": 32,
+            "gpu_bf16_cap": 64,
+            "kv_offload_gb": 6,
+            "cublas_max_tokens": 4,
+            "triton_preset": (16, 16, 32),
+            "prefetch": True,
+            "mtp": False,
+        },
+        # ── A100-40GB ────────────────────────────────
         "a100": {
             "gpu_hot_cap": 160,
             "gpu_bf16_cap": 300,
@@ -90,7 +139,7 @@ class HardwareConfig:
             "mtp": True,
             "mtp_draft": 3,
         },
-        # ── 配置 2: H20-96GB ─────────────────────────
+        # ── H20-96GB ─────────────────────────────────
         "h20": {
             "gpu_hot_cap": 1024,
             "gpu_bf16_cap": 512,
@@ -102,7 +151,7 @@ class HardwareConfig:
             "mtp": True,
             "mtp_draft": 4,
         },
-        # ── 配置 3: RTX PRO 6000-96GB ───────────────
+        # ── RTX PRO 6000-96GB ────────────────────────
         "rtx pro 6000": {
             "gpu_hot_cap": 1024,
             "gpu_bf16_cap": 512,
@@ -111,7 +160,7 @@ class HardwareConfig:
             "prefetch": False,
             "mtp": False,
         },
-        # ── 配置 4: 双卡 2080 Ti ─────────────────────
+        # ── 双卡 2080 Ti ─────────────────────────────
         "2080": {
             "gpu_hot_cap": 48,
             "gpu_bf16_cap": 80,
