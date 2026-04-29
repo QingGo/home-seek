@@ -16,6 +16,7 @@ from home_seek.inference_engine.expert_cache import ExpertWeightCache
 import math
 from home_seek.utils import rms_norm
 from home_seek.model_config import DeepSeekV4FlashConfig
+from home_seek.hardware_config import HardwareConfig
 from home_seek.mhc import mhc_split_sinkhorn
 from home_seek.fused_moe import FusedMoEFFN, SharedExpertFFN, clear_deq_cache, triton_dequantize_fp4_all
 from home_seek.compressor import Compressor as NewCompressor
@@ -93,7 +94,8 @@ class HomeSeekInferenceEngine:
     def __init__(self, weight_dir: str = "weights", device: str = "cuda", verbose: bool = False,
                  hot_experts_path: str = "hot_experts.json", preload_all: bool = False,
                  reprobe: bool = False, use_triton: bool = True,
-                 use_gqa_fusion: bool = False):
+                 use_gqa_fusion: bool = False,
+                 hw_overrides: dict | None = None):
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig.from_json(config_path)
         self.weight_dir = weight_dir
@@ -104,6 +106,13 @@ class HomeSeekInferenceEngine:
         self.hw_profile = probe_hardware(force=reprobe, weight_dir=weight_dir) if reprobe else load_profile()
         if self.hw_profile is None:
             self.hw_profile = probe_hardware(force=True, weight_dir=weight_dir)
+        # ── HardwareConfig: 从硬件探测自动推导所有硬件参数 ────────
+        self.hw_config = HardwareConfig.auto(
+            self.hw_profile, self.config,
+            **(hw_overrides or {}),
+        )
+
+        # CPU expert cache size: 兼顾 cgroup 限制
         try:
             _cgroup_max = 96 * 1024**3
             for _p in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
@@ -120,12 +129,12 @@ class HomeSeekInferenceEngine:
             _reserve_bytes = 8 * 1024**3
             _max_by_ram = max(0, (_avail_bytes - _reserve_bytes) // _per_expert_bytes)
             _total_experts = self.config.num_hidden_layers * self.config.n_routed_experts
-            cache_size = max(2048, min(_max_by_ram // 2, _total_experts))
+            cache_size = min(self.hw_config.cpu_cache_max, max(2048, min(_max_by_ram // 2, _total_experts)))
             self._log(f"Host: {_avail_bytes/1e9:.0f} GB cgroup limit, "
                       f"_per_expert={_per_expert_bytes/1e6:.1f} MB, "
                       f"cache_size={cache_size} (~{cache_size*_per_expert_bytes/1e9:.0f} GB)")
         except Exception:
-            cache_size = 8192
+            cache_size = self.hw_config.cpu_cache_max
             self._log(f"Host: unknown RAM, cache_size={cache_size}")
         self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
         self.layer_states: dict[int, LayerState] = {}
@@ -146,12 +155,9 @@ class HomeSeekInferenceEngine:
         self._hot_expert_set: set[int] = set()
         self._hot_expert_set_by_layer: dict[int, set[int]] = {}
         self._gpu_hot_experts: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        _vram_free = max(self.hw_profile.vram_free_gb, 8.0)
-        _expert_bf16_gb = 48.0 / 1024
-        self._max_hot_experts = max(16, min(int((_vram_free - 4) * 0.20 / _expert_bf16_gb), 64))
+        self._max_hot_experts = self.hw_config.gpu_hot_max
         self._gpu_bf16_cache: OrderedDict = OrderedDict()
-        _bf16_budget = max(1, _vram_free - 3)
-        self._max_bf16_cache = max(16, min(int(_bf16_budget * 0.80 / _expert_bf16_gb), 100))
+        self._max_bf16_cache = self.hw_config.gpu_bf16_max
         # Per-layer online hot usage tracking for dynamic GPU cache update
         # Per-layer online hot usage tracking for dynamic GPU cache update
         self._hot_usage_counter: dict[int, dict[int, int]] = {}
@@ -161,7 +167,7 @@ class HomeSeekInferenceEngine:
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        self._prefetch_enabled = True
+        self._prefetch_enabled = self.hw_config.prefetch_enabled
         self._prefetch_prev_layer_eids: dict[int, list[int]] = {}
         self._prefetch_current_eids: dict[int, list[int]] = {}
 
@@ -170,6 +176,7 @@ class HomeSeekInferenceEngine:
         self._mtp_weights: dict[str, torch.Tensor] = {}
         self._mtp_loaded = False
         self._mtp_eager = False
+        self._mtp_num_draft = self.hw_config.mtp_num_draft
         self._last_routed_eids: list[int] = []
         self._warmed_up = False
         self._layer_weight_cache: dict[int, dict[str, torch.Tensor]] = {}
@@ -181,16 +188,29 @@ class HomeSeekInferenceEngine:
             hidden_size=self.config.hidden_size,
             swiglu_limit=self.config.swiglu_limit,
             use_triton=True,
+            triton_blocks=self.hw_config.triton_blocks,
+            cublas_max_tokens=self.hw_config.cublas_max_tokens,
         )
         self._shared_ffn = SharedExpertFFN(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.moe_intermediate_size,
             swiglu_limit=self.config.swiglu_limit,
             use_triton=self._use_triton,
+            triton_blocks=self.hw_config.triton_blocks,
+            cublas_max_tokens=self.hw_config.cublas_max_tokens,
         )
 
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
+
+        # ── 多 GPU 设置 ────────────────────────────────
+        self._devices = self.hw_config.devices
+        self._device_map = self.hw_config.device_map
+        self._is_multigpu = len(self._devices) > 1
+        if self._is_multigpu:
+            self._log(f"Multi-GPU: {len(self._devices)} devices, "
+                      f"device_map={self._device_map}")
+
         if self._hot_expert_ids:
             self._preload_hot_experts_cpu_cache()
             self._preload_gpu_hot_experts()
@@ -334,10 +354,13 @@ class HomeSeekInferenceEngine:
             self.hc_head_scale = self.hc_head_scale.to(torch.float32)
         self._log(f"hc_head_fn: {self.hc_head_fn.shape if self.hc_head_fn is not None else 'missing'}")
 
-    def _get_layer_weights(self, layer_idx: int):
+    def _get_layer_weights(self, layer_idx: int, device: str | None = None):
         if layer_idx in self._layer_weight_cache:
             return self._layer_weight_cache[layer_idx]
         lw = {}
+        if device is None:
+            device = str(self.device) if not self._is_multigpu \
+                else self._devices[self._device_map[layer_idx]]
         keys_needed = [
             f"layers.{layer_idx}.{t}" for t in [
                 "attn_norm.weight", "ffn_norm.weight",
@@ -367,11 +390,11 @@ class HomeSeekInferenceEngine:
         ]
 
         present = self.loader.get_weights(*keys_needed)
+        target = torch.device(device)
         for full_key in keys_needed:
             short_key = full_key.replace(f"layers.{layer_idx}.", "")
             if full_key in present and present[full_key] is not None:
-                t = present[full_key].to(self.device, non_blocking=True)
-                # Pre-cast norm weights to BF16 to avoid repeated .to() in hot loop
+                t = present[full_key].to(target, non_blocking=True)
                 if short_key in ("attn_norm.weight", "ffn_norm.weight") and t.dtype != torch.bfloat16:
                     t = t.to(torch.bfloat16)
                 lw[short_key] = t
@@ -2084,6 +2107,12 @@ class HomeSeekInferenceEngine:
 
     def _forward_layer(self, h: torch.Tensor, lw: dict, layer_idx: int,
                        input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, set]:
+        # 多 GPU: 自动路由到对应 device
+        if self._is_multigpu:
+            target = self._devices[self._device_map[layer_idx]]
+            if str(h.device) != target:
+                h = h.to(target, non_blocking=True)
+                torch.cuda.synchronize(h.device)
         residual_attn = h
         h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
         if lw.get("attn_norm.weight") is not None:
@@ -2156,7 +2185,7 @@ class HomeSeekInferenceEngine:
 
                 if (layer_idx + 1) % 5 == 0:
                     mem = torch.cuda.memory_allocated() / (1024**3)
-                    if mem > 18:
+                    if mem > self.hw_config.kv_offload_threshold_gb:
                         for li in range(max(0, layer_idx - 5), layer_idx + 1):
                             if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
                                 if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
@@ -2194,7 +2223,7 @@ class HomeSeekInferenceEngine:
             T = self._global_pos
             self._log(f"Session resume: pos={T}, max_new={max_new_tokens}")
 
-        mtp_num_draft = getattr(self, '_mtp_num_draft', 2) if self._mtp_loaded else 0
+        mtp_num_draft = self._mtp_num_draft if self._mtp_loaded else 0
         _mtp_total_accepted = 0
         _mtp_total_drafts = 0
         _mtp_total_steps = 0
@@ -2216,7 +2245,7 @@ class HomeSeekInferenceEngine:
 
                 if layer_idx == self.config.num_hidden_layers // 2:
                     mem = torch.cuda.memory_allocated() / (1024**3)
-                    if mem > 18:
+                    if mem > self.hw_config.kv_offload_threshold_gb:
                         for li in range(layer_idx):
                             if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
                                 if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:

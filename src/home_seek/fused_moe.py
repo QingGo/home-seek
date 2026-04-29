@@ -136,18 +136,6 @@ def _triton_fused_down_kernel(
 # Tuning and format detection
 # ──────────────────────────────────────────────────────────────────────
 
-def _tune_blocks(device) -> tuple:
-    props = torch.cuda.get_device_properties(device)
-    sm_count = props.multi_processor_count
-
-    if sm_count >= 100:
-        return 16, 32, 64
-    elif sm_count >= 70:
-        return 16, 32, 32
-    else:
-        return 16, 16, 32
-
-
 def _is_fp4_packed(data: torch.Tensor) -> bool:
     return data is not None and data.dtype == torch.int8
 
@@ -246,6 +234,7 @@ def _triton_batched_swiglu_routedown(
     expert_weights: torch.Tensor,
     I: int,
     swiglu_limit: float = 10.0,
+    triton_blocks: tuple[int, int, int] = (16, 32, 64),
 ) -> torch.Tensor:
     B, I_total = gate.shape
     num_e = expert_weights.shape[1]
@@ -253,7 +242,7 @@ def _triton_batched_swiglu_routedown(
 
     out = torch.empty(B, D, device=gate.device, dtype=torch.bfloat16)
 
-    BM, BN, BK = _tune_blocks(gate.device)
+    BM, BN, BK = triton_blocks
 
     grid_m = triton.cdiv(B, BM)
     grid_n = triton.cdiv(D, BN)
@@ -286,15 +275,18 @@ def fused_expert_ffn_triton(
     w1_scale: Optional[torch.Tensor] = None,
     w3_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    triton_blocks: tuple[int, int, int] | None = None,
+    cublas_max_tokens: int | None = None,
 ) -> torch.Tensor:
     if hidden.device.type != "cuda":
         return fused_expert_ffn_pt(hidden, w1, w3, w2, swiglu_limit)
 
     M = hidden.shape[0]
 
-    # M <= 8: cuBLAS is 8x faster than Triton (15/16 SM idle).
-    # Benefits MTP batch verify (M=3), small-batch decode, and shared expert.
-    if M <= 8:
+    _cublas_max = cublas_max_tokens if cublas_max_tokens is not None else 8
+    _blocks = triton_blocks if triton_blocks is not None else (16, 32, 64)
+
+    if M <= _cublas_max:
         if (_is_fp4_packed(w1) and _is_fp4_packed(w3) and _is_fp4_packed(w2)
                 and w1_scale is not None and w3_scale is not None and w2_scale is not None):
             w1_bf, w3_bf, w2_bf = _dequantize_fp4_to_bf16(w1, w1_scale, w3, w3_scale, w2, w2_scale)
@@ -311,7 +303,8 @@ def fused_expert_ffn_triton(
             w3_s = w3_scale.to(torch.float32) if w3_scale.dtype != torch.float32 else w3_scale
             w2_s = w2_scale.to(torch.float32) if w2_scale.dtype != torch.float32 else w2_scale
             return _fused_fp4_expert_ffn_triton(
-                hidden, w1, w1_s, w3, w3_s, w2, w2_s, swiglu_limit)
+                hidden, w1, w1_s, w3, w3_s, w2, w2_s, swiglu_limit,
+                triton_blocks=_blocks)
         except Exception:
             pass
 
@@ -344,7 +337,7 @@ def fused_expert_ffn_triton(
     if M == 0 or D == 0:
         return torch.zeros(M, D, device=hidden.device, dtype=hidden.dtype)
 
-    BM, BN, BK = _tune_blocks(hidden.device)
+    BM, BN, BK = _blocks
 
     gate = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
     up = torch.empty(M, I, device=hidden.device, dtype=hidden.dtype)
@@ -414,12 +407,16 @@ class FusedMoEFFN:
         hidden_size: int = 4096,
         swiglu_limit: float = 10.0,
         use_triton: bool = True,
+        triton_blocks: tuple[int, int, int] = (16, 32, 64),
+        cublas_max_tokens: int = 8,
     ):
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size
         self.hidden_size = hidden_size
         self.swiglu_limit = swiglu_limit
         self.use_triton = use_triton and torch.cuda.is_available()
+        self._triton_blocks = triton_blocks
+        self._cublas_max_tokens = cublas_max_tokens
 
     def _get_expert_fn(self):
         if self.use_triton:
@@ -522,7 +519,8 @@ class FusedMoEFFN:
 
         if self.use_triton and torch.cuda.is_available() and B >= 16:
             return _triton_batched_swiglu_routedown(
-                gate, up, w2, expert_weights, I, self.swiglu_limit)
+                gate, up, w2, expert_weights, I, self.swiglu_limit,
+                triton_blocks=self._triton_blocks)
         # cuBLAS path (optimal for M=1 decode; scatter handles routing without Python loop)
         g = gate.float().clamp(max=self.swiglu_limit)
         u = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
@@ -541,20 +539,27 @@ class FusedMoEFFN:
 
 class SharedExpertFFN:
     def __init__(self, hidden_size: int = 4096, intermediate_size: int = 2048,
-                 swiglu_limit: float = 10.0, use_triton: bool = True):
+                 swiglu_limit: float = 10.0, use_triton: bool = True,
+                 triton_blocks: tuple[int, int, int] = (16, 32, 64),
+                 cublas_max_tokens: int = 8):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.swiglu_limit = swiglu_limit
         self.use_triton = use_triton and torch.cuda.is_available()
+        self._triton_blocks = triton_blocks
+        self._cublas_max_tokens = cublas_max_tokens
 
     def forward(self, hidden_states: torch.Tensor, w1, w3, w2,
                 dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         B, T, D = hidden_states.shape
         h_2d = hidden_states.reshape(-1, D)
         M = h_2d.shape[0]
-        # M=1 decode: cuBLAS is 8x faster than Triton (15/16 SM idle)
         if self.use_triton and M > 1:
-            out = fused_expert_ffn_triton(h_2d, w1, w3, w2, self.swiglu_limit)
+            out = fused_expert_ffn_triton(
+                h_2d, w1, w3, w2, self.swiglu_limit,
+                triton_blocks=self._triton_blocks,
+                cublas_max_tokens=self._cublas_max_tokens,
+            )
         else:
             out = fused_expert_ffn_pt(h_2d, w1, w3, w2, self.swiglu_limit)
         return out.reshape(B, T, D).to(dtype)
@@ -875,6 +880,7 @@ def _fused_fp4_expert_ffn_triton(
     w3_packed: torch.Tensor, w3_scale: torch.Tensor,
     w2_packed: torch.Tensor, w2_scale: torch.Tensor,
     swiglu_limit: float = 10.0,
+    triton_blocks: tuple[int, int, int] = (16, 32, 64),
 ) -> torch.Tensor:
     """Fused FP4+GEMM: dequantization happens inside the GEMM loop, no intermediate BF16 tensor."""
     M = hidden.shape[0]
@@ -886,7 +892,7 @@ def _fused_fp4_expert_ffn_triton(
 
     lut = _FP4_LUT.to(hidden.device)
 
-    BM, BN, _ = _tune_blocks(hidden.device)
+    BM, BN, _ = triton_blocks
     BK_FP4 = 32  # aligned to one scale group
 
     grid_m = triton.cdiv(M, BM)

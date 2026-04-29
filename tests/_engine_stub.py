@@ -41,8 +41,12 @@ class EngineStub:
         eng._deq_cache = OrderedDict()
         eng._prefetch_worker = None
         eng._prefetch_enabled = False
+        eng._is_multigpu = False
+        eng._devices = ("cuda:0",)
+        eng._device_map = tuple([0] * eng.config.num_hidden_layers)
         eng.predictor = MagicMock()
         eng._warmed_up = True
+        eng._mtp_num_draft = 2
         self._eng = eng
 
     def get(self) -> HomeSeekInferenceEngine:

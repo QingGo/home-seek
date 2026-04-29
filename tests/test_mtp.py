@@ -123,6 +123,10 @@ def _make_mock_engine():
         swiglu_limit=10.0,
         use_triton=True,
     )
+    eng._is_multigpu = False
+    eng._devices = ("cuda:0",)
+    eng._device_map = tuple([0] * eng.config.num_hidden_layers)
+    eng._mtp_num_draft = 2
     return eng
 
 

@@ -23,10 +23,10 @@ def _triton_warmup():
     if _triton_prewarmed or not torch.cuda.is_available():
         return
     try:
-        from home_seek.fused_moe import fused_expert_ffn_triton, _tune_blocks
+        from home_seek.fused_moe import fused_expert_ffn_triton
         from home_seek._fp4 import cast
 
-        BM, BN, BK = _tune_blocks(torch.device("cuda"))
+        _, BN, BK = 16, 32, 64
         D = max(BK, 128)
         I = max(BN * 2, 64)
 

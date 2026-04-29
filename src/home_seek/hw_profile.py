@@ -15,6 +15,7 @@ class HWProfile:
     mem_bw_gb_s: float = 0.0
     decode_matmul_us: float = 0.0
     gpu_name: str = ""
+    n_gpu: int = 1
     probe_timestamp: float = 0.0
 
 
@@ -86,6 +87,7 @@ def probe_hardware(force: bool = False, weight_dir: str = "weights") -> HWProfil
             raw = json.load(f)
         return HWProfile(**raw)
     sm, vram_total, gpu_name, mem_bw, vram_free = _probe_gpu()
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 1
     profile = HWProfile(
         disk_bw_gb_s=_probe_disk_bw(weight_dir.rstrip("/weights").rstrip("/") or "/dev/md0"),
         pcie_bw_gb_s=_probe_pcie_bw(),
@@ -95,8 +97,11 @@ def probe_hardware(force: bool = False, weight_dir: str = "weights") -> HWProfil
         mem_bw_gb_s=mem_bw,
         decode_matmul_us=_probe_matmul_us(),
         gpu_name=gpu_name,
+        n_gpu=n_gpu,
         probe_timestamp=time.time(),
     )
+    if n_gpu > 1:
+        print(f"[hw_profile] Detected {n_gpu} × {gpu_name}")
     with open(_PROFILE_PATH, "w") as f:
         json.dump(asdict(profile), f, indent=2)
     return profile

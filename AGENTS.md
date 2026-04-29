@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.4 — CPU cache + MTP optim
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (197 pass, 2 skip)
+make test-unit         # 单元测试 (232 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 单轮 profile (--rounds 1)
 make server            # 启动 API 服务器
@@ -93,6 +93,22 @@ tests/                             # 测试
 - 热专家: `hot_experts.json`; 架构设计: `docs/arch_design.md`
 - 实施记录: `docs/implementation_notes.md`
 - 里程碑记忆: `.agent_memory.md` (基线+瓶颈+下一步)
+
+## 硬件配置 (HardwareConfig)
+
+所有硬件参数集中管理在 `HardwareConfig` (src/home_seek/hardware_config.py)：
+- `HardwareConfig.auto(hw, cfg, **overrides)` 从 `HWProfile` 自动推导
+- 预设策略按 GPU 名子串匹配 (`"4090" in gpu_name.lower()`)
+- 不在列表的 GPU 走 fallback + VRAM 公式自适应
+- **多 GPU 自动探测**: `hw.n_gpu > 1` 且策略未设 `devices` → 自动生成 device 列表 + device_map
+- 策略新增 `per_gpu_*` 语义字段控制单卡 cap，`_compute` 根据 n_gpu 自动扩展
+- 启动时日志示例:
+  ```
+  Matched strategy: 4090
+  Auto multi-GPU: 8 × NVIDIA GeForce RTX 4090
+  HardwareConfig: RTX 4090  ×8  VRAM=24GB  SM=128  hot=64  ...  devices=8  device_map=43layers
+  Multi-GPU device map (43 layers): GPU0:6layers, ..., GPU7:1layers
+  ```
 
 ## 缓存体系 (V21.4)
 
