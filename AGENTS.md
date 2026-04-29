@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.4 — CPU cache + MTP optim
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (232 pass, 2 skip)
+make test-unit         # 单元测试 (278 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 单轮 profile (--rounds 1)
 make server            # 启动 API 服务器
@@ -109,6 +109,17 @@ tests/                             # 测试
   HardwareConfig: RTX 4090  ×8  VRAM=24GB  SM=128  hot=64  ...  devices=8  device_map=43layers
   Multi-GPU device map (43 layers): GPU0:6layers, ..., GPU7:1layers
   ```
+
+## 并行后端 (ParallelBackend)
+
+所有并行策略通过 `src/home_seek/inference_engine/parallel.py` 管理：
+- `ParallelBackend` — 抽象基类, 定义 `layer_device`, `transfer_hidden`, `resolve_expert_device`
+- `PPBackend` — Pipeline Parallel (当前实现): 层均分, h 串行传递, per-GPU 状态
+- `EPBackend` — Expert Parallel (预留): all-to-all 路由
+- `TPBackend` — Tensor Parallel (预留): all-reduce 聚合
+- `_ensure_backend()` 惰性创建, `__new__` 测试桩自动兼容
+- per-GPU 状态: `LayerState`, `Compressor`, `Indexer`, `HybridKVCache`, expert caches
+- embed/lm_head/norm_weight 自动复制到所有 GPU
 
 ## 缓存体系 (V21.4)
 
