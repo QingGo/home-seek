@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡 RTX 4090 推理引擎。V21.4 — CPU cache + MTP optimizations。
+DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.5 — EP 后端 + NSight 工具集成。
 
 ## 纪律
 
@@ -15,14 +15,38 @@ make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
 make test-unit         # 单元测试 (278 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
-make profile           # 单轮 profile (--rounds 1)
+make profile           # 标准 profile (5 prompts, 30 tokens)
+make profile-nsys      # Nsight Systems: CUDA stream 时间线 + PCIe 传输
+make profile-ncu       # Nsight Compute: 单个 kernel 深度分析
+make profile-deep      # nsys + torch.profiler 双重 trace
 make server            # 启动 API 服务器
 make cli               # 交互式客户端
 
-# 多轮 profiling (不同 prompt 消除缓存偏差)
+# 多轮 profiling
 uv run python -m home_seek.profiling_runner --rounds 5 \
   --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" \
   --max-tokens 20 --temperature 0
+
+# Chrome trace (torch.profiler)
+uv run python -m home_seek.profiling_runner \
+  --rounds 2 --prompts "Hello" "Hello" --max-tokens 5 --temperature 0 \
+  --profiler chrome --profiler-warmup 1
+
+# Nsight Systems (需安装 nsight-systems)
+nsys profile -o trace -t nvtx,cuda,osrt \
+  --show-output true --force-overwrite true \
+  uv run python -m home_seek.profiling_runner \
+    --rounds 1 --prompt "Hello" --max-tokens 2 --temperature 0
+
+# Nsight Compute (需安装 nsight-compute)
+ncu --set full --kernel-name "triton_fused" \
+  --launch-count 10 \
+  uv run python -m home_seek.profiling_runner \
+    --rounds 1 --prompt "Hello" --max-tokens 2 --temperature 0
+
+# 查看 trace
+nsys-ui trace.nsys-rep   # Nsight Systems GUI
+ncu-ui trace.ncu-rep     # Nsight Compute GUI (web)
 
 # MTP
 uv run python -m home_seek.profiling_runner --prompt "Hello" --max-tokens 20 --temperature 0 --use-mtp

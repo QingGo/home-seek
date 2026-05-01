@@ -9,6 +9,7 @@ import torch
 _logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 from collections import OrderedDict
+from torch.profiler import record_function
 from home_seek.inference_engine.weight_loader import WeightLoader, load_fp8_weight, load_fp4_weight
 from home_seek.inference_engine.layer_state import LayerState
 from home_seek.inference_engine.expert_cache import ExpertWeightCache
@@ -121,9 +122,10 @@ class HomeSeekInferenceEngine:
         config_path = os.path.join(weight_dir, "config.json")
         self.config = DeepSeekV4FlashConfig.from_json(config_path)
         self.weight_dir = weight_dir
-        self.device = torch.device(device)
+        raw_dev = torch.device(device)
+        self.device = torch.device(raw_dev.type, raw_dev.index if raw_dev.index is not None else 0)
         self.verbose = verbose
-        self.loader = WeightLoader(weight_dir, device)
+        self.loader = WeightLoader(weight_dir, str(self.device))
         from home_seek.hw_profile import probe_hardware, load_profile
         self.hw_profile = probe_hardware(force=reprobe, weight_dir=weight_dir) if reprobe else load_profile()
         if self.hw_profile is None:
@@ -158,7 +160,7 @@ class HomeSeekInferenceEngine:
         except Exception:
             cache_size = self.hw_config.cpu_cache_max
             self._log(f"Host: unknown RAM, cache_size={cache_size}")
-        self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=device, hot_deq_size=0)
+        self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=str(self.device), hot_deq_size=0)
         self.layer_states: dict[int, LayerState] = {}
         self._deq_cache: OrderedDict = OrderedDict()
         self._compressors: dict[int, NewCompressor] = {}
@@ -195,6 +197,10 @@ class HomeSeekInferenceEngine:
 
         self._shared_expert_weights: dict[int, tuple | None] = {}
         self._shared_experts_loaded = False
+        # Clear module-level deq cache to prevent cross-GPU memory accumulation
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+        self._deq_cache_hwm = 0
         self._mtp_weights: dict[str, torch.Tensor] = {}
         self._mtp_loaded = False
         self._mtp_eager = False
@@ -222,10 +228,7 @@ class HomeSeekInferenceEngine:
             cublas_max_tokens=self.hw_config.cublas_max_tokens,
         )
 
-        self._load_shared_experts_gpu()
-        self._load_mtp_weights()
-
-        # ── 并行后端 ────────────────────────────────────
+        # ── 并行后端 (必须早于 _load_shared_experts_gpu) ──
         self._backend = ParallelBackend.from_config(
             self.hw_config, self.config.num_hidden_layers)
         self._is_multigpu = self._backend.is_multigpu()
@@ -233,6 +236,19 @@ class HomeSeekInferenceEngine:
             self._log(f"Parallel backend: {self._backend.strategy.upper()}, "
                       f"{self._backend.n_gpu()} devices, "
                       f"device_map={self._backend.device_map}")
+        # 多 GPU: 选择性复制 — embed 只需 hidden_start_device, lm_head+norm 只需 hidden_end_device
+        if self._is_multigpu:
+            first_dev = self._backend.hidden_start_device()
+            last_dev = self._backend.hidden_end_device()
+            self._backend.get_device_state(first_dev).embed = \
+                self.embed.to(first_dev) if self.embed is not None else None
+            self._backend.get_device_state(last_dev).lm_head = \
+                self.lm_head.to(last_dev) if self.lm_head is not None else None
+            self._backend.get_device_state(last_dev).norm_weight = \
+                self.norm_weight.to(last_dev) if self.norm_weight is not None else None
+
+        self._load_shared_experts_gpu()
+        self._load_mtp_weights()
 
         if self._hot_expert_ids:
             self._preload_hot_experts_cpu_cache()
@@ -394,13 +410,6 @@ class HomeSeekInferenceEngine:
         if self.hc_head_scale is not None:
             self.hc_head_scale = self.hc_head_scale.to(torch.float32)
         self._log(f"hc_head_fn: {self.hc_head_fn.shape if self.hc_head_fn is not None else 'missing'}")
-        # 多 GPU: 复制 embed/lm_head/norm 到所有相关 device
-        if self._is_multigpu:
-            for state in self._backend.all_device_states():
-                d = state.device
-                state.embed = self.embed.to(d, non_blocking=True) if self.embed is not None else None
-                state.lm_head = self.lm_head.to(d, non_blocking=True) if self.lm_head is not None else None
-                state.norm_weight = self.norm_weight.to(d, non_blocking=True) if self.norm_weight is not None else None
 
     def _resolve_device(self, layer_idx: int) -> str:
         """返回第 layer_idx 层所在的 device 字符串。"""
@@ -1025,21 +1034,10 @@ class HomeSeekInferenceEngine:
     def _load_expert_fp4_raw(self, layer_idx, eid):
         self._ensure_backend()
         hot_key = (layer_idx, eid)
-        gpu_hot = self._backend.gpu_hot_experts(layer_idx)
-        gpu_bf16 = self._backend.gpu_bf16_cache(layer_idx)
-        layer_dev = self._resolve_device(layer_idx)
-
-        # 向后兼容: __new__ 测试桩可能写入了 self._gpu_hot_experts / _gpu_bf16_cache
-        if hasattr(self, '_gpu_hot_experts') and self._gpu_hot_experts is not gpu_hot:
-            for k, v in self._gpu_hot_experts.items():
-                if k not in gpu_hot:
-                    gpu_hot[k] = v
-            self._gpu_hot_experts = gpu_hot
-        if hasattr(self, '_gpu_bf16_cache') and self._gpu_bf16_cache is not gpu_bf16:
-            for k, v in self._gpu_bf16_cache.items():
-                if k not in gpu_bf16:
-                    gpu_bf16[k] = v
-            self._gpu_bf16_cache = gpu_bf16
+        expert_dev = self._backend.resolve_expert_device(layer_idx, eid)
+        gpu_hot = self._backend.get_device_state(expert_dev).gpu_hot_experts
+        gpu_bf16 = self._backend.get_device_state(expert_dev).gpu_bf16_cache
+        layer_dev = expert_dev
 
         if hot_key in gpu_hot:
             return gpu_hot[hot_key]
@@ -1064,47 +1062,48 @@ class HomeSeekInferenceEngine:
             return None
 
         dev = torch.device(layer_dev)
-        w1_dev = w1_data.device if w1_data is not None else torch.device("cpu")
-        if w1_data is not None and w1_dev.type != dev.type:
-            w1_data = w1_data.to(dev, non_blocking=True)
+        with torch.cuda.device(dev):
+            w1_dev = w1_data.device if w1_data is not None else torch.device("cpu")
+            if w1_data is not None and w1_dev.type != dev.type:
+                w1_data = w1_data.to(dev, non_blocking=True)
+                if w1_scale is not None:
+                    w1_scale = w1_scale.to(dev, non_blocking=True)
+            w3_dev = w3_data.device if w3_data is not None else torch.device("cpu")
+            if w3_data is not None and w3_dev.type != dev.type:
+                w3_data = w3_data.to(dev, non_blocking=True)
+                if w3_scale is not None:
+                    w3_scale = w3_scale.to(dev, non_blocking=True)
+            w2_dev = w2_data.device if w2_data is not None else torch.device("cpu")
+            if w2_data is not None and w2_dev.type != dev.type:
+                w2_data = w2_data.to(dev, non_blocking=True)
+                if w2_scale is not None:
+                    w2_scale = w2_scale.to(dev, non_blocking=True)
+
             if w1_scale is not None:
-                w1_scale = w1_scale.to(dev, non_blocking=True)
-        w3_dev = w3_data.device if w3_data is not None else torch.device("cpu")
-        if w3_data is not None and w3_dev.type != dev.type:
-            w3_data = w3_data.to(dev, non_blocking=True)
+                w1_scale = (w1_scale.to(torch.float32)
+                            if w1_scale.dtype != torch.float32
+                            else w1_scale)
             if w3_scale is not None:
-                w3_scale = w3_scale.to(dev, non_blocking=True)
-        w2_dev = w2_data.device if w2_data is not None else torch.device("cpu")
-        if w2_data is not None and w2_dev.type != dev.type:
-            w2_data = w2_data.to(dev, non_blocking=True)
+                w3_scale = (w3_scale.to(torch.float32)
+                            if w3_scale.dtype != torch.float32
+                            else w3_scale)
             if w2_scale is not None:
-                w2_scale = w2_scale.to(dev, non_blocking=True)
+                w2_scale = (w2_scale.to(torch.float32)
+                            if w2_scale.dtype != torch.float32
+                            else w2_scale)
 
-        if w1_scale is not None:
-            w1_scale = (w1_scale.to(torch.float32)
-                        if w1_scale.dtype != torch.float32
-                        else w1_scale)
-        if w3_scale is not None:
-            w3_scale = (w3_scale.to(torch.float32)
-                        if w3_scale.dtype != torch.float32
-                        else w3_scale)
-        if w2_scale is not None:
-            w2_scale = (w2_scale.to(torch.float32)
-                        if w2_scale.dtype != torch.float32
-                        else w2_scale)
+            w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
+                w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
 
-        w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
-            w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
-
-        layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
-        if eid in layer_hot:
-            if len(gpu_hot) >= self._max_hot_experts:
-                gpu_hot.pop(next(iter(gpu_hot)))
-            gpu_hot[hot_key] = (w1_b, w3_b, w2_b)
-        else:
-            if len(gpu_bf16) >= self._max_bf16_cache:
-                gpu_bf16.pop(next(iter(gpu_bf16)))
-            gpu_bf16[hot_key] = (w1_b, w3_b, w2_b)
+            layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
+            if eid in layer_hot:
+                if len(gpu_hot) >= self._max_hot_experts:
+                    gpu_hot.pop(next(iter(gpu_hot)))
+                gpu_hot[hot_key] = (w1_b, w3_b, w2_b)
+            else:
+                if len(gpu_bf16) >= self._max_bf16_cache:
+                    gpu_bf16.pop(next(iter(gpu_bf16)))
+                gpu_bf16[hot_key] = (w1_b, w3_b, w2_b)
 
         return (w1_b, w3_b, w2_b)
 
@@ -1189,6 +1188,8 @@ class HomeSeekInferenceEngine:
         return all(eid < 0 or eid in layer_set for eid in flat)
 
     def _forward_ffn(self, hidden_states, lw, layer_idx, input_ids=None):
+        if self._is_multigpu and getattr(self._backend, 'strategy', 'pp') == 'ep':
+            return self._forward_ffn_ep(hidden_states, lw, layer_idx, input_ids)
         gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
         gate_bias = lw.get("ffn.gate.bias")
         tid2eid = lw.get("ffn.gate.tid2eid")
@@ -1201,6 +1202,8 @@ class HomeSeekInferenceEngine:
         flat_hidden = hidden_states.reshape(total_tokens, D)
 
         if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
+            if input_ids.device != hidden_states.device:
+                input_ids = input_ids.to(hidden_states.device)
             topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
         else:
             topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
@@ -1292,6 +1295,125 @@ class HomeSeekInferenceEngine:
 
         return ffn_out, set()
 
+    def _forward_ffn_ep(self, hidden_states, lw, layer_idx, input_ids=None):
+        """EP: GPU0 负责 all, GPU1 负责 expert(eid%2==1). 两张卡通过 Stream 并行."""
+        B, T, D = hidden_states.shape
+        total_tokens = B * T
+        flat_hidden = hidden_states.reshape(total_tokens, D)
+
+        with record_function("ep_routing"):
+            gate_w = self._deq("ffn.gate.weight", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"), layer_idx)
+            gate_bias = lw.get("gate.bias")
+            tid2eid = lw.get("gate.tid2eid")
+        if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
+            if input_ids.device != hidden_states.device:
+                input_ids = input_ids.to(hidden_states.device)
+            topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
+        else:
+            topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
+
+        if topk_idx.numel() == 0:
+            ffn_out = torch.zeros_like(hidden_states)
+            shared_w = self._get_shared_expert(layer_idx)
+            if shared_w is not None:
+                shared_out = self._shared_ffn.forward(hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype)
+                ffn_out = ffn_out + shared_out
+            return ffn_out, set()
+
+        self._last_routed_eids = sorted(set(int(x) for x in topk_idx.flatten().tolist() if x >= 0))
+
+        n_gpu = self._backend.n_gpu()
+        with record_function("ep_split"):
+            topk_0 = topk_idx.clone()
+            topk_1 = topk_idx.clone()
+            topk_0[(topk_0 >= 0) & (topk_0 % n_gpu != 0)] = -1
+            topk_1[(topk_1 >= 0) & (topk_1 % n_gpu != 1)] = -1
+
+        with record_function("ep_shared_expert"):
+            shared_w = self._get_shared_expert(layer_idx)
+            shared_out = (self._shared_ffn.forward(hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype)
+                          if shared_w is not None else 0)
+
+        with record_function("ep_send_hidden"):
+            h_1, copy_ev = self._backend.ep_send_hidden(hidden_states, self._backend.devices[1])
+            flat_1 = h_1.reshape(-1, D)
+
+        gpu1_result = [None]
+
+        def _run_gpu1(h_t):
+            with record_function("ep_gpu1_compute"):
+                h_flat = h_t.reshape(-1, D)
+                tk1 = topk_1.to('cuda:1', non_blocking=False)
+                tw = topk_w.to('cuda:1', non_blocking=False)
+                try:
+                    r = self._fused_moe.forward(
+                        h_flat, tk1, tw,
+                        lambda l, e: self._load_expert_fp4_raw(l, e),
+                        layer_idx,
+                    )
+                    gpu1_result[0] = r
+                except Exception:
+                    r = torch.zeros(total_tokens, D, device=h_t.device, dtype=h_t.dtype)
+                    for k in range(self.config.num_experts_per_tok):
+                        eids_k = tk1[:, k]
+                        w_k = tw[:, k]
+                        for tok_i in range(total_tokens):
+                            eid = int(eids_k[tok_i].item())
+                            if eid < 0:
+                                continue
+                            deq = self._load_expert_fp4_raw(layer_idx, eid)
+                            if deq is None:
+                                continue
+                            w1_d, w3_d, w2_d = deq
+                            h_tok = h_flat[tok_i:tok_i+1].to(w1_d.dtype)
+                            gate_out = torch.matmul(h_tok, w1_d.t())
+                            up_out = torch.matmul(h_tok, w3_d.t())
+                            g = gate_out.float().clamp(max=self.config.swiglu_limit)
+                            u = up_out.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+                            activated = (g * g.sigmoid() * u).to(w1_d.dtype)
+                            out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                            r[tok_i] += out[0] * w_k[tok_i]
+                    gpu1_result[0] = r
+
+        done_ev = self._backend.ep_launch_gpu1(_run_gpu1, h_1, copy_ev)
+
+        with record_function("ep_gpu0_experts"):
+            try:
+                ffn_0 = self._fused_moe.forward(
+                    flat_hidden, topk_0, topk_w,
+                    lambda l, e: self._load_expert_fp4_raw(l, e),
+                    layer_idx,
+                )
+            except Exception:
+                ffn_0 = torch.zeros(total_tokens, D, device=hidden_states.device, dtype=hidden_states.dtype)
+                for k in range(self.config.num_experts_per_tok):
+                    eids_k = topk_0[:, k]
+                    w_k = topk_w[:, k]
+                    for tok_i in range(total_tokens):
+                        eid = int(eids_k[tok_i].item())
+                        if eid < 0:
+                            continue
+                        deq = self._load_expert_fp4_raw(layer_idx, eid)
+                        if deq is None:
+                            continue
+                        w1_d, w3_d, w2_d = deq
+                        h_tok = flat_hidden[tok_i:tok_i+1].to(w1_d.dtype)
+                        gate_out = torch.matmul(h_tok, w1_d.t())
+                        up_out = torch.matmul(h_tok, w3_d.t())
+                        g = gate_out.float().clamp(max=self.config.swiglu_limit)
+                        u = up_out.float().clamp(min=-self.config.swiglu_limit, max=self.config.swiglu_limit)
+                        activated = (g * g.sigmoid() * u).to(w1_d.dtype)
+                        out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                        ffn_0[tok_i] += out[0] * w_k[tok_i]
+
+        with record_function("ep_recv_combine"):
+            ffn_1 = self._backend.ep_recv_result(gpu1_result[0], done_ev)
+            ffn_out = (ffn_0 + ffn_1 + shared_out.reshape(total_tokens, D)).reshape(B, T, D)
+
+        if hasattr(self, 'predictor'):
+            self.predictor.collect(layer_idx, flat_hidden, topk_idx)
+        return ffn_out, set()
+
     def _process_mhc_layer(self, hidden_4d, lw, prefix: str):
         hc_base = lw.get(f"{prefix}_base")
         hc_fn = lw.get(f"{prefix}_fn")
@@ -1318,8 +1440,10 @@ class HomeSeekInferenceEngine:
         B, T, hc_mult, D = hidden_4d.shape
         x = hidden_4d.reshape(B, T, hc_mult * D).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-        mixes = torch.matmul(x, self.hc_head_fn.t()) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
+        dev = hidden_4d.device
+        hc_fn = self.hc_head_fn.to(dev)
+        mixes = torch.matmul(x, hc_fn.t()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale.to(dev) + self.hc_head_base.to(dev)) + self.config.hc_eps
         return (pre.unsqueeze(-1) * hidden_4d.float()).sum(dim=2).to(torch.bfloat16)
 
     def _load_shared_experts_gpu(self):
@@ -1340,15 +1464,20 @@ class HomeSeekInferenceEngine:
             w2_t = tensors.get(shared_keys[4])
             s2 = tensors.get(shared_keys[5])
 
-            # PP: 共享专家在所属层的 device 上; 单卡等价
-            layer_dev = self._resolve_device(layer_idx)
-            dev = torch.device(layer_dev)
-            self._backend.shared_expert_cache(layer_idx)[layer_idx] = (
-                w1.to(dev), s1.to(dev) if s1 is not None else None,
-                w3_t.to(dev) if w3_t is not None else None, s3.to(dev) if s3 is not None else None,
-                w2_t.to(dev) if w2_t is not None else None, s2.to(dev) if s2 is not None else None,
-                "fp8",
-            )
+            # PP: 共享专家在所属层的 device 上; EP: 复制到所有 device
+            if self._is_multigpu and getattr(self._backend, 'strategy', 'pp') == 'ep':
+                target_devs = self._backend.devices
+            else:
+                target_devs = (self._resolve_device(layer_idx),)
+            for dev_name in target_devs:
+                dev = torch.device(dev_name)
+                dev_state = self._backend.get_device_state(dev_name)
+                dev_state.shared_expert_weights[layer_idx] = (
+                    w1.to(dev), s1.to(dev) if s1 is not None else None,
+                    w3_t.to(dev) if w3_t is not None else None, s3.to(dev) if s3 is not None else None,
+                    w2_t.to(dev) if w2_t is not None else None, s2.to(dev) if s2 is not None else None,
+                    "fp8",
+                )
             count += 1
         self._shared_experts_loaded = True
         self._log(f"Pre-loaded {count} shared experts as FP8 on GPU")
@@ -1367,6 +1496,14 @@ class HomeSeekInferenceEngine:
                 return cached
             if len(cached) == 7 and cached[6] == "fp8":
                 w1_fp8, w1_s, w3_fp8, w3_s, w2_fp8, w2_s, _ = cached
+                if w1_fp8 is not None and w1_fp8.device.type != 'cuda':
+                    layer_dev = torch.device(self._resolve_device(layer_idx))
+                    w1_fp8 = w1_fp8.to(layer_dev)
+                    if w1_s is not None: w1_s = w1_s.to(layer_dev)
+                    if w3_fp8 is not None: w3_fp8 = w3_fp8.to(layer_dev)
+                    if w3_s is not None: w3_s = w3_s.to(layer_dev)
+                    if w2_fp8 is not None: w2_fp8 = w2_fp8.to(layer_dev)
+                    if w2_s is not None: w2_s = w2_s.to(layer_dev)
                 w1_bf = load_fp8_weight(w1_fp8, w1_s) if w1_fp8 is not None else None
                 w3_bf = load_fp8_weight(w3_fp8, w3_s) if w3_fp8 is not None else None
                 w2_bf = load_fp8_weight(w2_fp8, w2_s) if w2_fp8 is not None else None
@@ -2204,29 +2341,51 @@ class HomeSeekInferenceEngine:
 
     def _forward_layer(self, h: torch.Tensor, lw: dict, layer_idx: int,
                        input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, set]:
-        # 多 GPU: 自动路由到对应 device
-        if self._is_multigpu:
-            target = self._resolve_device(layer_idx)
-            h = self._backend.transfer_hidden(h, target)
-        residual_attn = h
-        h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
-        if lw.get("attn_norm.weight") is not None:
-            h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-        attn_out = self._forward_attn(h_pre, lw, layer_idx)
-        if post is not None and comb is not None:
-            h = self._process_mhc_post(attn_out, residual_attn, post, comb)
-        else:
-            h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        with record_function(f"forward_layer_{layer_idx}"):
+            # 多 GPU: 自动路由到对应 device + Triton 需要切换 CUDA context
+            if self._is_multigpu:
+                target = self._resolve_device(layer_idx)
+                prev_dev = h.device
+                if prev_dev.type == 'cuda' and prev_dev.index != torch.device(target).index:
+                    with record_function("clear_caches"):
+                        from home_seek.fused_moe import clear_deq_cache
+                        clear_deq_cache()
+                        self._deq_cache.clear()
+                        torch.cuda.empty_cache()
+                with record_function("transfer_hidden"):
+                    h = self._backend.transfer_hidden(h, target)
+                    torch.cuda.set_device(torch.device(target).index)
+            residual_attn = h
+            with record_function("mhc_attn"):
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
+            if lw.get("attn_norm.weight") is not None:
+                h_pre = rms_norm(h_pre, lw["attn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+            with record_function("forward_attn"):
+                attn_out = self._forward_attn(h_pre, lw, layer_idx)
+            if post is not None and comb is not None:
+                h = self._process_mhc_post(attn_out, residual_attn, post, comb)
+            else:
+                h = h + attn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-        residual = h
-        h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
-        if lw.get("ffn_norm.weight") is not None:
-            h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
-        ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, input_ids)
-        if post is not None and comb is not None:
-            h = self._process_mhc_post(ffn_out, residual, post, comb)
-        else:
-            h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            residual = h
+            with record_function("mhc_ffn"):
+                h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_ffn")
+            if lw.get("ffn_norm.weight") is not None:
+                h_pre = rms_norm(h_pre, lw["ffn_norm.weight"].to(torch.bfloat16), self.config.rms_norm_eps)
+            with record_function("forward_ffn"):
+                ffn_out, used_experts = self._forward_ffn(h_pre, lw, layer_idx, input_ids)
+            if post is not None and comb is not None:
+                h = self._process_mhc_post(ffn_out, residual, post, comb)
+            else:
+                h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            # 逐层清理: 上一层的权重不再需要
+            if layer_idx > 0 and layer_idx - 1 in self._layer_weight_cache:
+                del self._layer_weight_cache[layer_idx - 1]
+            if layer_idx > 0 and hasattr(self, '_ffn_weight_cache'):
+                for k in list(getattr(self, '_ffn_weight_cache', {}).keys()):
+                    li, _ = k if isinstance(k, tuple) else (k, None)
+                    if li == layer_idx - 1:
+                        self._ffn_weight_cache.pop(k, None)
         return h, used_experts
 
     @torch.no_grad()
@@ -2312,6 +2471,7 @@ class HomeSeekInferenceEngine:
                 next_id = torch.multinomial(probs, 1)
             else:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+            next_id = next_id.to(self.embed.device)
 
             generated = [next_id]
             if stream_callback is not None:
@@ -2334,7 +2494,9 @@ class HomeSeekInferenceEngine:
         step = 0
         while step < max_new_tokens - 1:
             self._global_pos = T + step
-            h = self._get_per_device('embed', next_id.device)[next_id].to(torch.bfloat16)
+            if next_id.device != self.embed.device:
+                next_id = next_id.to(self.embed.device, non_blocking=True)
+            h = self.embed[next_id].to(torch.bfloat16)
             h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):
                 lw = self._get_layer_weights(layer_idx)
@@ -2358,15 +2520,18 @@ class HomeSeekInferenceEngine:
             last_h_for_mtp = h
 
             h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-            if self.norm_weight is not None:
-                h_3d = rms_norm(h_3d, self.norm_weight, self.config.rms_norm_eps)
-            logits = torch.matmul(h_3d.to(self.lm_head.dtype), self.lm_head.t())
+            lm_head = self._get_per_device('lm_head', h_3d.device)
+            norm_w = self._get_per_device('norm_weight', h_3d.device)
+            if norm_w is not None:
+                h_3d = rms_norm(h_3d, norm_w, self.config.rms_norm_eps)
+            logits = torch.matmul(h_3d.to(lm_head.dtype), lm_head.t())
 
             if temperature > 0:
                 probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
                 next_id = torch.multinomial(probs, 1)
             else:
                 next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+            next_id = next_id.to(self.embed.device)
             generated.append(next_id)
             if stream_callback is not None:
                 stream_callback(next_id.item())
@@ -2441,7 +2606,7 @@ class HomeSeekInferenceEngine:
         decode_time = total_time - prefill_time
         if generated and generated[-1][0].item() in self._stop_token_ids:
             generated = generated[:-1]
-        all_tokens = torch.cat([input_ids] + generated, dim=-1)
+        all_tokens = torch.cat([input_ids] + [g.to(input_ids.device) for g in generated], dim=-1)
         result = {
             "tokens": all_tokens,
             "total_time_s": total_time,

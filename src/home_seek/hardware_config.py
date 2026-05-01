@@ -164,16 +164,18 @@ class HardwareConfig:
             "prefetch": False,
             "mtp": False,
         },
-        # ── 双卡 2080 Ti ─────────────────────────────
+        # ── 双卡 2080 Ti (PP) ─────────────────────────
         "2080": {
-            "gpu_hot_cap": 48,
-            "gpu_bf16_cap": 80,
-            "kv_offload_gb": 7,
+            "gpu_hot_cap": 80,
+            "gpu_bf16_cap": 100,
+            "cpu_cache_max": 6144,
+            "kv_offload_gb": 6,
             "cublas_max_tokens": 4,
             "triton_preset": (16, 16, 32),
-            "prefetch": True,
+            "prefetch": False,
             "mtp": False,
             "devices": ("cuda:0", "cuda:1"),
+            "parallel_backend": "ep",
         },
         # ── 未识别 GPU: 不压制 VRAM/SM 公式, 让 _compute 自动适配 ──
         #    gpu_hot_cap/gpu_bf16_cap 用默认值 64/100
@@ -269,7 +271,11 @@ class HardwareConfig:
         else:
             devices = ("cuda:0",)
 
-        if len(devices) > 1 and not strategy.get("device_map"):
+        parallel_backend = strategy.get("parallel_backend", "pp")
+        if parallel_backend == "ep":
+            # EP: 所有层在 first device (GPU0), expert 按 eid 分配到各 GPU
+            device_map = tuple([0] * n_layers)
+        elif len(devices) > 1 and not strategy.get("device_map"):
             device_map = cls._auto_device_map(n_layers, devices)
         else:
             device_map = strategy.get("device_map", ())

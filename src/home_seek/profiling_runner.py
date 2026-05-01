@@ -597,10 +597,29 @@ def run_profile(args):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
+        use_profiler = args.profiler != "none" and round_idx >= args.profiler_warmup
         util_mon.start()
         with torch.no_grad():
-            result = engine.generate(input_ids, max_new_tokens=max_new_tokens,
-                                      temperature=temperature)
+            if use_profiler:
+                trace_name = f"profile_round{round_idx}_{args.profiler}"
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                ) as prof:
+                    result = engine.generate(input_ids, max_new_tokens=max_new_tokens,
+                                              temperature=temperature)
+                if args.profiler == "chrome":
+                    prof.export_chrome_trace(f"{trace_name}.json")
+                    cpu_total = sum(e.cpu_time_total for e in prof.events())
+                    cuda_total = sum(e.cuda_time_total for e in prof.events())
+                    print(f"  [Profiler] CPU total: {cpu_total/1e6:.1f}s  CUDA total: {cuda_total/1e6:.1f}s")
+                    print(f"  [Profiler] Trace saved: {trace_name}.json")
+            else:
+                result = engine.generate(input_ids, max_new_tokens=max_new_tokens,
+                                          temperature=temperature)
         util_mon.stop()
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
@@ -781,6 +800,10 @@ def main():
     parser.add_argument("--no-triton", action="store_true",
                         help="Disable Triton kernels (use PyTorch fallbacks)")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--profiler", choices=["chrome", "none"], default="none",
+                        help="Enable torch.profiler. 'chrome' exports Chrome trace JSON")
+    parser.add_argument("--profiler-warmup", type=int, default=1,
+                        help="Warmup rounds before profiling (default 1, ignored if --profiler=none)")
     args = parser.parse_args()
     if args.prompts:
         args.prompts = list(args.prompts)
