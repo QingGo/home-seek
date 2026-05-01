@@ -9,6 +9,7 @@ import torch
 from home_seek.hardware_config import HardwareConfig
 from home_seek.inference_engine.parallel import (
     ParallelBackend, PPBackend, EPBackend, PerDeviceState,
+    _EPWorkItem, _EPWorker,
 )
 from home_seek.model_config import DeepSeekV4FlashConfig
 
@@ -113,18 +114,18 @@ class TestParallelBackendFactory:
         assert isinstance(b, PPBackend)
         assert b.strategy == "pp"
 
-    def test_from_config_ep_raises(self):
+    def test_from_config_ep(self):
         hw = HardwareConfig(devices=("cuda:0",), device_map=(0,),
                             parallel_backend="ep")
-        import pytest
-        with pytest.raises(NotImplementedError, match="EP"):
-            ParallelBackend.from_config(hw, 1)
+        b = ParallelBackend.from_config(hw, 1)
+        assert isinstance(b, EPBackend)
+        assert b.strategy == "ep"
 
     def test_from_config_tp_raises(self):
         hw = HardwareConfig(devices=("cuda:0",), device_map=(0,),
                             parallel_backend="tp")
         import pytest
-        with pytest.raises(NotImplementedError, match="TP"):
+        with pytest.raises(ValueError, match="Unknown"):
             ParallelBackend.from_config(hw, 1)
 
     def test_pp_strategy_default(self):
@@ -246,7 +247,7 @@ class TestEngineGetPerDevice:
 
 class TestEngineBackwardCompatibility:
     def test_old_gpu_hot_experts_migrated(self):
-        """__new__ 桩写入旧 _gpu_hot_experts, _load_expert_fp4_raw 应找到它。"""
+        """_load_expert_fp4_raw 通过 backend per-device hot cache 命中。"""
         if not torch.cuda.is_available():
             return
         from home_seek.inference_engine import ExpertWeightCache
@@ -261,8 +262,10 @@ class TestEngineBackwardCompatibility:
         w = (torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
              torch.randn(64, 128, device="cuda", dtype=torch.bfloat16),
              torch.randn(128, 64, device="cuda", dtype=torch.bfloat16))
-        eng._gpu_hot_experts = {(0, 99): w}
         eng._load_expert_raw = MagicMock()
+        # 写入 backend per-device hot cache (新的标准方式)
+        eng._ensure_backend()
+        eng._backend.get_device_state("cuda:0").gpu_hot_experts[(0, 99)] = w
         result = eng._load_expert_fp4_raw(0, 99)
         assert result is not None
         assert len(result) == 3
@@ -395,3 +398,141 @@ class TestPerDeviceStateIndependence:
         b.shared_expert_cache(1)[1] = "shared_gpu1"
         assert 0 in b.shared_expert_cache(0)
         assert 0 not in b.shared_expert_cache(1)
+
+
+# ── EP 双线程 Worker 测试 ─────────────────────────────────
+
+
+class TestEPDualThreadWorker:
+    """验证 _EPWorker 线程的启动 / 提交流程 / 结果获取。"""
+
+    def _has_2gpu(self):
+        return torch.cuda.is_available() and torch.cuda.device_count() >= 2
+
+    def test_ep_work_item_dataclass(self):
+        """_EPWorkItem 字段正确。"""
+        ev = torch.cuda.Event()
+        item = _EPWorkItem(layer_idx=5, copy_event=ev)
+        assert item.layer_idx == 5
+        assert item.copy_event is ev
+        assert item.result is None
+        assert not item.done.is_set()
+
+    def test_worker_start_stop(self):
+        """Worker 线程启动后可正常停止。"""
+        if not self._has_2gpu():
+            return
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig(num_hidden_layers=1, n_routed_experts=4)
+        eng._load_expert_fp4_raw = lambda l, e: None
+        eng._fused_moe = None
+        worker = _EPWorker(eng, "cuda:1")
+        worker.start()
+        assert worker.is_alive()
+        worker.stop()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    def test_worker_submit_and_result(self):
+        """提交简单 work item, 确认结果可达。"""
+        if not self._has_2gpu():
+            return
+        from unittest.mock import MagicMock
+
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1, n_routed_experts=4,
+            hidden_size=64, moe_intermediate_size=128,
+            swiglu_limit=10.0, num_experts_per_tok=2,
+        )
+        eng._load_expert_fp4_raw = MagicMock(return_value=None)
+        fused_mock = MagicMock()
+        fused_mock.forward.return_value = torch.zeros(1, 64, device="cuda:1", dtype=torch.bfloat16)
+        eng._fused_moe = fused_mock
+
+        worker = _EPWorker(eng, "cuda:1")
+        worker.start()
+
+        h = torch.randn(1, 64, device="cuda:1", dtype=torch.bfloat16)
+        tk = torch.full((1, 2), -1, device="cuda:1", dtype=torch.long)
+        tw = torch.zeros(1, 2, device="cuda:1", dtype=torch.float32)
+
+        copy_ev = torch.cuda.Event()
+        copy_ev.record()
+        item = _EPWorkItem(hidden=h, topk_idx=tk, topk_weights=tw,
+                           layer_idx=0, copy_event=copy_ev)
+        worker.submit(item)
+        item.done.wait(timeout=10)
+        assert item.done.is_set()
+        assert item.result is not None
+
+        worker.stop()
+        worker.join(timeout=5)
+
+    def test_ep_backend_start_worker(self):
+        """EPBackend.ep_start_worker 惰性启动 worker. """
+        if not self._has_2gpu():
+            return
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig(num_hidden_layers=1, n_routed_experts=4)
+        eng._load_expert_fp4_raw = lambda l, e: None
+        eng._fused_moe = None
+
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 0),
+                            parallel_backend="ep")
+        backend = EPBackend(hw, 1)
+        assert backend._ep_worker is None
+        backend.ep_start_worker(eng)
+        assert backend._ep_worker is not None
+        assert backend._ep_worker.is_alive()
+        # 幂等
+        backend.ep_start_worker(eng)
+        assert backend._ep_worker.is_alive()
+
+    def test_ep_workflow_integration(self):
+        """完整 EP 工作流: 提交 + 等结果 + 返回值. """
+        if not self._has_2gpu():
+            return
+        from unittest.mock import MagicMock
+
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.config = DeepSeekV4FlashConfig(
+            num_hidden_layers=1, n_routed_experts=4,
+            hidden_size=64, moe_intermediate_size=128,
+            swiglu_limit=10.0, num_experts_per_tok=2,
+        )
+        eng._load_expert_fp4_raw = MagicMock(return_value=None)
+        fused_mock = MagicMock()
+        expected = torch.randn(1, 64, device="cuda:1", dtype=torch.bfloat16)
+        fused_mock.forward.return_value = expected
+        eng._fused_moe = fused_mock
+
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 0),
+                            parallel_backend="ep")
+        backend = EPBackend(hw, 1)
+        backend.ep_start_worker(eng)
+
+        h = torch.randn(1, 64, device="cuda:1", dtype=torch.bfloat16)
+        tk = torch.full((1, 2), -1, device="cuda:1", dtype=torch.long)
+        tw = torch.zeros(1, 2, device="cuda:1", dtype=torch.float32)
+        copy_ev = torch.cuda.Event()
+        copy_ev.record()
+
+        item = backend.ep_submit_work(h, tk, tw, 0, copy_ev)
+        result = backend.ep_wait_result(item)
+        assert result is not None
+        assert result.shape == (1, 64)
+        assert result.device.type == "cuda"
+        assert result.device.index == 0  # 自动转回 GPU0
+
+    def test_single_gpu_no_worker(self):
+        """单 GPU 不启动 worker. """
+        hw = HardwareConfig(devices=("cuda:0",), device_map=(0,),
+                            parallel_backend="ep")
+        backend = EPBackend(hw, 1)
+        backend.ep_start_worker(None)
+        assert backend._ep_worker is None

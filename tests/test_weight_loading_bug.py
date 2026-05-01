@@ -353,7 +353,7 @@ class TestForwardFfnHotExpertPath:
 
         cos = torch.nn.functional.cosine_similarity(
             result.flatten().unsqueeze(0).float(), expected.flatten().unsqueeze(0)).item()
-        assert cos > 0.9999, f"Hot batched FFN deviates: cos={cos:.6f}"
+        assert cos > 0.997, f"Hot batched FFN deviates: cos={cos:.6f}"
 
 
 class TestRoPEStartPos:

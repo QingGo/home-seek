@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 from dataclasses import dataclass, field
 from collections import OrderedDict
 from typing import Any, Callable
@@ -183,18 +185,148 @@ class PPBackend(ParallelBackend):
     strategy: str = "pp"
 
 
+@dataclass
+class _EPWorkItem:
+    """单个 EP worker 工作项。"""
+    hidden: torch.Tensor | None = None
+    topk_idx: torch.Tensor | None = None
+    topk_weights: torch.Tensor | None = None
+    layer_idx: int = -1
+    copy_event: torch.cuda.Event | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+    result: torch.Tensor | None = None
+    exception: Exception | None = None
+
+
+class _EPWorker(threading.Thread):
+    """GPU1 专用工作线程: 接收 EP 工作项, 在 GPU1 上执行 FusedMoE. """
+
+    def __init__(self, engine, device: str):
+        super().__init__(daemon=True)
+        self.engine = engine
+        self.device = device
+        self.device_index = int(device.split(":")[1])
+        self._work_queue: queue.Queue[_EPWorkItem] = queue.Queue()
+        self._shutdown_event = threading.Event()
+
+    def submit(self, item: _EPWorkItem) -> None:
+        self._work_queue.put(item)
+
+    def stop(self) -> None:
+        self._shutdown_event.set()
+
+    def run(self) -> None:
+        torch.cuda.set_device(self.device_index)
+        while not self._shutdown_event.is_set():
+            try:
+                item = self._work_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            try:
+                # 等 async copy 完成 (GPU1 stream wait GPU0 event)
+                if item.copy_event is not None:
+                    torch.cuda.current_stream(self.device).wait_event(item.copy_event)
+
+                D = self.engine.config.hidden_size
+                h_flat = item.hidden.reshape(-1, D)
+
+                def _load_expert(layer, eid):
+                    return self.engine._load_expert_fp4_raw(layer, eid)
+
+                r = self.engine._fused_moe.forward(
+                    h_flat, item.topk_idx, item.topk_weights,
+                    _load_expert,
+                    item.layer_idx,
+                )
+                item.result = r
+            except Exception:
+                # fallback: 逐 expert 循环
+                try:
+                    D = self.engine.config.hidden_size
+                    total_tokens = item.hidden.shape[0]
+                    h_flat = item.hidden.reshape(-1, D)
+                    r = torch.zeros(total_tokens, D, device=self.device, dtype=item.hidden.dtype)
+                    for k in range(item.topk_idx.shape[1]):
+                        eids_k = item.topk_idx[:, k]
+                        w_k = item.topk_weights[:, k]
+                        for tok_i in range(total_tokens):
+                            eid = int(eids_k[tok_i].item())
+                            if eid < 0:
+                                continue
+                            deq = self.engine._load_expert_fp4_raw(item.layer_idx, eid)
+                            if deq is None:
+                                continue
+                            w1_d, w3_d, w2_d = deq
+                            h_tok = h_flat[tok_i:tok_i + 1].to(w1_d.dtype)
+                            gate_out = torch.matmul(h_tok, w1_d.t())
+                            up_out = torch.matmul(h_tok, w3_d.t())
+                            g = gate_out.float().clamp(max=self.engine.config.swiglu_limit)
+                            u = up_out.float().clamp(min=-self.engine.config.swiglu_limit,
+                                                     max=self.engine.config.swiglu_limit)
+                            activated = (g * g.sigmoid() * u).to(w1_d.dtype)
+                            out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
+                            r[tok_i] += out[0] * w_k[tok_i]
+                    item.result = r
+                except Exception as e2:
+                    item.exception = e2
+            finally:
+                item.done.set()
+
+
 class EPBackend(ParallelBackend):
     """Expert Parallel: 专家池均分到各 GPU.
 
     GPU0: MHC + Attention + 路由 + expert(eid%2==0) + shared expert
     GPU1: expert(eid%2==1)
-    每层 GPU0→GPU1 传 h_pre, GPU1→GPU0 传部分 FFN 结果.
-    两张卡通过 Stream/Event 实现计算重叠.
+
+    V21.5: 每个 GPU 一个 Python 线程, 实现真正计算并行.
     """
+
     strategy: str = "ep"
+    _ep_worker: _EPWorker | None = None
 
     def resolve_expert_device(self, layer_idx: int, eid: int) -> str:
         return self.devices[eid % self.n_gpu()]
+
+    def ep_start_worker(self, engine) -> None:
+        """启动 GPU1 工作线程 (惰性, 首次 EP 前传时调用)."""
+        if self._ep_worker is not None:
+            return
+        if self.n_gpu() < 2:
+            return
+        worker = _EPWorker(engine, self.devices[1])
+        worker.start()
+        self._ep_worker = worker
+
+    def ep_submit_work(self, hidden: torch.Tensor,
+                       topk_idx: torch.Tensor,
+                       topk_weights: torch.Tensor,
+                       layer_idx: int,
+                       copy_event: torch.cuda.Event | None = None) -> _EPWorkItem:
+        """提交 GPU1 expert 计算任务, 立即返回 work item."""
+        item = _EPWorkItem(
+            hidden=hidden,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            layer_idx=layer_idx,
+            copy_event=copy_event,
+        )
+        if self._ep_worker is not None:
+            self._ep_worker.submit(item)
+        return item
+
+    def ep_wait_result(self, item: _EPWorkItem) -> torch.Tensor:
+        """等 GPU1 完成, 返回结果 tensor."""
+        if item is None:
+            return torch.empty(0, device=self.devices[0])
+        if self._ep_worker is not None:
+            item.done.wait()
+            if item.exception is not None:
+                raise item.exception
+            if item.result is not None:
+                return item.result.to(self.devices[0], non_blocking=False)
+        return torch.empty(0, device=self.devices[0])
 
 
 class TPBackend(ParallelBackend):

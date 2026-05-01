@@ -65,12 +65,13 @@ def test_2080_ti_dual():
     cfg = HardwareConfig.auto(hw, _test_config())
     # 10GB free → hot: (10-4)*0.20/(48/1024) = 25, cap 48
     assert cfg.gpu_hot_max == 25
-    # bf16: (10-3)*0.80/(48/1024) = 119, cap 80
-    assert cfg.gpu_bf16_max == 80
+    # bf16: (10-3)*0.80/(48/1024) = 119, cap 100
+    assert cfg.gpu_bf16_max == 100
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert len(cfg.device_map) == 43
-    assert cfg.device_map[:22] == (0,) * 22
-    assert cfg.device_map[22:] == (1,) * 21
+    assert cfg.parallel_backend == "ep"
+    # EP: 所有层在 GPU0
+    assert all(d == 0 for d in cfg.device_map)
     assert cfg.triton_blocks == (16, 16, 32)
     assert cfg.mtp_enabled is False
 
@@ -230,7 +231,7 @@ def test_auto_multi_gpu_does_not_trigger_on_n_gpu_1():
 
 
 def test_auto_multi_gpu_explicit_strategy_still_works():
-    """2080 策略已有 devices=2, 即使 n_gpu=2 不走自动路径."""
+    """2080 策略已有 devices=2, EP 模式所有层在 GPU0."""
     hw = HWProfile(vram_free_gb=10, sm_count=68,
                    gpu_name="NVIDIA GeForce RTX 2080 Ti",
                    vram_total_gb=11,
@@ -238,8 +239,9 @@ def test_auto_multi_gpu_explicit_strategy_still_works():
     cfg = HardwareConfig.auto(hw, _test_config())
     # 策略已有 devices → 不走自动路径
     assert cfg.devices == ("cuda:0", "cuda:1")
-    assert cfg.device_map[:22] == (0,) * 22
-    assert cfg.device_map[22:] == (1,) * 21
+    assert cfg.parallel_backend == "ep"
+    # EP: 所有层在 GPU0, expert 分配通过 eid hash
+    assert all(d == 0 for d in cfg.device_map)
 
 
 def test_auto_multi_gpu_n_gpu_high_but_single_available():
