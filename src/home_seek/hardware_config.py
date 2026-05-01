@@ -64,6 +64,9 @@ class HardwareConfig:
     mtp_num_draft: int = 2
     """MTP 每步生成的 draft token 数。"""
 
+    ep_numa_aware: bool = False
+    """EP 模式下是否启用 NUMA 亲和绑定 (worker 线程绑定到对应 NUMA node)。"""
+
     # ── 身份信息 (仅供日志/调试) ────────────────────
     gpu_name: str = ""
     vram_total_gb: float = 0.0
@@ -164,7 +167,9 @@ class HardwareConfig:
             "prefetch": False,
             "mtp": False,
         },
-        # ── 双卡 2080 Ti (PP) ─────────────────────────
+        # ── 2080 Ti ────────────────────────────────────
+        # 拓扑参数 (devices, parallel_backend) 由 strategy_selector 根据
+        # interconnect_tier 自动选择，不再硬编码。
         "2080": {
             "gpu_hot_cap": 80,
             "gpu_bf16_cap": 100,
@@ -174,8 +179,6 @@ class HardwareConfig:
             "triton_preset": (16, 16, 32),
             "prefetch": False,
             "mtp": False,
-            "devices": ("cuda:0", "cuda:1"),
-            "parallel_backend": "ep",
         },
         # ── 未识别 GPU: 不压制 VRAM/SM 公式, 让 _compute 自动适配 ──
         #    gpu_hot_cap/gpu_bf16_cap 用默认值 64/100
@@ -191,17 +194,42 @@ class HardwareConfig:
     @classmethod
     def auto(cls, hw: HWProfile, model_cfg: DeepSeekV4FlashConfig,
              **overrides) -> HardwareConfig:
-        """从硬件探测结果自动推导配置, 支持用户覆盖任意字段。"""
+        """从硬件探测结果自动推导配置, 支持用户覆盖任意字段。
+
+        P1: 在 GPU 型号匹配后，调用 topology-aware strategy selector
+        覆盖并行相关参数（devices, device_map, parallel_backend 等）。
+        """
         base = cls._match_strategy(hw.gpu_name, hw, model_cfg)
+
+        # P1: 多 GPU 时用策略选择器覆盖并行参数
+        n_gpu = max(1, hw.n_gpu if hasattr(hw, 'n_gpu') else 1)
+        if n_gpu > 1:
+            try:
+                from home_seek.strategy_selector import select_parallel_strategy
+                strategy_params = select_parallel_strategy(hw, model_cfg)
+                for k in ["devices", "device_map", "parallel_backend",
+                          "gpu_hot_max", "gpu_bf16_max",
+                          "prefetch_enabled", "mtp_enabled",
+                          "ep_numa_aware"]:
+                    if k in strategy_params:
+                        base[k] = strategy_params[k]
+                _logger.info(f"  Strategy selector applied: backend={base.get('parallel_backend')} "
+                             f"devices={len(base.get('devices',[]))} "
+                             f"hot={base.get('gpu_hot_max')} bf16={base.get('gpu_bf16_max')}")
+            except Exception as exc:
+                _logger.warning(f"  Strategy selector failed: {exc}, using fallback")
+
         merged = {**base, **overrides}
         validated = cls._validate(merged, hw, model_cfg)
         config = cls(**validated)
 
         n_gpu = max(1, hw.n_gpu if hasattr(hw, 'n_gpu') else 1)
+        tier = getattr(hw, 'interconnect_tier', 'single')
         n_layers = model_cfg.num_hidden_layers
         _logger.info(
             f"HardwareConfig: {hw.gpu_name}"
             f"  ×{n_gpu}  "
+            f"tier={tier}  "
             f"VRAM={config.vram_total_gb:.0f}GB  "
             f"SM={config.sm_count}  "
             f"hot={config.gpu_hot_max}  "
@@ -263,7 +291,12 @@ class HardwareConfig:
         devices_explicit = strategy.get("devices")
 
         if devices_explicit is not None:
-            devices = devices_explicit
+            # P0: 策略硬编码的 devices 数量不能超过实际可用 GPU
+            if len(devices_explicit) > n_gpu:
+                _logger.warning(
+                    f"  Strategy wants {len(devices_explicit)} GPUs but only "
+                    f"{n_gpu} available, truncating")
+            devices = devices_explicit[:n_gpu] if n_gpu > 0 else ("cuda:0",)
         elif n_gpu > 1:
             _logger.info(
                 f"  Auto multi-GPU: {n_gpu} × {hw.gpu_name}")
@@ -298,6 +331,7 @@ class HardwareConfig:
             "vram_total_gb": hw.vram_total_gb,
             "mem_bw_gb_s": hw.mem_bw_gb_s,
             "sm_count": hw.sm_count,
+            "ep_numa_aware": strategy.get("ep_numa_aware", False),
         }
 
     @staticmethod
@@ -350,7 +384,12 @@ class HardwareConfig:
         dm = params.get("device_map", ())
         devs = params.get("devices", ("cuda:0",))
         n_layers = cfg.num_hidden_layers
-        if dm and len(dm) != n_layers:
+        pb = params.get("parallel_backend", "pp")
+
+        # P0: EP 模式下强制所有层在 GPU0 (expert 按 eid 分配)
+        if pb == "ep":
+            dm = tuple([0] * n_layers)
+        elif dm and len(dm) != n_layers:
             dm = cls._auto_device_map(n_layers, devs)
         elif not dm:
             dm = tuple([0] * n_layers)

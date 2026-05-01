@@ -199,13 +199,19 @@ class _EPWorkItem:
 
 
 class _EPWorker(threading.Thread):
-    """GPU1 专用工作线程: 接收 EP 工作项, 在 GPU1 上执行 FusedMoE. """
+    """GPU1 专用工作线程: 接收 EP 工作项, 在 GPU1 上执行 FusedMoE.
 
-    def __init__(self, engine, device: str):
+    P2: 支持 NUMA 绑定 (numa_node≥0), 在 run() 开始时绑定到指定
+    NUMA node, 确保后续 CPU 内存分配 (mmap page fault, torch tensor)
+    落在此 NUMA node 的本地内存上, 减少 GPU1 PCIe 跨 NUMA 读取延迟。
+    """
+
+    def __init__(self, engine, device: str, numa_node: int = -1):
         super().__init__(daemon=True)
         self.engine = engine
         self.device = device
         self.device_index = int(device.split(":")[1])
+        self._numa_node = numa_node
         self._work_queue: queue.Queue[_EPWorkItem] = queue.Queue()
         self._shutdown_event = threading.Event()
 
@@ -216,6 +222,17 @@ class _EPWorker(threading.Thread):
         self._shutdown_event.set()
 
     def run(self) -> None:
+        # P2: NUMA 绑定 (必须在 torch.cuda.set_device 之前)
+        if self._numa_node >= 0:
+            try:
+                from home_seek.topology_prober import bind_thread_to_numa
+                bound = bind_thread_to_numa(self._numa_node)
+                if bound:
+                    import logging
+                    logging.getLogger(__name__).info(
+                        f"  EP worker bound to NUMA node {self._numa_node}")
+            except Exception:
+                pass
         torch.cuda.set_device(self.device_index)
         while not self._shutdown_event.is_set():
             try:
@@ -290,12 +307,24 @@ class EPBackend(ParallelBackend):
         return self.devices[eid % self.n_gpu()]
 
     def ep_start_worker(self, engine) -> None:
-        """启动 GPU1 工作线程 (惰性, 首次 EP 前传时调用)."""
+        """启动 GPU1 工作线程 (惰性, 首次 EP 前传时调用).
+
+        P2: 当 engine 的 ep_numa_aware=True 时, 从 hw_profile.numa_map
+        获取 GPU1 对应的 NUMA node, 传给 _EPWorker 进行线程绑定。
+        """
         if self._ep_worker is not None:
             return
         if self.n_gpu() < 2:
             return
-        worker = _EPWorker(engine, self.devices[1])
+        numa_node = -1
+        hw_config = getattr(engine, 'hw_config', None)
+        hw_profile = getattr(engine, 'hw_profile', None)
+        if (hw_config is not None and hw_profile is not None
+                and getattr(hw_config, 'ep_numa_aware', False)):
+            numa_map = getattr(hw_profile, 'numa_map', {})
+            gpu1_idx = int(self.devices[1].split(":")[1])
+            numa_node = numa_map.get(gpu1_idx, -1)
+        worker = _EPWorker(engine, self.devices[1], numa_node=numa_node)
         worker.start()
         self._ep_worker = worker
 

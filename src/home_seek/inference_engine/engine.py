@@ -153,7 +153,9 @@ class HomeSeekInferenceEngine:
             _reserve_bytes = 8 * 1024**3
             _max_by_ram = max(0, (_avail_bytes - _reserve_bytes) // _per_expert_bytes)
             _total_experts = self.config.num_hidden_layers * self.config.n_routed_experts
-            cache_size = min(self.hw_config.cpu_cache_max, max(2048, min(_max_by_ram // 2, _total_experts)))
+            # P2: CPU cache 从 50% RAM 扩大到 75%, 减少文件 I/O
+            _cpu_ratio = _max_by_ram * 3 // 4
+            cache_size = min(self.hw_config.cpu_cache_max, max(2048, min(_cpu_ratio, _total_experts)))
             self._log(f"Host: {_avail_bytes/1e9:.0f} GB cgroup limit, "
                       f"_per_expert={_per_expert_bytes/1e6:.1f} MB, "
                       f"cache_size={cache_size} (~{cache_size*_per_expert_bytes/1e9:.0f} GB)")
@@ -161,6 +163,8 @@ class HomeSeekInferenceEngine:
             cache_size = self.hw_config.cpu_cache_max
             self._log(f"Host: unknown RAM, cache_size={cache_size}")
         self.expert_cache = ExpertWeightCache(max_experts=cache_size, device=str(self.device), hot_deq_size=0)
+        self._expert_caches: dict[int, ExpertWeightCache] = {}
+        """P2: EP+numa_aware 时每 GPU 独立的 ExpertWeightCache, 确保 NUMA-local 分配。"""
         self.layer_states: dict[int, LayerState] = {}
         self._deq_cache: OrderedDict = OrderedDict()
         self._compressors: dict[int, NewCompressor] = {}
@@ -249,6 +253,22 @@ class HomeSeekInferenceEngine:
 
         self._load_shared_experts_gpu()
         self._load_mtp_weights()
+
+        # P2: EP+numa_aware → 每 GPU 独立 ExpertWeightCache (NUMA-local 分配)
+        # 容量: 默认 cache 存 hot/pinned, per-GPU 存该 GPU 的 non-hot expert
+        if self._is_multigpu and getattr(self._backend, 'strategy', 'pp') == 'ep' \
+                and self.hw_config.ep_numa_aware:
+            pinned_count = len(getattr(self.expert_cache, 'pinned', set()))
+            dev_count = self._backend.n_gpu()
+            per_dev = max(256, (self.expert_cache.max_experts - pinned_count) // dev_count)
+            self._log(f"Per-GPU cache: {dev_count} × ~{per_dev} experts (NUMA local)")
+            for dev_idx in range(dev_count):
+                cache = ExpertWeightCache(
+                    max_experts=per_dev,
+                    device=str(self._backend.devices[dev_idx]),
+                    hot_deq_size=0,
+                )
+                self._expert_caches[dev_idx] = cache
 
         if self._hot_expert_ids:
             self._preload_hot_experts_cpu_cache()
@@ -1014,6 +1034,15 @@ class HomeSeekInferenceEngine:
         layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
         pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+        # P2: EP+numa_aware → 同时写入 per-GPU cache (NUMA-local 副本)
+        if self._expert_caches:
+            self._ensure_backend()
+            if self._backend.strategy == "ep":
+                n = self._backend.n_gpu()
+                dev_idx = eid % n
+                gpu_cache = self._expert_caches.get(dev_idx)
+                if gpu_cache is not None and gpu_cache.get(cache_key) is None:
+                    gpu_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
         return self.expert_cache.get(cache_key)
 
     def _load_expert_raw(self, layer_idx, eid):
@@ -2412,13 +2441,17 @@ class HomeSeekInferenceEngine:
         skip_prefill = resume and session_id is not None
 
         if not skip_prefill:
+            cache_total = len(self.expert_cache) + sum(len(c) for c in self._expert_caches.values())
+            cache_max = self.expert_cache.max_experts + sum(c.max_experts for c in self._expert_caches.values())
             self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}, "
-                      f"cache={len(self.expert_cache)}/{self.expert_cache.max_experts}, "
+                      f"cache={cache_total}/{cache_max}, "
                       f"gpu_hot={sum(len(s.gpu_hot_experts) for s in self._backend.all_device_states())}, "
                       f"gpu_bf16={sum(len(s.gpu_bf16_cache) for s in self._backend.all_device_states())}")
             self.layer_states = {}
             self._deq_cache.clear()
             self.expert_cache.clear()
+            for cache in self._expert_caches.values():
+                cache.clear()
             self._layer_weight_cache.clear()
             clear_deq_cache()
             # Clear GPU caches to prevent VRAM accumulation across requests

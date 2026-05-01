@@ -61,17 +61,21 @@ def test_h20_defaults():
 def test_2080_ti_dual():
     hw = HWProfile(vram_free_gb=10, sm_count=68,
                    gpu_name="NVIDIA GeForce RTX 2080 Ti",
-                   vram_total_gb=11, mem_bw_gb_s=616)
+                   vram_total_gb=11, mem_bw_gb_s=616,
+                   n_gpu=2)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # 10GB free → hot: (10-4)*0.20/(48/1024) = 25, cap 48
-    assert cfg.gpu_hot_max == 25
-    # bf16: (10-3)*0.80/(48/1024) = 119, cap 100
-    assert cfg.gpu_bf16_max == 100
+    # 与真实硬件拓扑探测不同，测试 HWProfile 的 tier=single(默认)。
+    # 策略选择器走保守 PP 路径: _configure_pcie_numa
+    # GPU 缓存策略: 使用 vram_total_gb
+    assert cfg.gpu_hot_max == 25      # baseline 2080 策略值
+    assert cfg.gpu_bf16_max == 100    # baseline 2080 策略值
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert len(cfg.device_map) == 43
-    assert cfg.parallel_backend == "ep"
-    # EP: 所有层在 GPU0
-    assert all(d == 0 for d in cfg.device_map)
+    # 未知拓扑 → 保守 PP (非旧硬编码 EP)
+    assert cfg.parallel_backend == "pp"
+    # PP: 22+21 均分
+    assert cfg.device_map[:22] == (0,) * 22
+    assert cfg.device_map[22:] == (1,) * 21
     assert cfg.triton_blocks == (16, 16, 32)
     assert cfg.mtp_enabled is False
 
@@ -231,17 +235,19 @@ def test_auto_multi_gpu_does_not_trigger_on_n_gpu_1():
 
 
 def test_auto_multi_gpu_explicit_strategy_still_works():
-    """2080 策略已有 devices=2, EP 模式所有层在 GPU0."""
+    """n_gpu=2, unknown tier → 策略选择器走保守 PP，缓存值来自 baseline."""
     hw = HWProfile(vram_free_gb=10, sm_count=68,
                    gpu_name="NVIDIA GeForce RTX 2080 Ti",
                    vram_total_gb=11,
                    n_gpu=2)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # 策略已有 devices → 不走自动路径
     assert cfg.devices == ("cuda:0", "cuda:1")
-    assert cfg.parallel_backend == "ep"
-    # EP: 所有层在 GPU0, expert 分配通过 eid hash
-    assert all(d == 0 for d in cfg.device_map)
+    assert cfg.parallel_backend == "pp"
+    assert cfg.device_map[:22] == (0,) * 22
+    assert cfg.device_map[22:] == (1,) * 21
+    # 缓存值保留 baseline（不被策略选择器覆盖）
+    assert cfg.gpu_hot_max == 25
+    assert cfg.gpu_bf16_max == 100
 
 
 def test_auto_multi_gpu_n_gpu_high_but_single_available():
