@@ -1412,12 +1412,13 @@ class HomeSeekInferenceEngine:
         total_tokens = B * T
         flat_hidden = hidden_states.reshape(total_tokens, D)
 
-        if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
-            if input_ids.device != hidden_states.device:
-                input_ids = input_ids.to(hidden_states.device)
-            topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
-        else:
-            topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
+        with record_function(f"ffn_routing_L{layer_idx}"):
+            if layer_idx < self.config.num_hash_layers and tid2eid is not None and input_ids is not None:
+                if input_ids.device != hidden_states.device:
+                    input_ids = input_ids.to(hidden_states.device)
+                topk_idx, topk_w = self._compute_hash_experts(input_ids, layer_idx, tid2eid)
+            else:
+                topk_idx, topk_w = self._compute_routing_experts(flat_hidden, gate_w, gate_bias)
 
         self._last_routed_eids = sorted(set(
             int(x) for x in topk_idx.flatten().tolist() if x >= 0))
@@ -1429,15 +1430,17 @@ class HomeSeekInferenceEngine:
         if self._hot_expert_set and total_tokens > 0:
             try:
                 if self._all_routed_are_hot(flat_topk_idx, layer_idx):
-                    hot_result = self._forward_ffn_hot_batched(
-                        flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
+                    with record_function(f"ffn_hot_batched_L{layer_idx}"):
+                        hot_result = self._forward_ffn_hot_batched(
+                            flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
                     if hot_result is not None:
                         ffn_out = hot_result.reshape(B, T, D)
                         shared_w = self._get_shared_expert(layer_idx)
                         if shared_w is not None:
                             w1_d, w3_d, w2_d = shared_w
-                            shared_out = self._shared_ffn.forward(
-                                hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
+                            with record_function(f"ffn_shared_L{layer_idx}"):
+                                shared_out = self._shared_ffn.forward(
+                                    hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
                             ffn_out = ffn_out + shared_out
                         return ffn_out, set()
             except Exception:
@@ -1445,15 +1448,17 @@ class HomeSeekInferenceEngine:
 
         if total_tokens == 1 and self._fused_moe.use_triton:
             try:
-                m1_result = self._forward_ffn_m1_triton(
-                    hidden_states, flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
+                with record_function(f"ffn_m1_triton_L{layer_idx}"):
+                    m1_result = self._forward_ffn_m1_triton(
+                        hidden_states, flat_hidden, flat_topk_idx, flat_topk_w, layer_idx)
                 if m1_result is not None:
                     ffn_out = m1_result
                     shared_w = self._get_shared_expert(layer_idx)
                     if shared_w is not None:
                         w1_d, w3_d, w2_d = shared_w
-                        shared_out = self._shared_ffn.forward(
-                            hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
+                        with record_function(f"ffn_shared_L{layer_idx}"):
+                            shared_out = self._shared_ffn.forward(
+                                hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
                         ffn_out = ffn_out + shared_out
                     if hasattr(self, 'predictor'):
                         self.predictor.collect(layer_idx, flat_hidden, flat_topk_idx)
@@ -1462,13 +1467,14 @@ class HomeSeekInferenceEngine:
                 pass
 
         try:
-            def _bf16_load(layer, eid):
-                return self._load_bf16_deq(layer, eid)
-            result = self._fused_moe.forward(
-                flat_hidden, flat_topk_idx, flat_topk_w,
-                _bf16_load,
-                layer_idx,
-            )
+            with record_function(f"ffn_fused_moe_L{layer_idx}"):
+                def _bf16_load(layer, eid):
+                    return self._load_bf16_deq(layer, eid)
+                result = self._fused_moe.forward(
+                    flat_hidden, flat_topk_idx, flat_topk_w,
+                    _bf16_load,
+                    layer_idx,
+                )
             ffn_out = result.reshape(B, T, D)
         except Exception as _e:
             self._log(f"FusedMoE FP4 path failed at layer {layer_idx}: {type(_e).__name__}")
@@ -1515,8 +1521,9 @@ class HomeSeekInferenceEngine:
         shared_w = self._get_shared_expert(layer_idx)
         if shared_w is not None:
             w1_d, w3_d, w2_d = shared_w
-            shared_out = self._shared_ffn.forward(
-                hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
+            with record_function(f"ffn_shared_L{layer_idx}"):
+                shared_out = self._shared_ffn.forward(
+                    hidden_states, w1_d, w3_d, w2_d, hidden_states.dtype)
             ffn_out = ffn_out + shared_out
 
         if hasattr(self, 'predictor'):
@@ -2769,8 +2776,9 @@ class HomeSeekInferenceEngine:
             self._global_pos = T + step
             if next_id.device != self.embed.device:
                 next_id = next_id.to(self.embed.device, non_blocking=True)
-            h = self.embed[next_id].to(torch.bfloat16)
-            h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            with record_function("decode_embed"):
+                h = self.embed[next_id].to(torch.bfloat16)
+                h = h.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
             for layer_idx in range(self.config.num_hidden_layers):
                 lw = self._get_layer_weights(layer_idx)
                 h, _ = self._forward_layer(h, lw, layer_idx, next_id)
@@ -2795,19 +2803,21 @@ class HomeSeekInferenceEngine:
 
             last_h_for_mtp = h
 
-            h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
-            lm_head = self._get_per_device('lm_head', h_3d.device)
-            norm_w = self._get_per_device('norm_weight', h_3d.device)
-            if norm_w is not None:
-                h_3d = rms_norm(h_3d, norm_w, self.config.rms_norm_eps)
-            logits = torch.matmul(h_3d.to(lm_head.dtype), lm_head.t())
+            with record_function("decode_lm_head"):
+                h_3d = self._hc_head(h) if self.hc_head_fn is not None else h.sum(dim=2)
+                lm_head = self._get_per_device('lm_head', h_3d.device)
+                norm_w = self._get_per_device('norm_weight', h_3d.device)
+                if norm_w is not None:
+                    h_3d = rms_norm(h_3d, norm_w, self.config.rms_norm_eps)
+                logits = torch.matmul(h_3d.to(lm_head.dtype), lm_head.t())
 
-            if temperature > 0:
-                probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
-                next_id = torch.multinomial(probs, 1)
-            else:
-                next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
-            next_id = next_id.to(self.embed.device)
+            with record_function("decode_sample"):
+                if temperature > 0:
+                    probs = F.softmax(logits[:, -1].float() / temperature, dim=-1)
+                    next_id = torch.multinomial(probs, 1)
+                else:
+                    next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+                next_id = next_id.to(self.embed.device)
             generated.append(next_id)
             if stream_callback is not None:
                 stream_callback(next_id.item())

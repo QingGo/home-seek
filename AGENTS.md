@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.5 — EP 后端 + NSight 工具集成。
+DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.14 — Profiling overhaul + 瓶颈重新定位。
 
 ## 纪律
 
@@ -13,10 +13,11 @@ DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.5 — EP 后端 + NSight 
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (278 pass, 2 skip)
+make test-unit         # 单元测试 (304 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
-make profile           # 标准 profile (5 prompts, 30 tokens)
-make profile-nsys      # Nsight Systems: CUDA stream 时间线 + PCIe 传输
+make profile           # 标准 profile (5 prompts, 30 tokens). 现在包含: intra-FFN细分, decode step分布, post_step overhead
+make profile-compare   # 对比 prev/last profile (现在 per-layer + cache + intra-FFN + BW 全部对比)
+make profile-nsys      # Nsight Systems: CUDA stream 时间线 + PCIe 传输 (现在单GPU路径有 NVTX: ffn_routing, decode_embed, ...)
 make profile-ncu       # Nsight Compute: 单个 kernel 深度分析
 make profile-deep      # nsys + torch.profiler 双重 trace
 make server            # 启动 API 服务器
@@ -186,6 +187,7 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 - **Prefill/decode 分离**: `decode_time_s` / `num_generated_tokens`
 - **Shared expert 修改**: cuBLAS vs Triton 的 FP32 累加序差异 → 路由噪声 ±20%. **不得用于 A/B 对比**
 - **Profile 自动保存**: `make profile` 输出 JSON 到 `artifacts/last_profile.json`, `make profile-compare` 对比前后变化
+- **Profiling tax**: 每个 trace wrapper 前的 `torch.cuda.synchronize()` 增加 ~100-200ms/tok 开销. 生产环境无 tracing 时 decode 快 ~10-15%. Bottleneck analysis 的 "Other" decomposition 会分解此开销.
 - 修 bug 先写 L1 测试
 
 ## 已知陷阱 (gotchas)
@@ -212,8 +214,9 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 - **`encoding_dsv4` 路径**: V21 使用 `_project_root` 绝对路径计算, 不依赖 `__file__` 相对层级
 - **日志**: 使用 `logging.getLogger(__name__)` 而非 `print()`. `_log` 方法内部调用 `_logger.info()`
 - **V21.4 Thread-safe cache**: `ExpertWeightCache.put()` 包装 KeyError 处理多线程并发 eviction
-- **V21.4 f8 scale**: `_make_raw_entry` 保持 float8_e8m0fnu scale 不转 fp32 (4x 内存节省). `load_fp4_weight` 内部自动 to(f32)
-- **V21.4 cache sizing**: `min(_max_by_ram // 2, total_experts)` — max 一半 RAM 给 CPU cache, 留另一半给 page cache
+- **GPU store 命中率可能为 0%**: `hot_experts.json` 与真实路由可能完全不重合. 检查 `make profile` 输出中的 `GPU store: 0h/0m`. 如果为 0, 所有 expert 都走 CPU→GPU DMA, 重新生成 hot_experts.json 可能改善.
+- **Bottleneck analysis 数字使用最后一段的 delta**: 多轮 profile 时 bottleneck 分析使用 `round_results[-1]` 的 per-round delta, 不是 `layer_trace` (累积所有轮).
+- **post_step = ~22ms 是真实值**: lm_head matmul 不是瓶颈. 不要花时间优化它.
 
 ## Triton Kernel 铁律
 

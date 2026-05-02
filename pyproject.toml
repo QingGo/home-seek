@@ -78,6 +78,9 @@ select = ["F", "E", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/home_seek/encoding_dsv4.py" = ["E501"]
+"src/home_seek/profiling_runner.py" = ["E501"]
+"scripts/profile_compare.py" = ["E501"]
+"scripts/profile_show.py" = ["E501"]
 
 [tool.pytest.ini_options]
 markers = [
