@@ -31,6 +31,9 @@ class EngineStub:
         eng._max_hot_experts = 16
         eng._gpu_bf16_cache = OrderedDict()
         eng._max_bf16_cache = 16
+        eng._gpu_bf16_deq_cache = OrderedDict()
+        eng._max_gpu_bf16_deq = 48
+        eng._ep_affinity_rr = 0
         eng._shared_expert_weights = {}
         eng._shared_ffn = MagicMock()
         eng._shared_ffn.forward.return_value = torch.zeros(1, 1, eng.config.hidden_size,

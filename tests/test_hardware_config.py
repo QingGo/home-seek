@@ -18,8 +18,10 @@ def test_4090_defaults():
                    gpu_name="NVIDIA GeForce RTX 4090",
                    vram_total_gb=24, mem_bw_gb_s=1008)
     cfg = HardwareConfig.auto(hw, _test_config())
-    assert cfg.gpu_hot_max == 64
-    assert cfg.gpu_bf16_max == 100
+    # V21.7 FP4: (22-4)*0.20/(12.75/1024)=289, cap 256 → 256
+    assert cfg.gpu_hot_max == 256
+    # (22-3)*0.80/(12.75/1024)=1220, cap 400 → 400
+    assert cfg.gpu_bf16_max == 400
     assert cfg.cublas_max_tokens == 8
     assert cfg.devices == ("cuda:0",)
     assert cfg.mtp_enabled is False
@@ -32,9 +34,10 @@ def test_a100_defaults():
                    gpu_name="NVIDIA A100-PCIE-40GB",
                    vram_total_gb=40, mem_bw_gb_s=1555)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # actual computed from 38GB free: (38-4)*0.20/(48/1024)=145
-    assert cfg.gpu_hot_max == 145
-    assert cfg.gpu_bf16_max == 300
+    # V21.7 FP4: (38-4)*0.20/(12.75/1024)=546, cap 640 → 546
+    assert cfg.gpu_hot_max == 546
+    # (38-3)*0.80/(12.75/1024)=2248, cap 1200 → 1200
+    assert cfg.gpu_bf16_max == 1200
     assert cfg.mtp_enabled is True
     assert cfg.mtp_num_draft == 3
     assert cfg.cublas_max_tokens == 4
@@ -46,9 +49,10 @@ def test_h20_defaults():
                    gpu_name="NVIDIA H20 NVLink 96GB",
                    vram_total_gb=96, mem_bw_gb_s=4000)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # hot = (94-4)*0.20/(48/1024) = 384  capped at 1024 → 384
-    assert cfg.gpu_hot_max == 384
-    assert cfg.gpu_bf16_max == 512
+    # FP4: (94-4)*0.20/(12.75/1024)=1445, cap 1024 → 1024
+    assert cfg.gpu_hot_max == 1024
+    # (94-3)*0.80/(12.75/1024)=5846, cap 2048 → 2048
+    assert cfg.gpu_bf16_max == 2048
     # cpu_cache_max = max(2048, min(1024, 11008)) = 2048
     assert cfg.cpu_cache_max >= 2048
     assert cfg.triton_blocks == (16, 32, 32)
@@ -66,9 +70,10 @@ def test_2080_ti_dual():
     cfg = HardwareConfig.auto(hw, _test_config())
     # 与真实硬件拓扑探测不同，测试 HWProfile 的 tier=single(默认)。
     # 策略选择器走保守 PP 路径: _configure_pcie_numa
-    # GPU 缓存策略: 使用 vram_total_gb
-    assert cfg.gpu_hot_max == 25      # baseline 2080 策略值
-    assert cfg.gpu_bf16_max == 100    # baseline 2080 策略值
+    # V21.7 FP4: (10-4)*0.20/(12.75/1024)=96, cap 320 → 96
+    assert cfg.gpu_hot_max == 96
+    # (10-3)*0.80/(12.75/1024)=449, cap 400 → 400
+    assert cfg.gpu_bf16_max == 400
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert len(cfg.device_map) == 43
     # 未知拓扑 → 保守 PP (非旧硬编码 EP)
@@ -103,8 +108,8 @@ def test_validation_clamps_overcommit():
     hw = HWProfile(vram_free_gb=12, sm_count=68,
                    gpu_name="RTX 2080 Ti")
     cfg = HardwareConfig.auto(hw, _test_config(),
-                               gpu_hot_max=9999)
-    per_exp = 48.0 / 1024
+                                gpu_hot_max=9999)
+    per_exp = 12.75 / 1024  # V21.7 FP4
     max_possible = int(12 * 0.4 / per_exp)
     assert cfg.gpu_hot_max <= max_possible
 
@@ -113,20 +118,22 @@ def test_user_override_wins():
     hw = HWProfile(vram_free_gb=22, sm_count=128,
                    gpu_name="RTX 4090")
     cfg = HardwareConfig.auto(hw, _test_config(),
-                               mtp_enabled=True, mtp_num_draft=4)
+                                mtp_enabled=True, mtp_num_draft=4)
     assert cfg.mtp_enabled is True
     assert cfg.mtp_num_draft == 4
-    assert cfg.gpu_hot_max == 64  # 4090 baseline preserved
+    # V21.7 FP4 baseline preserved: 4090 → hot=256, bf16=400
+    assert cfg.gpu_hot_max == 256
 
 
 def test_unknown_gpu_fallback():
     hw = HWProfile(vram_free_gb=4, sm_count=32,
                    gpu_name="Unknown GPU")
     cfg = HardwareConfig.auto(hw, _test_config())
-    # vram clamped to 8, cap 64 → (8-4)*0.20/(48/1024)=17
-    assert cfg.gpu_hot_max == 17
-    # (8-3)*0.80/(48/1024)=85, cap 100 → 85
-    assert cfg.gpu_bf16_max == 85
+    # vram clamped to 8, cap 128 → (8-4)*0.20/(12.75/1024)=64
+    assert cfg.gpu_hot_max == 64
+    # (8-3)*0.80/(12.75/1024)=321, cap 256 → 256
+    # validate also clamps vram=4→8, so 0.85*8=6.8 > (64+256)*0.012451=3.98 → OK
+    assert cfg.gpu_bf16_max == 256
     # SM=32 < 70 → (16, 16, 32)
     assert cfg.triton_blocks == (16, 16, 32)
     # kv_offload = vram-6 = 8-6 = 2 (validation 只钳位上限)
@@ -137,11 +144,12 @@ def test_low_vram_clamp():
     hw = HWProfile(vram_free_gb=8, sm_count=68,
                    gpu_name="Old GPU")
     cfg = HardwareConfig.auto(hw, _test_config())
-    per_exp = 48.0 / 1024
+    per_exp = 12.75 / 1024  # V21.7 FP4
     max_hot = int(8 * 0.4 / per_exp)
     assert cfg.gpu_hot_max <= max_hot
     assert cfg.gpu_hot_max >= 16
-    assert cfg.gpu_hot_max == 17
+    # FP4: (8-4)*0.20/(12.75/1024)=64, cap 128 → 64
+    assert cfg.gpu_hot_max == 64
 
 
 def test_device_map_length_enforced():
@@ -173,7 +181,7 @@ def test_to_json(tmp_path):
     assert p.exists()
     import json
     data = json.loads(p.read_text())
-    assert data["gpu_hot_max"] == 64
+    assert data["gpu_hot_max"] == 256  # V21.7 FP4
 
 
 def test_pick_triton_blocks():
@@ -193,13 +201,11 @@ def test_auto_multi_gpu_8x4090():
                    vram_total_gb=24, mem_bw_gb_s=1008,
                    n_gpu=8)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # 策略值保持不变（per-GPU）
-    assert cfg.gpu_hot_max == 64
-    assert cfg.gpu_bf16_max == 100
-    # 自动生成 8 卡 device list
+    # V21.7 FP4: 策略值保持不变（per-GPU）
+    assert cfg.gpu_hot_max == 256
+    assert cfg.gpu_bf16_max == 400
     assert cfg.devices == tuple(f"cuda:{i}" for i in range(8))
     assert len(cfg.device_map) == 43
-    # 43/8=5.375 → ceil=6, 前 7 卡各 6 层, 末卡 1 层
     counts = [cfg.device_map.count(d) for d in range(8)]
     assert counts == [6, 6, 6, 6, 6, 6, 6, 1], f"unexpected dist: {counts}"
     assert sum(counts) == 43
@@ -212,15 +218,13 @@ def test_auto_multi_gpu_4x_unknown():
                    vram_total_gb=24,
                    n_gpu=4)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # fallback 不设 cap, 公式计算: (22-4)*0.20/(48/1024)=76, cap 64 → 64
-    assert cfg.gpu_hot_max == 64
+    # V21.7 FP4: (22-4)*0.20/(12.75/1024)=289, cap 128 → 128
+    assert cfg.gpu_hot_max == 128
     assert cfg.devices == tuple(f"cuda:{i}" for i in range(4))
     assert len(cfg.device_map) == 43
-    # (43+4-1)//4 = 11 → 前 3 卡各 11 层, 末卡 10
     counts = [cfg.device_map.count(d) for d in range(4)]
     assert counts == [11, 11, 11, 10], f"unexpected dist: {counts}"
     assert sum(counts) == 43
-    # SM=82, fallback triton_preset=auto → (16, 32, 32)
     assert cfg.triton_blocks == (16, 32, 32)
 
 
@@ -245,9 +249,9 @@ def test_auto_multi_gpu_explicit_strategy_still_works():
     assert cfg.parallel_backend == "pp"
     assert cfg.device_map[:22] == (0,) * 22
     assert cfg.device_map[22:] == (1,) * 21
-    # 缓存值保留 baseline（不被策略选择器覆盖）
-    assert cfg.gpu_hot_max == 25
-    assert cfg.gpu_bf16_max == 100
+    # V21.7 FP4 baseline preserved
+    assert cfg.gpu_hot_max == 96
+    assert cfg.gpu_bf16_max == 400
 
 
 def test_auto_multi_gpu_n_gpu_high_but_single_available():
@@ -279,8 +283,8 @@ def test_4090d_defaults():
                    gpu_name="NVIDIA GeForce RTX 4090 D",
                    vram_total_gb=24, n_gpu=1)
     cfg = HardwareConfig.auto(hw, _test_config())
-    assert cfg.gpu_hot_max == 64
-    assert cfg.gpu_bf16_max == 100
+    assert cfg.gpu_hot_max == 256
+    assert cfg.gpu_bf16_max == 400
     assert cfg.devices == ("cuda:0",)
 
 
@@ -290,7 +294,7 @@ def test_4090d_does_not_trigger_on_plain_4090():
                    gpu_name="NVIDIA GeForce RTX 4090",
                    vram_total_gb=24)
     cfg = HardwareConfig.auto(hw, _test_config())
-    assert cfg.gpu_hot_max == 64
+    assert cfg.gpu_hot_max == 256
 
 
 def test_5090_defaults():
@@ -299,10 +303,10 @@ def test_5090_defaults():
                    gpu_name="NVIDIA GeForce RTX 5090",
                    vram_total_gb=32, mem_bw_gb_s=1800)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # (30-4)*0.20/(48/1024)=110, cap 128
-    assert cfg.gpu_hot_max == 110
-    # (30-3)*0.80/(48/1024)=461, cap 256
-    assert cfg.gpu_bf16_max == 256
+    # FP4: (30-4)*0.20/(12.75/1024)=417, cap 512 → 417
+    assert cfg.gpu_hot_max == 417
+    # (30-3)*0.80/(12.75/1024)=1734, cap 1024 → 1024
+    assert cfg.gpu_bf16_max == 1024
     assert cfg.cublas_max_tokens == 4
     assert cfg.prefetch_enabled is False
     assert cfg.mtp_enabled is True
@@ -316,8 +320,8 @@ def test_3090_defaults():
                    gpu_name="NVIDIA GeForce RTX 3090",
                    vram_total_gb=24, mem_bw_gb_s=936)
     cfg = HardwareConfig.auto(hw, _test_config())
-    assert cfg.gpu_hot_max == 64
-    assert cfg.gpu_bf16_max == 100
+    assert cfg.gpu_hot_max == 256
+    assert cfg.gpu_bf16_max == 400
     assert cfg.triton_blocks == (16, 32, 32)  # SM=82 auto
     assert cfg.mtp_enabled is False
 
@@ -328,9 +332,10 @@ def test_3080_ti_defaults():
                    gpu_name="NVIDIA GeForce RTX 3080 Ti",
                    vram_total_gb=12, mem_bw_gb_s=912)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # 10GB free → (10-4)*0.20/(48/1024)=25, cap 48
-    assert cfg.gpu_hot_max == 25
-    assert cfg.gpu_bf16_max == 80  # cap
+    # FP4: (10-4)*0.20/(12.75/1024)=96, cap 192 → 96
+    assert cfg.gpu_hot_max == 96
+    # (10-3)*0.80/(12.75/1024)=449, cap 320 → 320
+    assert cfg.gpu_bf16_max == 320
     assert cfg.triton_blocks == (16, 32, 32)  # SM=80 auto
 
 
@@ -340,10 +345,10 @@ def test_3080_defaults():
                    gpu_name="NVIDIA GeForce RTX 3080",
                    vram_total_gb=10, mem_bw_gb_s=760)
     cfg = HardwareConfig.auto(hw, _test_config())
-    # vram clamped to 8 → (8-4)*0.20/(48/1024)=17, cap 32
-    assert cfg.gpu_hot_max == 17
-    # (8-3)*0.80/(48/1024)=85, cap 64
-    assert cfg.gpu_bf16_max == 64
+    # FP4: (8-4)*0.20/(12.75/1024)=64, cap 128 → 64
+    assert cfg.gpu_hot_max == 64
+    # (8-3)*0.80/(12.75/1024)=321, cap 256 → 256
+    assert cfg.gpu_bf16_max == 256
     assert cfg.triton_blocks == (16, 16, 32)  # SM=68 + preset
     assert cfg.cublas_max_tokens == 4
 
@@ -355,8 +360,8 @@ def test_3080_ti_matches_before_3080():
                        vram_total_gb=12)
     cfg_ti = HardwareConfig.auto(hw_ti, _test_config())
     hw_plain = HWProfile(vram_free_gb=8, sm_count=68,
-                          gpu_name="RTX 3080",
-                          vram_total_gb=10)
+                           gpu_name="RTX 3080",
+                           vram_total_gb=10)
     cfg_plain = HardwareConfig.auto(hw_plain, _test_config())
     assert cfg_ti.gpu_hot_max > cfg_plain.gpu_hot_max  # Ti 更激进
     assert cfg_ti.triton_blocks == (16, 32, 32)

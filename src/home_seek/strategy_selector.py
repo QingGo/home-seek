@@ -67,12 +67,12 @@ def _configure_nvlink(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConfig) -
     """NVLink：最高带宽互联 → EP（专家可通过 NVLink 零拷贝共享）。"""
     vram = _vram_per_gpu(hw)
     n = _n_gpu(hw)
-    per_exp = 48.0 / 1024
+    per_exp = 12.75 / 1024  # V21.7: FP4 raw entry size
 
     params["parallel_backend"] = "ep"
     params["device_map"] = tuple([0] * cfg.num_hidden_layers)
-    params["gpu_hot_max"] = max(32, min(int(vram * 0.30 / per_exp), 512))
-    params["gpu_bf16_max"] = max(64, min(int(vram * 0.50 / per_exp), 512))
+    params["gpu_hot_max"] = max(32, min(int(vram * 0.30 / per_exp), 1024))
+    params["gpu_bf16_max"] = max(64, min(int(vram * 0.50 / per_exp), 2048))
     params["prefetch_enabled"] = False
     params["mtp_enabled"] = True
     _logger.info(f"  [Strategy] NVLink ×{n}: EP backend, large GPU cache")
@@ -82,7 +82,7 @@ def _configure_pcie_p2p(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConfig)
     """同 NUMA + P2P 可达 → EP（专家可通过 P2P 在卡间搬运）。"""
     vram = _vram_per_gpu(hw)
     n = _n_gpu(hw)
-    per_exp = 48.0 / 1024
+    per_exp = 12.75 / 1024  # V21.7: FP4 raw entry size
 
     params["parallel_backend"] = "ep"
     params["device_map"] = tuple([0] * cfg.num_hidden_layers)
@@ -96,16 +96,16 @@ def _configure_numa_remote(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConf
     """跨 NUMA 无 P2P：EP + NUMA 绑定，利用独立内存控制器并行加载。"""
     vram = _vram_per_gpu(hw)
     n = _n_gpu(hw)
-    per_exp = 48.0 / 1024
+    per_exp = 12.75 / 1024  # V21.7: FP4 raw entry size
 
     params["parallel_backend"] = "ep"
     params["device_map"] = tuple([0] * cfg.num_hidden_layers)
     # P2: EP 下每个 GPU 需缓存所有层的专家。
     # VRAM 预算: total - 3GB(non-expert) - 2GB(KV) - 1GB(misc) = available
-    # BF16 缓存上限 50% 可用 VRAM, 留余量避免 OOM
+    # FP4 缓存上限 50% 可用 VRAM, 留余量避免 OOM
     _safe_vram = max(8, vram - 6)
-    params["gpu_hot_max"] = max(32, min(int(_safe_vram * 0.20 / per_exp), 128))
-    params["gpu_bf16_max"] = max(64, min(int(_safe_vram * 0.50 / per_exp), 250))
+    params["gpu_hot_max"] = max(32, min(int(_safe_vram * 0.20 / per_exp), 512))
+    params["gpu_bf16_max"] = max(64, min(int(_safe_vram * 0.50 / per_exp), 1024))
     params["prefetch_enabled"] = True
     params["ep_numa_aware"] = True
     _logger.info(f"  [Strategy] NUMA Remote ×{n}: EP backend + NUMA bind")

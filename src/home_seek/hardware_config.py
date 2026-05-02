@@ -21,12 +21,12 @@ class HardwareConfig:
     - 不含 torch.Tensor 或 CUDA 引用
     """
 
-    # ── GPU 缓存 ────────────────────────────────────
-    gpu_hot_max: int = 64
-    """_gpu_hot_experts LRU 上限。每项 ~48 MB (BF16 dequant 后)。"""
+    # ── GPU 缓存 (V21.7: FP4 raw 格式, ~12.75 MB/项) ─
+    gpu_hot_max: int = 128
+    """_gpu_hot_experts FIFO 上限。每项 ~12.75 MB (FP4 raw)。"""
 
-    gpu_bf16_max: int = 100
-    """_gpu_bf16_cache LRU 上限。"""
+    gpu_bf16_max: int = 256
+    """_gpu_bf16_cache LRU 上限。每项 ~12.75 MB (FP4 raw)。"""
 
     # ── CPU 缓存 ────────────────────────────────────
     cpu_cache_max: int = 8192
@@ -81,8 +81,8 @@ class HardwareConfig:
         # ── 4090 D (24GB, 128SM, ~0.95 TB/s) ──────────
         # 必须先于 "4090" 匹配, 避免 "4090 D" 误配到 4090
         "4090 d": {
-            "gpu_hot_cap": 64,
-            "gpu_bf16_cap": 100,
+            "gpu_hot_cap": 256,
+            "gpu_bf16_cap": 400,
             "kv_offload_gb": 18,
             "cublas_max_tokens": 8,
             "prefetch": True,
@@ -90,8 +90,8 @@ class HardwareConfig:
         },
         # ── 当前基线: 4090 (24GB, 128SM, 1.0 TB/s) ────
         "4090": {
-            "gpu_hot_cap": 64,
-            "gpu_bf16_cap": 100,
+            "gpu_hot_cap": 256,
+            "gpu_bf16_cap": 400,
             "kv_offload_gb": 18,
             "cublas_max_tokens": 8,
             "prefetch": True,
@@ -99,8 +99,8 @@ class HardwareConfig:
         },
         # ── 5090 (32GB, 170+SM, ~1.8 TB/s) ────────────
         "5090": {
-            "gpu_hot_cap": 128,
-            "gpu_bf16_cap": 256,
+            "gpu_hot_cap": 512,
+            "gpu_bf16_cap": 1024,
             "kv_offload_gb": 26,
             "cublas_max_tokens": 4,
             "prefetch": False,
@@ -109,8 +109,8 @@ class HardwareConfig:
         },
         # ── 3090 (24GB, 82SM, 936 GB/s) ───────────────
         "3090": {
-            "gpu_hot_cap": 64,
-            "gpu_bf16_cap": 100,
+            "gpu_hot_cap": 256,
+            "gpu_bf16_cap": 400,
             "kv_offload_gb": 18,
             "cublas_max_tokens": 8,
             "prefetch": True,
@@ -119,8 +119,8 @@ class HardwareConfig:
         # ── 3080 Ti (12GB, 80SM, 912 GB/s) ────────────
         # 必须先于 "3080" 匹配
         "3080 ti": {
-            "gpu_hot_cap": 48,
-            "gpu_bf16_cap": 80,
+            "gpu_hot_cap": 192,
+            "gpu_bf16_cap": 320,
             "kv_offload_gb": 7,
             "cublas_max_tokens": 4,
             "prefetch": True,
@@ -128,8 +128,8 @@ class HardwareConfig:
         },
         # ── 3080 (10/12GB, 68SM, 760 GB/s) ────────────
         "3080": {
-            "gpu_hot_cap": 32,
-            "gpu_bf16_cap": 64,
+            "gpu_hot_cap": 128,
+            "gpu_bf16_cap": 256,
             "kv_offload_gb": 6,
             "cublas_max_tokens": 4,
             "triton_preset": (16, 16, 32),
@@ -138,8 +138,8 @@ class HardwareConfig:
         },
         # ── A100-40GB ────────────────────────────────
         "a100": {
-            "gpu_hot_cap": 160,
-            "gpu_bf16_cap": 300,
+            "gpu_hot_cap": 640,
+            "gpu_bf16_cap": 1200,
             "kv_offload_gb": 30,
             "cublas_max_tokens": 4,
             "prefetch": True,
@@ -149,7 +149,7 @@ class HardwareConfig:
         # ── H20-96GB ─────────────────────────────────
         "h20": {
             "gpu_hot_cap": 1024,
-            "gpu_bf16_cap": 512,
+            "gpu_bf16_cap": 2048,
             "cpu_cache_max": 1024,
             "kv_offload_gb": 75,
             "triton_preset": (16, 32, 32),
@@ -161,7 +161,7 @@ class HardwareConfig:
         # ── RTX PRO 6000-96GB ────────────────────────
         "rtx pro 6000": {
             "gpu_hot_cap": 1024,
-            "gpu_bf16_cap": 512,
+            "gpu_bf16_cap": 2048,
             "kv_offload_gb": 75,
             "cublas_max_tokens": 8,
             "prefetch": False,
@@ -171,8 +171,8 @@ class HardwareConfig:
         # 拓扑参数 (devices, parallel_backend) 由 strategy_selector 根据
         # interconnect_tier 自动选择，不再硬编码。
         "2080": {
-            "gpu_hot_cap": 80,
-            "gpu_bf16_cap": 100,
+            "gpu_hot_cap": 320,
+            "gpu_bf16_cap": 400,
             "cpu_cache_max": 6144,
             "kv_offload_gb": 6,
             "cublas_max_tokens": 4,
@@ -181,7 +181,7 @@ class HardwareConfig:
             "mtp": False,
         },
         # ── 未识别 GPU: 不压制 VRAM/SM 公式, 让 _compute 自动适配 ──
-        #    gpu_hot_cap/gpu_bf16_cap 用默认值 64/100
+        #    gpu_hot_cap/gpu_bf16_cap 用默认值 128/256 (FP4 ~12.75MB/项)
         #    triton_preset=auto → _pick_triton_blocks 按 SM 选择
         #    kv_offload_gb → vram-6 (由 _compute 自动)
         #    _validate 确保安全钳位 (hot≤40%VRAM, hot+bf16≤85%VRAM)
@@ -273,13 +273,13 @@ class HardwareConfig:
                  cfg: DeepSeekV4FlashConfig) -> dict:
         """将预设策略的语义参数展开为具体数值。"""
         vram = max(hw.vram_free_gb, 8.0)
-        per_exp_bf16 = 48.0 / 1024  # GiB
+        per_exp_fp4 = 12.75 / 1024  # GiB (V21.7: GPU 存 FP4 raw ~12.75 MB/项)
 
-        hot_cap = strategy.get("gpu_hot_cap", 64)
-        hot = max(16, min(int((vram - 4) * 0.20 / per_exp_bf16), hot_cap))
+        hot_cap = strategy.get("gpu_hot_cap", 128)
+        hot = max(16, min(int((vram - 4) * 0.20 / per_exp_fp4), hot_cap))
 
-        bf16_cap = strategy.get("gpu_bf16_cap", 100)
-        bf16 = max(16, min(int((vram - 3) * 0.80 / per_exp_bf16), bf16_cap))
+        bf16_cap = strategy.get("gpu_bf16_cap", 256)
+        bf16 = max(16, min(int((vram - 3) * 0.80 / per_exp_fp4), bf16_cap))
 
         cpu_max = max(2048,
                       min(strategy.get("cpu_cache_max", 8192),
@@ -362,18 +362,18 @@ class HardwareConfig:
         """验证字段合法性, 修正不可行值。"""
         params = dict(params)
         vram = max(hw.vram_free_gb, 8.0)
-        per_exp_bf16 = 48.0 / 1024
+        per_exp_fp4 = 12.75 / 1024  # V21.7: FP4 raw entry size
 
-        hot = params.get("gpu_hot_max", 64)
-        hot_gb = hot * per_exp_bf16
+        hot = params.get("gpu_hot_max", 128)
+        hot_gb = hot * per_exp_fp4
         if hot_gb > vram * 0.4:
-            hot = int(vram * 0.4 / per_exp_bf16)
+            hot = int(vram * 0.4 / per_exp_fp4)
         params["gpu_hot_max"] = hot
 
-        bf16 = params.get("gpu_bf16_max", 100)
-        total_gb = (hot * per_exp_bf16) + (bf16 * per_exp_bf16)
+        bf16 = params.get("gpu_bf16_max", 256)
+        total_gb = (hot * per_exp_fp4) + (bf16 * per_exp_fp4)
         if total_gb > vram * 0.85:
-            bf16 = int((vram * 0.85 - hot * per_exp_bf16) / per_exp_bf16)
+            bf16 = int((vram * 0.85 - hot * per_exp_fp4) / per_exp_fp4)
         params["gpu_bf16_max"] = max(16, bf16)
 
         offload = params.get("kv_offload_threshold_gb", vram - 6)

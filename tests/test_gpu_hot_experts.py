@@ -14,6 +14,7 @@ import torch
 import pytest
 from collections import OrderedDict
 from unittest.mock import MagicMock
+from tests._engine_stub import make_engine
 
 _HS = 256
 _IM = 128
@@ -47,6 +48,9 @@ def _make_engine_stub():
     eng._max_hot_experts = 16
     eng._gpu_bf16_cache = OrderedDict()
     eng._max_bf16_cache = 16
+    eng._gpu_bf16_deq_cache = OrderedDict()
+    eng._max_gpu_bf16_deq = 48
+    eng._ep_affinity_rr = 0
     eng._shared_expert_weights = {}
     eng._shared_ffn = MagicMock()
     eng._shared_ffn.forward.return_value = torch.zeros(1, 1, _HS, device="cuda", dtype=torch.bfloat16)
@@ -134,8 +138,11 @@ class TestLoadGpuHotExpert:
         w2p, w2s = cast(w2_bf16.cpu(), fmt="e2m1", block_size=(1, 32))
 
         eng = _make_engine_stub()
-        eng._load_expert_fp4_raw = MagicMock(return_value=(
-            w1p.cpu(), w1s.cpu(), w3p.cpu(), w3s.cpu(), w2p.cpu(), w2s.cpu()))
+        eng._load_expert_raw = MagicMock(return_value=(
+            (w1p.cpu(), w1s.cpu(), "fp4"),
+            (w3p.cpu(), w3s.cpu(), "fp4"),
+            (w2p.cpu(), w2s.cpu(), "fp4"),
+        ))
 
         result = eng._load_gpu_hot_expert_bf16(0, 5)
         assert result is not None
@@ -143,7 +150,10 @@ class TestLoadGpuHotExpert:
         for w in result:
             assert w.dtype == torch.bfloat16
             assert w.device.type == "cuda"
-        assert (0, 5) in eng._gpu_hot_experts
+        # FP4 6-tuple stored in bf16 cache (eid=5 is not hot)
+        assert (0, 5) in eng._gpu_bf16_cache
+        cached = eng._gpu_bf16_cache[(0, 5)]
+        assert len(cached) == 6  # FP4 raw, not BF16
 
     def test_cache_hit_returns_cached(self):
         eng = _make_engine_stub()
@@ -165,14 +175,23 @@ class TestLoadGpuHotExpert:
             eng._gpu_hot_experts[(0, i)] = (w, w, w)
         from home_seek._fp4 import cast
         w_ref = torch.randn(_IM, _HS, dtype=torch.bfloat16)
+        w_ref2 = torch.randn(_HS, _IM, dtype=torch.bfloat16)
         wp, ws = cast(w_ref.cpu(), fmt="e2m1", block_size=(1, 32))
-        eng._load_expert_fp4_raw = MagicMock(return_value=(
-            wp.cpu(), ws.cpu(), wp.cpu(), ws.cpu(), wp.cpu(), ws.cpu()))
+        wp2, ws2 = cast(w_ref2.cpu(), fmt="e2m1", block_size=(1, 32))
+        eng._load_expert_raw = MagicMock(return_value=(
+            (wp.cpu(), ws.cpu(), "fp4"),
+            (wp.cpu(), ws.cpu(), "fp4"),
+            (wp2.cpu(), ws2.cpu(), "fp4"),
+        ))
+        # Make eid=99 a hot expert so it enters gpu_hot cache (FIFO eviction)
+        eng._hot_expert_set = {99}
         result = eng._load_gpu_hot_expert_bf16(0, 99)
         assert result is not None
         assert len(eng._gpu_hot_experts) == 4
         assert (0, 0) not in eng._gpu_hot_experts
         assert (0, 99) in eng._gpu_hot_experts
+        cached = eng._gpu_hot_experts[(0, 99)]
+        assert len(cached) == 6  # FP4 raw stored, not BF16
 
     def test_cache_none_when_load_fails(self):
         eng = _make_engine_stub()
@@ -224,9 +243,9 @@ class TestForwardFfnHotBatched:
             w_ref2 = torch.randn(_HS, _IM, dtype=torch.bfloat16)
             wp2, ws2 = cast(w_ref2, fmt="e2m1", block_size=(1, 32))
             return (
-                wp.cpu(), ws.cpu(),
-                wp.cpu(), ws.cpu(),
-                wp2.cpu(), ws2.cpu(),
+                wp.cuda(), ws.cuda(),
+                wp.cuda(), ws.cuda(),
+                wp2.cuda(), ws2.cuda(),
             )
         eng._load_expert_fp4_raw = mock_fp4_raw
         return eng
@@ -283,7 +302,7 @@ class TestForwardFfnHotBatched:
             w1p, w1s = cast(w1.cpu(), fmt="e2m1", block_size=(1, 32))
             w3p, w3s = cast(w3.cpu(), fmt="e2m1", block_size=(1, 32))
             w2p, w2s = cast(w2.cpu(), fmt="e2m1", block_size=(1, 32))
-            return (w1p, w1s, w3p, w3s, w2p, w2s)
+            return (w1p.cuda(), w1s.cuda(), w3p.cuda(), w3s.cuda(), w2p.cuda(), w2s.cuda())
 
         def mock_legacy_load(layer, eid):
             w1, w3, w2 = w_refs[eid]
@@ -318,7 +337,7 @@ class TestForwardFfnHotBatched:
         w1p, w1s = cast(w_ref.cpu(), fmt="e2m1", block_size=(1, 32))
         w2p, w2s = cast(w_ref2.cpu(), fmt="e2m1", block_size=(1, 32))
         eng._load_expert_fp4_raw = MagicMock(return_value=(
-            w1p, w1s, w1p, w1s, w2p, w2s))
+            w1p.cuda(), w1s.cuda(), w1p.cuda(), w1s.cuda(), w2p.cuda(), w2s.cuda()))
 
         hidden = torch.randn(1, _HS, device="cuda", dtype=torch.bfloat16)
         idx = torch.tensor([[5, -1, -1, -1]], device="cuda")
@@ -420,17 +439,17 @@ class TestGpuBf16LruCache:
         return MagicMock(return_value=(
             (w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4")))
 
-    def test_non_hot_returns_3tuple(self):
+    def test_non_hot_returns_6tuple(self):
         eng = _make_engine_stub()
         eng._max_bf16_cache = 4
         eng._load_expert_raw = self._make_fp4_raw_mock()
 
         result = eng._load_expert_fp4_raw(0, 99)
         assert result is not None
-        assert len(result) == 3
-        for w in result:
-            assert w.dtype == torch.bfloat16
-            assert w.device.type == "cuda"
+        assert len(result) == 6
+        assert result[0].dtype == torch.int8  # packed FP4
+        assert result[1].dtype == torch.float32  # scale
+        assert result[0].device.type == "cuda"
         assert (0, 99) in eng._gpu_bf16_cache
         assert (0, 99) not in eng._gpu_hot_experts
 
@@ -506,3 +525,390 @@ class TestGpuBf16LruCache:
             (None, None, "bf16"), (None, None, "bf16"), (None, None, "bf16")))
         result = eng._load_expert_fp4_raw(0, 99)
         assert result is None
+
+
+@pytest.mark.fast
+class TestGpuFp4CacheV21_7:
+    """V21.7: GPU 缓存存 FP4 raw (6元组) 而非 BF16 (3元组).
+
+    验证:
+    1. _load_expert_fp4_raw 存储 FP4 6元组并返回 6元组
+    2. 缓存命中返回正确 6元组
+    3. _load_gpu_hot_expert_bf16 从 FP4 缓存去量化 BF16
+    4. _forward_legacy 处理 6元组 (FP4 即时去量化)
+    5. 热专家 FIFO 淘汰仍正常工作
+    """
+
+    def setup_method(self):
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+
+    def _make_fp4_raw(self, I=32, D=128):
+        from home_seek._fp4 import cast
+        w1 = torch.randn(I, D, dtype=torch.bfloat16)
+        w3 = torch.randn(I, D, dtype=torch.bfloat16)
+        w2 = torch.randn(D, I, dtype=torch.bfloat16)
+        w1p, w1s = cast(w1.cpu(), fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(w3.cpu(), fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(w2.cpu(), fmt="e2m1", block_size=(1, 32))
+        return {
+            "bf16": (w1, w3, w2),
+            "raw": ((w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4")),
+        }
+
+    def test_cache_stores_fp4_not_bf16(self):
+        """验证缓存存储 6元组 (FP4 raw) 而非 3元组 (BF16)."""
+        eng = _make_engine_stub()
+        eng._max_hot_experts = 4
+        eng._hot_expert_set = {7}  # hot → goes to gpu_hot cache
+        fp4 = self._make_fp4_raw()
+        eng._load_expert_raw = MagicMock(return_value=fp4["raw"])
+
+        result = eng._load_expert_fp4_raw(0, 7)
+        assert result is not None
+        assert len(result) == 6, "should store FP4 6-tuple"
+        assert result[0].dtype == torch.int8, "FP4 packed data is int8"
+        assert result[1].dtype == torch.float32, "FP4 scale is float32"
+        assert (0, 7) in eng._gpu_hot_experts
+        cached = eng._gpu_hot_experts[(0, 7)]
+        assert len(cached) == 6
+        assert cached[0].dtype == torch.int8
+
+    def test_cache_hit_returns_6tuple(self):
+        """第二次调用命中缓存, 返回相同 6元组."""
+        eng = _make_engine_stub()
+        eng._max_bf16_cache = 4
+        fp4 = self._make_fp4_raw()
+        eng._load_expert_raw = MagicMock(return_value=fp4["raw"])
+
+        r1 = eng._load_expert_fp4_raw(0, 99)
+        eng._load_expert_raw.reset_mock()
+        r2 = eng._load_expert_fp4_raw(0, 99)
+        eng._load_expert_raw.assert_not_called()
+        assert r2 is not None
+        assert len(r2) == 6
+        # Same data pointers (cache hit returns the same tensors)
+        for a, b in zip(r1, r2):
+            assert a.data_ptr() == b.data_ptr()
+
+    def test_hot_batched_from_fp4_cache(self):
+        """_forward_ffn_hot_batched 调用 _load_gpu_hot_expert_bf16,
+        后者从 FP4 cache 去量化并返回 BF16."""
+        from home_seek.fused_moe import FusedMoEFFN
+        eng = _make_engine_stub()
+        eng._max_hot_experts = 8
+        eng._hot_expert_set = {1, 2, 3, 4}
+
+        fp4 = self._make_fp4_raw(I=_IM, D=_HS)
+
+        def mock_raw(layer, eid):
+            return fp4["raw"]
+        eng._load_expert_raw = MagicMock(side_effect=mock_raw)
+
+        eng._fused_moe = FusedMoEFFN(
+            num_experts=8, intermediate_size=_IM, hidden_size=_HS,
+            use_triton=False)
+
+        B, D = 1, _HS
+        hidden = torch.randn(B, D, device="cuda", dtype=torch.bfloat16)
+        idx = torch.tensor([[1, 2, 3, 4]], device="cuda")
+        w = torch.ones(B, 4, device="cuda") / 4
+
+        result = eng._forward_ffn_hot_batched(hidden, idx, w, 0)
+        assert result is not None
+        assert result.shape == (B, D)
+        assert torch.isfinite(result).all()
+
+    def test_fp4_cache_eviction_fifo(self):
+        """热专家 FIFO: 满时淘汰最早条目."""
+        eng = _make_engine_stub()
+        eng._max_hot_experts = 2
+        fp4 = self._make_fp4_raw(I=_IM, D=_HS)
+        eng._load_expert_raw = MagicMock(return_value=fp4["raw"])
+
+        eng._hot_expert_set = {10, 20, 30}
+        eng._load_expert_fp4_raw(0, 10)
+        eng._load_expert_fp4_raw(0, 20)
+        assert len(eng._gpu_hot_experts) == 2
+        eng._load_expert_fp4_raw(0, 30)
+        assert len(eng._gpu_hot_experts) == 2
+        assert (0, 10) not in eng._gpu_hot_experts  # FIFO evicted
+        assert (0, 20) in eng._gpu_hot_experts
+        assert (0, 30) in eng._gpu_hot_experts
+        # Verify stored as FP4 6-tuple
+        assert len(eng._gpu_hot_experts[(0, 30)]) == 6
+
+    def test_fp4_cache_survives_clear(self):
+        """generate() 的 clear 清理 FP4 缓存."""
+        eng = _make_engine_stub()
+        eng._max_hot_experts = 4
+        eng._hot_expert_set = {42}
+        fp4 = self._make_fp4_raw(I=_IM, D=_HS)
+        eng._load_expert_raw = MagicMock(return_value=fp4["raw"])
+        eng._load_expert_fp4_raw(0, 42)
+        assert len(eng._gpu_hot_experts) == 1
+
+        # Simulate generate() clear
+        eng._gpu_hot_experts.clear()
+        assert len(eng._gpu_hot_experts) == 0
+
+
+# ── V21.7 回归复现: 跨层复用同一专家时去量化被重复执行 ──────────
+#    Bug: 同一 eid 在 layer 0 和 layer 1 都被路由到,
+#    _load_expert_fp4_raw 返回 6 元组 (FP4 raw),
+#    _forward_legacy 每次都要重复跑 triton_dequantize_fp4_all.
+#    期望: 同一 eid 在一次 generate 内只去量化一次, 后续复用 BF16 缓存.
+
+
+@pytest.mark.fast
+class TestCrossLayerDequantRepeat:
+    """V21.7 回归: 跨层复用同一专家时, 去量化被重复执行."""
+
+    def setup_method(self):
+        from home_seek.fused_moe import clear_deq_cache
+        clear_deq_cache()
+
+    def _make_fp4_raw(self, I=32, D=128):
+        from home_seek._fp4 import cast
+        w1 = torch.randn(I, D, dtype=torch.bfloat16)
+        w3 = torch.randn(I, D, dtype=torch.bfloat16)
+        w2 = torch.randn(D, I, dtype=torch.bfloat16)
+        w1p, w1s = cast(w1.cpu(), fmt="e2m1", block_size=(1, 32))
+        w3p, w3s = cast(w3.cpu(), fmt="e2m1", block_size=(1, 32))
+        w2p, w2s = cast(w2.cpu(), fmt="e2m1", block_size=(1, 32))
+        return ((w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4"))
+
+    def test_same_expert_different_layers_double_dequant(self):
+        """相同 eid 在 layer 0 和 layer 1 各触发一次 triton_dequantize_fp4_all.
+        期望: 总共只调用 1 次 (layer 0 去量化后缓存 BF16, layer 1 复用).
+        """
+        from unittest.mock import patch
+        from home_seek.fused_moe import triton_dequantize_fp4_all as real_dequant
+        call_count = [0]
+
+        def counting_dequant(*args):
+            call_count[0] += 1
+            return real_dequant(*args)
+
+        # _load_bf16_deq 在 engine.py 中调用, _forward_legacy 在 fused_moe 中调用
+        with patch(
+            'home_seek.inference_engine.engine.triton_dequantize_fp4_all',
+            counting_dequant
+        ), patch(
+            'home_seek.fused_moe.triton_dequantize_fp4_all',
+            counting_dequant
+        ):
+            from tests._engine_stub import make_engine
+            eng = make_engine()
+            eng._max_hot_experts = 8
+            eng._max_bf16_cache = 16
+            fp4_raw = self._make_fp4_raw(I=32, D=128)
+            eng._load_expert_raw = MagicMock(return_value=fp4_raw)
+
+            r0 = eng._load_expert_fp4_raw(0, 5)
+            r1 = eng._load_expert_fp4_raw(1, 5)
+            assert len(r0) == 6
+            assert len(r1) == 6
+
+            from home_seek.fused_moe import FusedMoEFFN
+            moe = FusedMoEFFN(num_experts=4, intermediate_size=32,
+                               hidden_size=128, use_triton=False)
+
+            def load_fn(layer, eid):
+                return eng._load_bf16_deq(layer, eid)
+
+            hidden = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+            idx = torch.tensor([[5, -1, -1, -1]], device="cuda")
+            w = torch.tensor([[1.0, 0, 0, 0]], device="cuda")
+
+            call_count[0] = 0
+            moe._forward_legacy(hidden, idx, w, load_fn, 0)
+            first_calls = call_count[0]
+
+            moe._forward_legacy(hidden, idx, w, load_fn, 1)
+            total_calls = call_count[0]
+
+        assert first_calls == 1, f"第一次 forward 应去量化 1 次, 实际 {first_calls}"
+        assert total_calls == 1, (
+            f"[FIXED] 跨层同一专家触发了 {total_calls} 次去量化, "
+            f"期望 1 次 (第一层去量化后缓存 BF16, 第二层复用)")
+
+    def test_hot_batched_same_expert_cross_layer(self):
+        """_forward_ffn_hot_batched 路径下, 同一专家跨层也重复去量化."""
+        from unittest.mock import patch
+        from home_seek.inference_engine import engine as eng_module
+        from home_seek.fused_moe import triton_dequantize_fp4_all as real_dequant
+        call_count = 0
+
+        def counting_dequant(*args):
+            nonlocal call_count
+            call_count += 1
+            return real_dequant(*args)
+
+        with patch.object(eng_module, 'triton_dequantize_fp4_all', counting_dequant):
+            from tests._engine_stub import make_engine
+            from home_seek._fp4 import cast
+            eng = make_engine()
+            eng._max_hot_experts = 16
+            eng._max_bf16_cache = 16
+            eng._hot_expert_set = {5}
+
+            I, D = 32, 128
+            w1bf = torch.randn(I, D, dtype=torch.bfloat16)
+            w3bf = torch.randn(I, D, dtype=torch.bfloat16)
+            w2bf = torch.randn(D, I, dtype=torch.bfloat16)
+            w1p, w1s = cast(w1bf.cpu(), fmt="e2m1", block_size=(1, 32))
+            w3p, w3s = cast(w3bf.cpu(), fmt="e2m1", block_size=(1, 32))
+            w2p, w2s = cast(w2bf.cpu(), fmt="e2m1", block_size=(1, 32))
+            eng._load_expert_raw = MagicMock(return_value=(
+                (w1p, w1s, "fp4"), (w3p, w3s, "fp4"), (w2p, w2s, "fp4")))
+
+            hidden = torch.randn(1, D, device="cuda", dtype=torch.bfloat16)
+            idx = torch.tensor([[5, -1, -1, -1]], device="cuda")
+            w = torch.tensor([[1.0, 0, 0, 0]], device="cuda")
+
+            call_count = 0
+            eng._forward_ffn_hot_batched(hidden, idx, w, 0)
+            c1 = call_count
+
+            eng._forward_ffn_hot_batched(hidden, idx, w, 1)
+            c2 = call_count
+
+        assert c1 == 1, f"第一层应触发 1 次去量化, 实际 {c1}"
+        assert c2 == 1, (
+            f"[FIXED] hot_batched 路径跨层同一专家触发了 {c2} 次去量化, "
+            f"期望 1 次 (复用 BF16 缓存)")
+
+
+@pytest.mark.fast
+class TestEpAffinityScheduling:
+    """EP 亲和性调度: 替代 eid%2 硬切分, 按缓存位置动态分配."""
+
+    def _make_ep_engine(self):
+        from unittest.mock import MagicMock
+        from home_seek.inference_engine.parallel import EPBackend
+        from home_seek.hardware_config import HardwareConfig
+        from home_seek.model_config import DeepSeekV4FlashConfig
+        eng = make_engine()
+        eng.config = DeepSeekV4FlashConfig()
+        hw = HardwareConfig(devices=("cuda:0", "cuda:1"), device_map=(0, 0))
+        eng._backend = EPBackend(hw, 43)
+        eng._is_multigpu = True
+        eng._ep_affinity_rr = 0
+        eng._hot_expert_set = set()
+        eng._hot_expert_set_by_layer = {}
+        eng._shared_expert_weights = {}
+        eng._shared_ffn = MagicMock()
+        eng._shared_ffn.forward.return_value = torch.zeros(
+            1, 1, eng.config.hidden_size, device="cpu", dtype=torch.float32)
+        eng._get_shared_expert = MagicMock(return_value=None)
+        eng._fused_moe = MagicMock()
+        eng._fused_moe.forward.return_value = torch.zeros(
+            1, eng.config.hidden_size, device="cpu", dtype=torch.float32)
+        eng._deq = MagicMock(return_value=torch.randn(
+            8, eng.config.hidden_size, device="cpu"))
+        return eng
+
+    def test_cache_affinity_returns_device_index(self):
+        """应返回 expert 所在缓存的 GPU 索引."""
+        eng = self._make_ep_engine()
+        # GPU0 hot cache 有 expert 5
+        eng._backend.get_device_state("cuda:0").gpu_hot_experts[(0, 5)] = "dummy"
+        # GPU1 bf16 cache 有 expert 10
+        eng._backend.get_device_state("cuda:1").gpu_bf16_cache[(0, 10)] = "dummy"
+        # GPU0 bf16 cache 有 expert 7
+        eng._backend.get_device_state("cuda:0").gpu_bf16_cache[(0, 7)] = "dummy"
+
+        assert eng._check_expert_cache_affinity(0, 5) == 0
+        assert eng._check_expert_cache_affinity(0, 10) == 1
+        assert eng._check_expert_cache_affinity(0, 7) == 0
+        assert eng._check_expert_cache_affinity(0, 99) == -1
+
+    def test_cache_affinity_hot_and_bf16_both_checked(self):
+        """hot cache 和 bf16 cache 任一命中即返回."""
+        eng = self._make_ep_engine()
+        eng._backend.get_device_state("cuda:1").gpu_hot_experts[(0, 3)] = "dummy"
+        assert eng._check_expert_cache_affinity(0, 3) == 1
+
+        eng._backend.get_device_state("cuda:0").gpu_bf16_cache[(0, 4)] = "dummy"
+        assert eng._check_expert_cache_affinity(0, 4) == 0
+
+    def test_empty_cache_returns_minus_one(self):
+        """空缓存应返回 -1."""
+        eng = self._make_ep_engine()
+        assert eng._check_expert_cache_affinity(0, 0) == -1
+        assert eng._check_expert_cache_affinity(5, 42) == -1
+
+    def test_split_uses_affinity_not_eid_mod(self):
+        """ep_split 用缓存亲和性替代 eid%2."""
+        eng = self._make_ep_engine()
+        # eid=0 缓存在 GPU1, eid=1 缓存在 GPU0
+        eng._backend.get_device_state("cuda:1").gpu_hot_experts[(0, 0)] = "dummy"
+        eng._backend.get_device_state("cuda:0").gpu_bf16_cache[(0, 1)] = "dummy"
+
+        topk_idx = torch.tensor([[0, 1]], device="cpu")
+        n_gpu = 2
+        unique_eids = sorted(set(int(x) for x in topk_idx.flatten().tolist() if x >= 0))
+        eid_to_dev = {}
+        for eid in unique_eids:
+            dev_idx = eng._check_expert_cache_affinity(0, eid)
+            if dev_idx < 0:
+                dev_idx = eng._ep_affinity_rr % n_gpu
+                eng._ep_affinity_rr += 1
+            eid_to_dev[eid] = dev_idx
+
+        topk_per_gpu = [topk_idx.clone().fill_(-1) for _ in range(n_gpu)]
+        for eid, dev_idx in eid_to_dev.items():
+            topk_per_gpu[dev_idx][topk_idx == eid] = eid
+
+        topk_0 = topk_per_gpu[0]
+        topk_1 = topk_per_gpu[1]
+
+        # eid=0 cached on GPU1 → should be in topk_1, not topk_0
+        assert topk_0[0, 0].item() == -1, "eid=0 cached on GPU1, should NOT be in topk_0"
+        assert topk_1[0, 0].item() == 0, "eid=0 cached on GPU1, should be in topk_1"
+        # eid=1 cached on GPU0 → should be in topk_0, not topk_1
+        assert topk_0[0, 1].item() == 1, "eid=1 cached on GPU0, should be in topk_0"
+        assert topk_1[0, 1].item() == -1, "eid=1 cached on GPU0, should NOT be in topk_1"
+
+    def test_uncached_round_robin(self):
+        """未缓存的 expert 应轮询分配到各 GPU."""
+        eng = self._make_ep_engine()
+        n_gpu = 2
+        eids = [10, 20, 30]
+        eid_to_dev = {}
+        for eid in eids:
+            dev_idx = eng._check_expert_cache_affinity(0, eid)
+            if dev_idx < 0:
+                dev_idx = eng._ep_affinity_rr % n_gpu
+                eng._ep_affinity_rr += 1
+            eid_to_dev[eid] = dev_idx
+
+        assert eid_to_dev[10] == 0  # first uncached → GPU0
+        assert eid_to_dev[20] == 1  # second uncached → GPU1
+        assert eid_to_dev[30] == 0  # third uncached → GPU0
+        assert eng._ep_affinity_rr == 3
+
+    def test_mixed_cached_and_uncached(self):
+        """部分缓存的 expert: 缓存优先, 未缓存轮询."""
+        eng = self._make_ep_engine()
+        # eid=5 cached on GPU0
+        eng._backend.get_device_state("cuda:0").gpu_hot_experts[(0, 5)] = "dummy"
+        # eid=7 cached on GPU1
+        eng._backend.get_device_state("cuda:1").gpu_bf16_cache[(0, 7)] = "dummy"
+        # eid=9, 11 uncached
+
+        n_gpu = 2
+        all_eids = [5, 7, 9, 11]
+        eid_to_dev = {}
+        for eid in all_eids:
+            dev_idx = eng._check_expert_cache_affinity(0, eid)
+            if dev_idx < 0:
+                dev_idx = eng._ep_affinity_rr % n_gpu
+                eng._ep_affinity_rr += 1
+            eid_to_dev[eid] = dev_idx
+
+        assert eid_to_dev[5] == 0  # cached on GPU0
+        assert eid_to_dev[7] == 1  # cached on GPU1
+        assert eid_to_dev[9] == 0  # uncached, round-robin: GPU0
+        assert eid_to_dev[11] == 1  # uncached, round-robin: GPU1

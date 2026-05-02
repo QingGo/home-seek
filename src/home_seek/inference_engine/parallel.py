@@ -196,6 +196,9 @@ class _EPWorkItem:
     done: threading.Event = field(default_factory=threading.Event)
     result: torch.Tensor | None = None
     exception: Exception | None = None
+    gpu1_ev_start: torch.cuda.Event | None = None
+    gpu1_ev_end: torch.cuda.Event | None = None
+    gpu1_elapsed_ms: float = 0.0
 
 
 class _EPWorker(threading.Thread):
@@ -245,20 +248,33 @@ class _EPWorker(threading.Thread):
                 if item.copy_event is not None:
                     torch.cuda.current_stream(self.device).wait_event(item.copy_event)
 
+                # GPU1 timing events
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_end = torch.cuda.Event(enable_timing=True)
+                item.gpu1_ev_start = ev_start
+                item.gpu1_ev_end = ev_end
+
                 D = self.engine.config.hidden_size
                 h_flat = item.hidden.reshape(-1, D)
 
                 def _load_expert(layer, eid):
-                    return self.engine._load_expert_fp4_raw(layer, eid)
+                    return self.engine._load_bf16_deq(layer, eid)
 
+                ev_start.record()
                 r = self.engine._fused_moe.forward(
                     h_flat, item.topk_idx, item.topk_weights,
                     _load_expert,
                     item.layer_idx,
                 )
+                ev_end.record()
                 item.result = r
             except Exception:
                 # fallback: 逐 expert 循环
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_end = torch.cuda.Event(enable_timing=True)
+                item.gpu1_ev_start = ev_start
+                item.gpu1_ev_end = ev_end
+                ev_start.record()
                 try:
                     D = self.engine.config.hidden_size
                     total_tokens = item.hidden.shape[0]
@@ -271,10 +287,10 @@ class _EPWorker(threading.Thread):
                             eid = int(eids_k[tok_i].item())
                             if eid < 0:
                                 continue
-                            deq = self.engine._load_expert_fp4_raw(item.layer_idx, eid)
-                            if deq is None:
+                            bf16 = self.engine._load_bf16_deq(item.layer_idx, eid)
+                            if bf16 is None:
                                 continue
-                            w1_d, w3_d, w2_d = deq
+                            w1_d, w3_d, w2_d = bf16
                             h_tok = h_flat[tok_i:tok_i + 1].to(w1_d.dtype)
                             gate_out = torch.matmul(h_tok, w1_d.t())
                             up_out = torch.matmul(h_tok, w3_d.t())
@@ -284,10 +300,20 @@ class _EPWorker(threading.Thread):
                             activated = (g * g.sigmoid() * u).to(w1_d.dtype)
                             out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
                             r[tok_i] += out[0] * w_k[tok_i]
+                    ev_end.record()
                     item.result = r
                 except Exception as e2:
                     item.exception = e2
             finally:
+                # Calculate GPU1 elapsed time from CUDA events
+                ev_s = getattr(item, 'gpu1_ev_start', None)
+                ev_e = getattr(item, 'gpu1_ev_end', None)
+                if ev_s is not None and ev_e is not None:
+                    try:
+                        ev_e.synchronize()
+                        item.gpu1_elapsed_ms = ev_s.elapsed_time(ev_e)
+                    except Exception:
+                        pass
                 item.done.set()
 
 

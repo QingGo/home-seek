@@ -32,7 +32,6 @@ PROFILE_NSYS := $(PROFILE_DIR)/nsys_trace
 
 profile-nsys: $(PROFILE_DIR)
 	nsys profile -o $(PROFILE_NSYS) -t nvtx,cuda,osrt \
-		--gpu-metrics-devices=0 \
 		--cuda-memory-usage true \
 		--show-output true \
 		--force-overwrite true \
@@ -56,7 +55,7 @@ profile-ncu: $(PROFILE_DIR)
 # ── Nsys + Profiler (双工具: Chrome trace + stream timeline) ─────────
 profile-deep: $(PROFILE_DIR)
 	nsys profile -o $(PROFILE_DIR)/deep_trace -t nvtx,cuda,osrt \
-		--gpu-metrics-devices=0 --cuda-memory-usage true \
+		--cuda-memory-usage true \
 		--show-output true --force-overwrite true \
 		$(UV) python -m home_seek.profiling_runner \
 			--rounds 2 --prompts "Hello" "Hello" --max-tokens 5 --temperature 0 \

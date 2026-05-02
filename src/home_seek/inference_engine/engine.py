@@ -182,15 +182,18 @@ class HomeSeekInferenceEngine:
         self._hash_expert_ids: list[int] = []
         self._hot_expert_set: set[int] = set()
         self._hot_expert_set_by_layer: dict[int, set[int]] = {}
-        self._gpu_hot_experts: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._gpu_hot_experts: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
         self._max_hot_experts = self.hw_config.gpu_hot_max
         self._gpu_bf16_cache: OrderedDict = OrderedDict()
         self._max_bf16_cache = self.hw_config.gpu_bf16_max
-        # Per-layer online hot usage tracking for dynamic GPU cache update
+        # V21.7: 跨层 BF16 去量化缓存 (keyed by eid, LRU 48, ~2.3GB)
+        self._gpu_bf16_deq_cache: OrderedDict = OrderedDict()
+        self._max_gpu_bf16_deq = 48
         # Per-layer online hot usage tracking for dynamic GPU cache update
         self._hot_usage_counter: dict[int, dict[int, int]] = {}
         self._hot_usage_window: list[tuple[int, int]] = []
         self._hot_usage_window_size = 1024
+        self._ep_affinity_rr = 0  # round-robin counter for EP affinity scheduling
         self._preload_hot_experts(hot_experts_path)
         self._kv_offload_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -360,7 +363,7 @@ class HomeSeekInferenceEngine:
                     break
             if len(gpu_hot) >= self._max_hot_experts:
                 break
-        self._log(f"Pre-loaded {count} hot expert BF16 weights on GPU")
+        self._log(f"Pre-loaded {count} hot expert FP4 weights on GPU")
 
     def _preload_hot_experts_cpu_cache(self):
         hot_ids = set(self._hot_expert_ids)
@@ -1090,16 +1093,35 @@ class HomeSeekInferenceEngine:
         self._migrate_gpu_caches()
         hot_key = (layer_idx, eid)
         expert_dev = self._backend.resolve_expert_device(layer_idx, eid)
-        gpu_hot = self._backend.get_device_state(expert_dev).gpu_hot_experts
-        gpu_bf16 = self._backend.get_device_state(expert_dev).gpu_bf16_cache
-        layer_dev = expert_dev
+        n_gpu = self._backend.n_gpu()
+        is_ep = self._is_multigpu and self._backend.strategy == "ep"
 
-        if hot_key in gpu_hot:
-            return gpu_hot[hot_key]
+        # EP 亲和性: 搜索所有 GPU 的缓存
+        if is_ep:
+            for di, d in enumerate(self._backend.devices):
+                st = self._backend.get_device_state(d)
+                if hot_key in st.gpu_hot_experts:
+                    return st.gpu_hot_experts[hot_key]
+                if hot_key in st.gpu_bf16_cache:
+                    st.gpu_bf16_cache.move_to_end(hot_key)
+                    return st.gpu_bf16_cache[hot_key]
+            # 未在任何 GPU 缓存: 优先存在负责计算的 GPU 上
+            cur_dev_idx = torch.cuda.current_device()
+            store_dev = self._backend.devices[cur_dev_idx] if cur_dev_idx < n_gpu else expert_dev
+            store_state = self._backend.get_device_state(store_dev)
+            gpu_hot = store_state.gpu_hot_experts
+            gpu_bf16 = store_state.gpu_bf16_cache
+            layer_dev = store_dev
+        else:
+            gpu_hot = self._backend.get_device_state(expert_dev).gpu_hot_experts
+            gpu_bf16 = self._backend.get_device_state(expert_dev).gpu_bf16_cache
+            layer_dev = expert_dev
 
-        if hot_key in gpu_bf16:
-            gpu_bf16.move_to_end(hot_key)
-            return gpu_bf16[hot_key]
+            if hot_key in gpu_hot:
+                return gpu_hot[hot_key]
+            if hot_key in gpu_bf16:
+                gpu_bf16.move_to_end(hot_key)
+                return gpu_bf16[hot_key]
 
         raw = self._load_expert_raw(layer_idx, eid)
         if raw is None:
@@ -1147,49 +1169,62 @@ class HomeSeekInferenceEngine:
                             if w2_scale.dtype != torch.float32
                             else w2_scale)
 
-            w1_b, w3_b, w2_b = triton_dequantize_fp4_all(
-                w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
+            # V21.7: 存储 FP4 raw (6元组) 到 GPU 缓存, 去量化延迟到 caller 做
+            fp4_six = (w1_data, w1_scale, w3_data, w3_scale, w2_data, w2_scale)
 
             layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
             if eid in layer_hot:
                 if len(gpu_hot) >= self._max_hot_experts:
                     gpu_hot.pop(next(iter(gpu_hot)))
-                gpu_hot[hot_key] = (w1_b, w3_b, w2_b)
+                gpu_hot[hot_key] = fp4_six
             else:
                 if len(gpu_bf16) >= self._max_bf16_cache:
                     gpu_bf16.pop(next(iter(gpu_bf16)))
-                gpu_bf16[hot_key] = (w1_b, w3_b, w2_b)
+                gpu_bf16[hot_key] = fp4_six
 
-        return (w1_b, w3_b, w2_b)
+        return fp4_six
 
     def _load_gpu_hot_expert_bf16(self, layer: int, eid: int):
         self._ensure_backend()
         key = (layer, eid)
         gpu_hot = self._backend.gpu_hot_experts(layer)
-        layer_dev = self._resolve_device(layer)
-        # 向后兼容: __new__ 测试桩可能写入了 self._gpu_hot_experts
         if key not in gpu_hot and hasattr(self, '_gpu_hot_experts') and self._gpu_hot_experts is not gpu_hot:
             for k, v in self._gpu_hot_experts.items():
                 if k not in gpu_hot:
                     gpu_hot[k] = v
             self._gpu_hot_experts = gpu_hot
         if key in gpu_hot:
-            return gpu_hot[key]
-        result = self._load_expert_fp4_raw(layer, eid)
-        if result is None:
+            val = gpu_hot[key]
+            if len(val) == 6:
+                if eid in self._gpu_bf16_deq_cache:
+                    return self._gpu_bf16_deq_cache[eid]
+                bf16 = triton_dequantize_fp4_all(*val)
+                self._gpu_bf16_deq_cache[eid] = bf16
+                if len(self._gpu_bf16_deq_cache) > self._max_gpu_bf16_deq:
+                    self._gpu_bf16_deq_cache.pop(next(iter(self._gpu_bf16_deq_cache)))
+                return bf16
+            return val
+        return self._load_bf16_deq(layer, eid)
+
+    def _load_bf16_deq(self, layer: int, eid: int) -> tuple | None:
+        """加载专家权重并返回 BF16 3 元组.
+
+        优先从 _gpu_bf16_deq_cache 返回 (keyed by eid),
+        避免跨层复用同一专家时重复 FP4→BF16 去量化 (V21.7 regression fix).
+        """
+        if eid in self._gpu_bf16_deq_cache:
+            self._gpu_bf16_deq_cache.move_to_end(eid)
+            return self._gpu_bf16_deq_cache[eid]
+        raw = self._load_expert_fp4_raw(layer, eid)
+        if raw is None:
             return None
-        if len(result) == 3:
-            return result
-        if len(result) == 6:
-            w1_d, w1_s, w3_d, w3_s, w2_d, w2_s = result
-            dev = torch.device(layer_dev)
-            w1_b = load_fp4_weight(w1_d, w1_s).to(device=dev, dtype=torch.bfloat16)
-            w3_b = load_fp4_weight(w3_d, w3_s).to(device=dev, dtype=torch.bfloat16)
-            w2_b = load_fp4_weight(w2_d, w2_s).to(device=dev, dtype=torch.bfloat16)
-            bf16 = (w1_b, w3_b, w2_b)
-            if len(gpu_hot) >= self._max_hot_experts:
-                gpu_hot.pop(next(iter(gpu_hot)))
-            gpu_hot[key] = bf16
+        if len(raw) == 3:
+            return raw
+        if len(raw) == 6:
+            bf16 = triton_dequantize_fp4_all(*raw)
+            self._gpu_bf16_deq_cache[eid] = bf16
+            if len(self._gpu_bf16_deq_cache) > self._max_gpu_bf16_deq:
+                self._gpu_bf16_deq_cache.pop(next(iter(self._gpu_bf16_deq_cache)))
             return bf16
         return None
 
@@ -1288,11 +1323,11 @@ class HomeSeekInferenceEngine:
                 pass
 
         try:
-            def _fp4_load(layer, eid):
-                return self._load_expert_fp4_raw(layer, eid)
+            def _bf16_load(layer, eid):
+                return self._load_bf16_deq(layer, eid)
             result = self._fused_moe.forward(
                 flat_hidden, flat_topk_idx, flat_topk_w,
-                _fp4_load,
+                _bf16_load,
                 layer_idx,
             )
             ffn_out = result.reshape(B, T, D)
@@ -1350,10 +1385,22 @@ class HomeSeekInferenceEngine:
 
         return ffn_out, set()
 
+    def _check_expert_cache_affinity(self, layer_idx: int, eid: int) -> int:
+        """检查 expert 在哪个 GPU 上有缓存 (FP4 或 BF16 raw).
+        返回 device index, 或 -1 (未在任何 GPU 缓存).
+        """
+        hot_key = (layer_idx, eid)
+        for dev_idx, dev in enumerate(self._backend.devices):
+            state = self._backend.get_device_state(dev)
+            if hot_key in state.gpu_hot_experts or hot_key in state.gpu_bf16_cache:
+                return dev_idx
+        return -1
+
     def _forward_ffn_ep(self, hidden_states, lw, layer_idx, input_ids=None):
         """EP: GPU0 负责 all, GPU1 负责 expert(eid%2==1). 双线程并行.
 
-        V21.5: 每个 GPU 一个 Python 线程 → 真正计算并行.
+        V21.7: EP 亲和性调度 — 根据 expert 缓存的 GPU 动态分配,
+        替代 eid%2 硬切分, 提升双卡 cache hit rate.
         """
         B, T, D = hidden_states.shape
         total_tokens = B * T
@@ -1382,10 +1429,22 @@ class HomeSeekInferenceEngine:
 
         n_gpu = self._backend.n_gpu()
         with record_function("ep_split"):
-            topk_0 = topk_idx.clone()
-            topk_1 = topk_idx.clone()
-            topk_0[(topk_0 >= 0) & (topk_0 % n_gpu != 0)] = -1
-            topk_1[(topk_1 >= 0) & (topk_1 % n_gpu != 1)] = -1
+            # V21.7: 亲和性调度 — 按缓存位置分配, 未缓存则轮询
+            unique_eids = sorted(set(int(x) for x in topk_idx.flatten().tolist() if x >= 0))
+            eid_to_dev: dict[int, int] = {}
+            for eid in unique_eids:
+                dev_idx = self._check_expert_cache_affinity(layer_idx, eid)
+                if dev_idx < 0:
+                    dev_idx = self._ep_affinity_rr % n_gpu
+                    self._ep_affinity_rr += 1
+                eid_to_dev[eid] = dev_idx
+
+            topk_per_gpu = [topk_idx.clone().fill_(-1) for _ in range(n_gpu)]
+            for eid, dev_idx in eid_to_dev.items():
+                topk_per_gpu[dev_idx][topk_idx == eid] = eid
+
+            topk_0 = topk_per_gpu[0]
+            topk_1 = topk_per_gpu[1] if n_gpu > 1 else topk_idx.clone().fill_(-1)
 
         with record_function("ep_shared_expert"):
             shared_w = self._get_shared_expert(layer_idx)
@@ -1405,20 +1464,26 @@ class HomeSeekInferenceEngine:
                 h_1 = hidden_states.to(dev1, non_blocking=True).reshape(total_tokens, D)
                 tk1 = topk_1.to(dev1, non_blocking=True)
                 tw = topk_w.to(dev1, non_blocking=True)
-                # 记录 copy 完成事件
                 copy_ev = torch.cuda.Event()
                 copy_ev.record(torch.cuda.current_stream(self._backend.devices[0]))
             gpu1_work_item = self._backend.ep_submit_work(
                 h_1, tk1, tw, layer_idx, copy_ev)
 
+        # ── GPU timing events ──
+        ev_gpu0_start = torch.cuda.Event(enable_timing=True)
+        ev_gpu0_end = torch.cuda.Event(enable_timing=True)
+        ev_copy_start = torch.cuda.Event(enable_timing=True)
+        ev_copy_end = torch.cuda.Event(enable_timing=True)
+
         # ── GPU0: 本卡 expert 计算 ──
         with record_function("ep_gpu0_experts"):
             has_gpu0_work = (topk_0 >= 0).any().item() if topk_0.numel() > 0 else False
             if has_gpu0_work:
+                ev_gpu0_start.record()
                 try:
                     ffn_0 = self._fused_moe.forward(
                         flat_hidden, topk_0, topk_w,
-                        lambda l, e: self._load_expert_fp4_raw(l, e),
+                        lambda l, e: self._load_bf16_deq(l, e),
                         layer_idx,
                     )
                 except Exception:
@@ -1430,10 +1495,10 @@ class HomeSeekInferenceEngine:
                             eid = int(eids_k[tok_i].item())
                             if eid < 0:
                                 continue
-                            deq = self._load_expert_fp4_raw(layer_idx, eid)
-                            if deq is None:
+                            bf16 = self._load_bf16_deq(layer_idx, eid)
+                            if bf16 is None:
                                 continue
-                            w1_d, w3_d, w2_d = deq
+                            w1_d, w3_d, w2_d = bf16
                             h_tok = flat_hidden[tok_i:tok_i+1].to(w1_d.dtype)
                             gate_out = torch.matmul(h_tok, w1_d.t())
                             up_out = torch.matmul(h_tok, w3_d.t())
@@ -1442,16 +1507,28 @@ class HomeSeekInferenceEngine:
                             activated = (g * g.sigmoid() * u).to(w1_d.dtype)
                             out = torch.matmul(activated.to(w2_d.dtype), w2_d.t())
                             ffn_0[tok_i] += out[0] * w_k[tok_i]
+                ev_gpu0_end.record()
             else:
                 ffn_0 = torch.zeros(total_tokens, D, device=hidden_states.device, dtype=hidden_states.dtype)
+                ev_gpu0_end.record()
 
         # ── 收 GPU1 结果 ──
         with record_function("ep_recv_combine"):
+            ev_copy_start.record()
             if gpu1_work_item is not None:
                 ffn_1 = self._backend.ep_wait_result(gpu1_work_item)
             else:
                 ffn_1 = torch.zeros(total_tokens, D, device=hidden_states.device, dtype=hidden_states.dtype)
+            torch.cuda.synchronize()
+            ev_copy_end.record()
             ffn_out = (ffn_0 + ffn_1 + shared_out.reshape(total_tokens, D)).reshape(B, T, D)
+
+        # ── Collect timing ──
+        torch.cuda.synchronize()
+        gpu0_ms = ev_gpu0_start.elapsed_time(ev_gpu0_end) if has_gpu0_work else 0
+        copy_ms = ev_copy_start.elapsed_time(ev_copy_end) if has_gpu1_work else 0
+        gpu1_ms = getattr(gpu1_work_item, 'gpu1_elapsed_ms', 0) if gpu1_work_item is not None else 0
+        self._ep_timing = {'gpu0_ms': gpu0_ms, 'gpu1_ms': gpu1_ms, 'copy_ms': copy_ms}
 
         if hasattr(self, 'predictor'):
             self.predictor.collect(layer_idx, flat_hidden, topk_idx)
@@ -2457,6 +2534,7 @@ class HomeSeekInferenceEngine:
             # Clear GPU caches to prevent VRAM accumulation across requests
             self._gpu_hot_experts.clear()
             self._gpu_bf16_cache.clear()
+            self._gpu_bf16_deq_cache.clear()
             for state in self._backend.all_device_states():
                 state.gpu_hot_experts.clear()
                 state.gpu_bf16_cache.clear()

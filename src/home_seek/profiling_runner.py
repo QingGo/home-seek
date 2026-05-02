@@ -197,9 +197,14 @@ class CacheMonitor:
         self.cache_misses = 0
         self.gpu_store_hits = 0
         self.gpu_store_misses = 0
+        self.gpu_per_device_hits: dict[int, int] = {}
+        self.gpu_per_device_misses: dict[int, int] = {}
         self.file_loads = 0
         self.deq_times = []
         self.file_load_times = []
+        self.ep_gpu0_ms = 0.0
+        self.ep_gpu1_ms = 0.0
+        self.ep_copy_ms = 0.0
 
     def snapshot(self) -> dict:
         """Return serializable snapshot for differential profiling."""
@@ -210,16 +215,24 @@ class CacheMonitor:
             'cache_misses': self.cache_misses,
             'gpu_store_hits': self.gpu_store_hits,
             'gpu_store_misses': self.gpu_store_misses,
+            'gpu_per_device_hits': dict(self.gpu_per_device_hits),
+            'gpu_per_device_misses': dict(self.gpu_per_device_misses),
             'file_loads': self.file_loads,
             'deq_n': len(self.deq_times),
             'deq_total': sum(self.deq_times),
             'file_n': len(self.file_load_times),
             'file_total': sum(self.file_load_times),
+            'ep_gpu0_ms': self.ep_gpu0_ms,
+            'ep_gpu1_ms': self.ep_gpu1_ms,
+            'ep_copy_ms': self.ep_copy_ms,
         }
 
     @staticmethod
     def delta(before: dict, after: dict) -> dict:
         """Compute difference between two snapshots."""
+        def _dict_diff(b, a):
+            keys = set(b) | set(a)
+            return {k: a.get(k, 0) - b.get(k, 0) for k in keys if a.get(k, 0) - b.get(k, 0) != 0}
         return {
             'hot_hits': after['hot_hits'] - before['hot_hits'],
             'hot_misses': after['hot_misses'] - before['hot_misses'],
@@ -227,11 +240,16 @@ class CacheMonitor:
             'cache_misses': after['cache_misses'] - before['cache_misses'],
             'gpu_store_hits': after['gpu_store_hits'] - before['gpu_store_hits'],
             'gpu_store_misses': after['gpu_store_misses'] - before['gpu_store_misses'],
+            'gpu_per_device_hits': _dict_diff(before.get('gpu_per_device_hits', {}), after.get('gpu_per_device_hits', {})),
+            'gpu_per_device_misses': _dict_diff(before.get('gpu_per_device_misses', {}), after.get('gpu_per_device_misses', {})),
             'file_loads': after['file_n'] - before['file_n'],
             'deq_n': after['deq_n'] - before['deq_n'],
             'deq_total': after['deq_total'] - before['deq_total'],
             'file_n': after['file_n'] - before['file_n'],
             'file_total': after['file_total'] - before['file_total'],
+            'ep_gpu0_ms': after.get('ep_gpu0_ms', 0) - before.get('ep_gpu0_ms', 0),
+            'ep_gpu1_ms': after.get('ep_gpu1_ms', 0) - before.get('ep_gpu1_ms', 0),
+            'ep_copy_ms': after.get('ep_copy_ms', 0) - before.get('ep_copy_ms', 0),
         }
 
     def record_hot(self, hit: bool):
@@ -246,11 +264,20 @@ class CacheMonitor:
         else:
             self.cache_misses += 1
 
-    def record_gpu_store(self, hit: bool):
+    def record_gpu_store(self, hit: bool, device_idx: int = -1):
         if hit:
             self.gpu_store_hits += 1
+            if device_idx >= 0:
+                self.gpu_per_device_hits[device_idx] = self.gpu_per_device_hits.get(device_idx, 0) + 1
         else:
             self.gpu_store_misses += 1
+            if device_idx >= 0:
+                self.gpu_per_device_misses[device_idx] = self.gpu_per_device_misses.get(device_idx, 0) + 1
+
+    def record_ep_timing(self, gpu0_ms: float, gpu1_ms: float, copy_ms: float):
+        self.ep_gpu0_ms += gpu0_ms
+        self.ep_gpu1_ms += gpu1_ms
+        self.ep_copy_ms += copy_ms
 
     def record_file_load(self):
         self.file_loads += 1
@@ -267,18 +294,18 @@ class CacheMonitor:
         hot_rate = s['hot_hits'] / total_hot * 100 if total_hot > 0 else 0
         total_cache = s['cache_hits'] + s['cache_misses']
         cache_rate = s['cache_hits'] / total_cache * 100 if total_cache > 0 else 0
+        total_gpu = s['gpu_store_hits'] + s['gpu_store_misses']
+        gpu_rate = s['gpu_store_hits'] / total_gpu * 100 if total_gpu > 0 else 0
         fl_n, fl_avg = s['file_n'], (s['file_total'] / s['file_n'] if s['file_n'] > 0 else 0)
-        return [
-            f"  Hot cache hits: {s['hot_hits']}, misses: {s['hot_misses']}  (hit rate: {hot_rate:.1f}%)",
-            f"  Raw cache hits: {s['cache_hits']}, misses: {s['cache_misses']}  (hit rate: {cache_rate:.1f}%)",
-            f"  File loads: {s['file_n']}  (avg {fl_avg:.1f}ms, total {s['file_total']/1000:.1f}s)",
-        ]
-        total_hot = self.hot_hits + self.hot_misses
-        hot_rate = self.hot_hits / total_hot * 100 if total_hot > 0 else 0
-        total_cache = self.cache_hits + self.cache_misses
-        cache_rate = self.cache_hits / total_cache * 100 if total_cache > 0 else 0
-        total_gpu = self.gpu_store_hits + self.gpu_store_misses
-        gpu_rate = self.gpu_store_hits / total_gpu * 100 if total_gpu > 0 else 0
+
+        per_gpu_hits = s.get('gpu_per_device_hits', {})
+        per_gpu_misses = s.get('gpu_per_device_misses', {})
+        gpu_hit_lines = []
+        for dev_idx in sorted(set(per_gpu_hits) | set(per_gpu_misses)):
+            h = per_gpu_hits.get(dev_idx, 0)
+            m = per_gpu_misses.get(dev_idx, 0)
+            rate = h / (h + m) * 100 if h + m > 0 else 0
+            gpu_hit_lines.append(f"GPU{dev_idx}: {h}h/{m}m ({rate:.0f}%)")
 
         def stats(vals):
             if not vals:
@@ -290,13 +317,22 @@ class CacheMonitor:
 
         lines = [
             "Expert Cache Performance:",
-            f"  Hot cache hits: {self.hot_hits}, misses: {self.hot_misses}  (hit rate: {hot_rate:.1f}%)",
-            f"  Raw cache hits: {self.cache_hits}, misses: {self.cache_misses}  (hit rate: {cache_rate:.1f}%)",
-            f"  GPU store hits: {self.gpu_store_hits}, misses: {self.gpu_store_misses}  (hit rate: {gpu_rate:.1f}%)",
-            f"  File loads: {self.file_loads}",
+            f"  Hot cache hits: {s['hot_hits']}, misses: {s['hot_misses']}  (hit rate: {hot_rate:.1f}%)",
+            f"  Raw cache hits: {s['cache_hits']}, misses: {s['cache_misses']}  (hit rate: {cache_rate:.1f}%)",
+            f"  GPU store hits: {s['gpu_store_hits']}, misses: {s['gpu_store_misses']}  (hit rate: {gpu_rate:.1f}%)",
+        ]
+        if gpu_hit_lines:
+            lines.append(f"    Per-GPU: {', '.join(gpu_hit_lines)}")
+        lines.extend([
+            f"  File loads: {s['file_n']}  (avg {fl_avg:.1f}ms, total {s['file_total']/1000:.1f}s)",
             f"  Dequantize times (ms): n={deq_n}  avg={deq_avg:.2f}  min={deq_min:.2f}  max={deq_max:.2f}",
             f"  File load times (ms):  n={fl_n}  avg={fl_avg:.2f}  min={fl_min:.2f}  max={fl_max:.2f}",
-        ]
+        ])
+        ep_gpu0 = s.get('ep_gpu0_ms', 0)
+        ep_gpu1 = s.get('ep_gpu1_ms', 0)
+        ep_copy = s.get('ep_copy_ms', 0)
+        if ep_gpu0 > 0 or ep_gpu1 > 0:
+            lines.append(f"  EP timing (cumulative): GPU0={ep_gpu0:.0f}ms  GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms")
         if fl_n > 0:
             total_file_time = sum(self.file_load_times) / 1000
             lines.append(f"  Total file I/O time: {total_file_time:.2f}s")
@@ -368,7 +404,7 @@ class LayerTrace:
         return "\n".join(lines)
 
 
-def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
+def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode=None):
     original_forward_attn = engine._forward_attn
     original_forward_ffn = engine._forward_ffn
     original_process_mhc = engine._process_mhc_layer
@@ -377,6 +413,7 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
     original_expert_deq = engine._load_expert_deq
     original_expert_cache_get = engine.expert_cache.get
     original_hc_head = engine._hc_head
+    original_load_fp4_raw = engine._load_expert_fp4_raw
 
     def traced_forward_attn(hidden_states, lw, layer_idx):
         torch.cuda.synchronize()
@@ -386,19 +423,37 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
         dt = (time.perf_counter() - t0) * 1000
         timer.record("attention", layer_idx, dt)
         layer_trace.attn_ms[layer_idx] += dt
+        if layer_trace_decode is not None and getattr(engine, '_phase', None) == 'decode':
+            layer_trace_decode.attn_ms[layer_idx] += dt
         mem_trace.append(("attn_end", layer_idx, torch.cuda.memory_allocated()))
         return result
 
     def traced_forward_ffn(hidden_states, lw, layer_idx, input_ids=None):
         torch.cuda.synchronize()
+        is_ep = getattr(engine, '_is_multigpu', False) and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
+        ep_t0 = None
+        if is_ep:
+            torch.cuda.synchronize()
+            ep_t0 = time.perf_counter()
         t0 = time.perf_counter()
         result, used = original_forward_ffn(hidden_states, lw, layer_idx, input_ids)
         torch.cuda.synchronize()
         dt = (time.perf_counter() - t0) * 1000
         timer.record("ffn", layer_idx, dt)
         layer_trace.ffn_ms[layer_idx] += dt
+        if layer_trace_decode is not None and getattr(engine, '_phase', None) == 'decode':
+            layer_trace_decode.ffn_ms[layer_idx] += dt
         layer_trace.expert_ids[layer_idx] = sorted(used) if used else []
+        if layer_trace_decode is not None and getattr(engine, '_phase', None) == 'decode':
+            layer_trace_decode.expert_ids[layer_idx] = sorted(used) if used else []
         mem_trace.append(("ffn_end", layer_idx, torch.cuda.memory_allocated()))
+        # EP timing breakdown
+        if is_ep and hasattr(engine, '_ep_timing'):
+            timing = engine._ep_timing
+            gpu0 = timing.get('gpu0_ms', 0)
+            gpu1 = timing.get('gpu1_ms', 0)
+            copy_ = timing.get('copy_ms', 0)
+            cache_mon.record_ep_timing(gpu0, gpu1, copy_)
         return result, used
 
     def traced_process_mhc(hidden_4d, lw, prefix):
@@ -456,6 +511,20 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
         cache_mon.record_cache(hit)
         return original_expert_cache_get(key)
 
+    def traced_load_fp4_raw(layer_idx, eid):
+        # EP: track per-GPU GPU cache hit/miss
+        is_ep = getattr(engine, '_is_multigpu', False) and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
+        if is_ep:
+            hot_key = (layer_idx, eid)
+            hit_dev = -1
+            for di, d in enumerate(engine._backend.devices):
+                st = engine._backend.get_device_state(d)
+                if hot_key in st.gpu_hot_experts or hot_key in st.gpu_bf16_cache:
+                    hit_dev = di
+                    break
+            cache_mon.record_gpu_store(hit_dev >= 0, hit_dev)
+        return original_load_fp4_raw(layer_idx, eid)
+
     engine._forward_attn = traced_forward_attn
     engine._forward_ffn = traced_forward_ffn
     engine._process_mhc_layer = traced_process_mhc
@@ -464,10 +533,12 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace):
     engine._load_expert_weights = traced_load_expert
     engine._load_expert_deq = traced_expert_deq
     engine.expert_cache.get = traced_cache_get
+    engine._load_expert_fp4_raw = traced_load_fp4_raw
     return engine
 
 
-def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, num_layers, tokenizer):
+def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, num_layers, tokenizer,
+                         decode_layer_delta=None):
     """Print single round's performance summary."""
     out = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
     print(f"\n  >>> {label} <<<")
@@ -493,17 +564,46 @@ def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, n
     fl_n, fl_total = cache_mon_snap['file_n'], cache_mon_snap['file_total']
     total_cache = cache_mon_snap['cache_hits'] + cache_mon_snap['cache_misses']
     hit_rate = cache_mon_snap['cache_hits'] / total_cache * 100 if total_cache > 0 else 0
+    total_gpu_store = cache_mon_snap['gpu_store_hits'] + cache_mon_snap['gpu_store_misses']
+    gpu_store_rate = cache_mon_snap['gpu_store_hits'] / total_gpu_store * 100 if total_gpu_store > 0 else 0
     print(f"\n  Cache: {cache_mon_snap['cache_hits']}h/{cache_mon_snap['cache_misses']}m ({hit_rate:.0f}%)")
+    print(f"  GPU store: {cache_mon_snap['gpu_store_hits']}h/{cache_mon_snap['gpu_store_misses']}m ({gpu_store_rate:.0f}%)")
+    per_gpu_hits = cache_mon_snap.get('gpu_per_device_hits', {})
+    per_gpu_misses = cache_mon_snap.get('gpu_per_device_misses', {})
+    gpu_parts = []
+    for dev_idx in sorted(set(per_gpu_hits) | set(per_gpu_misses)):
+        h = per_gpu_hits.get(dev_idx, 0)
+        m = per_gpu_misses.get(dev_idx, 0)
+        r = h / (h + m) * 100 if h + m > 0 else 0
+        gpu_parts.append(f"GPU{dev_idx}={h}h/{m}m({r:.0f}%)")
+    if gpu_parts:
+        print(f"    Per-GPU: {'  '.join(gpu_parts)}")
     if fl_n > 0:
         print(f"  File:  {fl_n} loads, {fl_total/1000:.1f}s total, {fl_total/fl_n:.1f}ms avg")
 
-    # Layer total
+    # Layer total (all phases)
     total_attn = sum(layer_snap['attn_ms'])
     total_ffn = sum(layer_snap['ffn_ms'])
     total_misc = sum(layer_snap['mhc_attn_ms']) + sum(layer_snap['mhc_ffn_ms']) + sum(layer_snap['mhc_post_ms'])
     total_layer = total_attn + total_ffn + total_misc
     print(f"\n  Layer:  Attn={total_attn:.0f}ms  FFN={total_ffn:.0f}ms  Misc={total_misc:.0f}ms  Total={total_layer:.0f}ms")
     print(f"  Per-tok layer: {total_layer/decode_tok:.0f}ms/tok  FFN: {total_ffn/decode_tok:.0f}ms/tok")
+
+    # Decode-only layer breakdown
+    if decode_layer_delta is not None:
+        dec_attn = sum(decode_layer_delta['attn_ms'])
+        dec_ffn = sum(decode_layer_delta['ffn_ms'])
+        dec_total = dec_attn + dec_ffn
+        print(f"  [Decode-only] Attn={dec_attn:.0f}ms  FFN={dec_ffn:.0f}ms  Total={dec_total:.0f}ms")
+        if decode_tok > 0:
+            print(f"  [Decode-only] Per-tok: {dec_total/decode_tok:.0f}ms/tok  FFN: {dec_ffn/decode_tok:.0f}ms/tok")
+
+    # EP timing breakdown
+    ep_gpu0 = cache_mon_snap.get('ep_gpu0_ms', 0)
+    ep_gpu1 = cache_mon_snap.get('ep_gpu1_ms', 0)
+    ep_copy = cache_mon_snap.get('ep_copy_ms', 0)
+    if ep_gpu0 > 0 or ep_gpu1 > 0:
+        print(f"  EP timing: GPU0={ep_gpu0:.0f}ms  GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms")
 
 
 def run_profile(args):
@@ -571,10 +671,11 @@ def run_profile(args):
     timer = PerLayerTimer()
     cache_mon = CacheMonitor()
     layer_trace = LayerTrace(engine.config.num_hidden_layers)
+    layer_trace_decode = LayerTrace(engine.config.num_hidden_layers)
     mem_trace = []
     mem_trace.append(("init", -1, torch.cuda.memory_allocated()))
 
-    patch_engine(engine, timer, cache_mon, layer_trace, mem_trace)
+    patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode)
     util_mon = UtilMonitor()
 
     print("\n[3/5] Running inference ...")
@@ -591,6 +692,7 @@ def run_profile(args):
         cache_before = cache_mon.snapshot()
         timer_before = timer.snapshot()
         layer_before = layer_trace.snapshot()
+        decode_before = layer_trace_decode.snapshot()
         mem_before = torch.cuda.memory_allocated()
 
         torch.cuda.reset_peak_memory_stats()
@@ -628,10 +730,12 @@ def run_profile(args):
         cache_after = cache_mon.snapshot()
         timer_after = timer.snapshot()
         layer_after = layer_trace.snapshot()
+        decode_after = layer_trace_decode.snapshot()
 
         # Compute deltas
         cache_delta = CacheMonitor.delta(cache_before, cache_after)
         layer_delta = LayerTrace.delta(layer_before, layer_after)
+        decode_delta = LayerTrace.delta(decode_before, decode_after)
         result['_elapsed'] = elapsed
         result['_peak_mem'] = torch.cuda.max_memory_allocated() / (1024**3)
 
@@ -642,7 +746,8 @@ def run_profile(args):
 
         _print_round_result(label, result, cache_delta, layer_delta,
                            {'before': timer_before, 'after': timer_after},
-                           engine.config.num_hidden_layers, tokenizer)
+                           engine.config.num_hidden_layers, tokenizer,
+                           decode_layer_delta=decode_delta)
         print()
 
         round_results.append({
@@ -650,6 +755,7 @@ def run_profile(args):
             'result': result,
             'cache': cache_delta,
             'layer': layer_delta,
+            'decode_layer': decode_delta,
         })
 
     # Multi-round comparison table
@@ -657,7 +763,7 @@ def run_profile(args):
         print("=" * 70)
         print("Multi-Round Comparison")
         print("=" * 70)
-        header = f"{'Round':<15} {'t/s':>8} {'Decode':>8} {'File(s)':>9} {'Loads':>7} {'Hit%':>7} {'Attn':>7} {'FFN':>7} {'Mem':>7}"
+        header = f"{'Round':<15} {'t/s':>8} {'Decode':>8} {'File(s)':>9} {'Loads':>7} {'Hit%':>7} {'GPU_hit':>7} {'Attn':>7} {'FFN':>7} {'EP_G0':>7} {'EP_G1':>7} {'Mem':>7}"
         print(header)
         print("-" * len(header))
         for r in round_results:
@@ -666,12 +772,16 @@ def run_profile(args):
             dec = res.get('decode_time_s', 0)
             c = r['cache']
             hit = c['cache_hits'] / max(c['cache_hits'] + c['cache_misses'], 1) * 100
+            gpu_hit = c['gpu_store_hits'] / max(c['gpu_store_hits'] + c['gpu_store_misses'], 1) * 100
             l = r['layer']
             attn = sum(l['attn_ms'])
             ffn = sum(l['ffn_ms'])
+            ep_g0 = c.get('ep_gpu0_ms', 0)
+            ep_g1 = c.get('ep_gpu1_ms', 0)
             mem = res.get('peak_memory_gb', 0)
             print(f"{r['label']:<15} {tps:>8.2f} {dec:>8.2f}s {c['file_total']/1000:>8.2f}s "
-                  f"{c['file_n']:>7} {hit:>6.0f}% {attn:>6.0f} {ffn:>6.0f} {mem:>6.1f}")
+                  f"{c['file_n']:>7} {hit:>6.0f}% {gpu_hit:>6.0f}% {attn:>7.0f} {ffn:>7.0f} "
+                  f"{ep_g0:>7.0f} {ep_g1:>7.0f} {mem:>6.1f}")
 
     # Save results
     if args.output:
@@ -688,6 +798,7 @@ def run_profile(args):
                 'decode_tps': r['result'].get('decode_tokens_per_second', 0),
                 'decode_time_s': r['result'].get('decode_time_s', 0),
                 'cache': r['cache'],
+                'decode_layer': r.get('decode_layer'),
             } for r in round_results],
         }
         out_dir = os.path.dirname(args.output)
@@ -766,6 +877,10 @@ def run_profile(args):
                 "layers": {
                     "attn_ms": layer_trace.attn_ms,
                     "ffn_ms": layer_trace.ffn_ms,
+                },
+                "decode_layers": {
+                    "attn_ms": layer_trace_decode.attn_ms,
+                    "ffn_ms": layer_trace_decode.ffn_ms,
                 },
                 "cache": last['cache'],
             }
