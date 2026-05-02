@@ -557,7 +557,6 @@ class TestExpertCacheManagerContract:
     def setup_method(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
-        from home_seek.inference_engine import HomeSeekInferenceEngine, ExpertWeightCache
         from home_seek.fused_moe import triton_dequantize_fp4_all
         from home_seek._fp4 import cast
         self.I, self.D = 128, 256

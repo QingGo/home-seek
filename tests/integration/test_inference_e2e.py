@@ -108,4 +108,4 @@ class TestInferenceE2E:
             )
         else:
             print(f"\n  [regression] Recorded hash: HOME_SEEK_EXPECTED_HASH={actual}")
-            print(f"  [regression] Set env or hardcode this as EXPECTED_HASH in the test")
+            print("  [regression] Set env or hardcode this as EXPECTED_HASH in the test")

@@ -390,6 +390,22 @@ class HomeSeekInferenceEngine:
                 w3_entry = self._make_raw_entry(w3, s3)
                 w2_entry = self._make_raw_entry(w2, s2)
                 self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=True)
+                # P2: EP+numa_aware → also store NUMA-local copy in per-GPU cache.
+                # Use pin=False so the cache stays within max_experts (LRU eviction).
+                if self._expert_caches and self.hw_config.ep_numa_aware:
+                    self._ensure_backend()
+                    if self._backend.strategy == "ep":
+                        n = self._backend.n_gpu()
+                        gpu_cache = self._expert_caches.get(eid % n)
+                        if gpu_cache is not None and gpu_cache.get(cache_key) is None:
+                            numa_map = getattr(self.hw_profile, 'numa_map', {})
+                            gpu_pci_idx = int(str(self._backend.devices[eid % n]).split(":")[1])
+                            numa_node = numa_map.get(str(gpu_pci_idx), numa_map.get(gpu_pci_idx, -1))
+                            w1_numa = self._make_raw_entry_numa(w1, s1, numa_node)
+                            w3_numa = self._make_raw_entry_numa(w3, s3, numa_node)
+                            w2_numa = self._make_raw_entry_numa(w2, s2, numa_node)
+                            if w1_numa is not None:
+                                gpu_cache.put(cache_key, w1_numa, w3_numa, w2_numa, pin=False)
                 count += 1
         if count > 0:
             self._log(f"Pre-loaded {count} hot expert raw entries into CPU cache "
@@ -573,11 +589,27 @@ class HomeSeekInferenceEngine:
         )
         indexer.set_weights(
             wq_b=idx_wq_b.to(dev) if idx_wq_b.device.type != dev.type else idx_wq_b,
-            weights_proj=weights_proj.to(dev) if weights_proj is not None and weights_proj.device.type != dev.type else weights_proj,
-            compressor_wkv=idx_c_wkv.to(dev) if idx_c_wkv is not None and idx_c_wkv.device.type != dev.type else idx_c_wkv,
-            compressor_wgate=idx_c_wgate.to(dev) if idx_c_wgate is not None and idx_c_wgate.device.type != dev.type else idx_c_wgate,
+            weights_proj=(
+                weights_proj.to(dev)
+                if weights_proj is not None and weights_proj.device.type != dev.type
+                else weights_proj
+            ),
+            compressor_wkv=(
+                idx_c_wkv.to(dev)
+                if idx_c_wkv is not None and idx_c_wkv.device.type != dev.type
+                else idx_c_wkv
+            ),
+            compressor_wgate=(
+                idx_c_wgate.to(dev)
+                if idx_c_wgate is not None and idx_c_wgate.device.type != dev.type
+                else idx_c_wgate
+            ),
             compressor_norm=idx_c_norm,
-            compressor_ape=idx_c_ape.to(dev) if idx_c_ape is not None and idx_c_ape.device.type != dev.type else idx_c_ape,
+            compressor_ape=(
+                idx_c_ape.to(dev)
+                if idx_c_ape is not None and idx_c_ape.device.type != dev.type
+                else idx_c_ape
+            ),
         )
         self._indexers[layer_idx] = indexer
         return indexer
@@ -859,7 +891,12 @@ class HomeSeekInferenceEngine:
             rope_beta_slow = 1
         rope_dim = self.config.qk_rope_head_dim
         start_pos = getattr(self, '_global_pos', 0)
-        freqs_cis = precompute_freqs_cis(rope_dim, T, theta=rope_theta, original_seq_len=rope_original_seq_len, factor=rope_factor, beta_fast=rope_beta_fast, beta_slow=rope_beta_slow, start_pos=start_pos).to(q.device)
+        freqs_cis = precompute_freqs_cis(
+            rope_dim, T, theta=rope_theta,
+            original_seq_len=rope_original_seq_len, factor=rope_factor,
+            beta_fast=rope_beta_fast, beta_slow=rope_beta_slow,
+            start_pos=start_pos,
+        ).to(q.device)
         q = apply_rotary_emb(q, freqs_cis, rd=self.config.qk_rope_head_dim)
         kv_latent = apply_rotary_emb(kv_latent, freqs_cis, rd=self.config.qk_rope_head_dim)
 
@@ -914,7 +951,8 @@ class HomeSeekInferenceEngine:
                 _k_sw_len = k_sw.shape[-2]
                 _new_start = _k_sw_len - T
                 if _new_start >= 0:
-                    _triu = torch.triu(torch.full((T, T), float('-inf'), device=q.device, dtype=torch.float32), diagonal=1)
+                    _triu_full = torch.full((T, T), float('-inf'), device=q.device, dtype=torch.float32)
+                    _triu = torch.triu(_triu_full, diagonal=1)
                     _causal_mask = torch.zeros(T, k_all.shape[-2], device=q.device, dtype=torch.float32)
                     _causal_mask[:, _new_start:_k_sw_len] = _triu
 
@@ -930,8 +968,10 @@ class HomeSeekInferenceEngine:
             scale_f = self.config.head_dim ** -0.5
             v_all = k_all
 
-            k_expanded = k_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, k_all.shape[-2], k_all.shape[-1])
-            v_expanded = v_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1).reshape(B, -1, v_all.shape[-2], v_all.shape[-1])
+            k_exp = k_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1)
+            k_expanded = k_exp.reshape(B, -1, k_all.shape[-2], k_all.shape[-1])
+            v_exp = v_all.unsqueeze(1).expand(-1, n_groups, -1, -1, -1)
+            v_expanded = v_exp.reshape(B, -1, v_all.shape[-2], v_all.shape[-1])
 
             attn = torch.matmul(q.float() * scale_f, k_expanded.float().transpose(-2, -1))
 
@@ -981,6 +1021,27 @@ class HomeSeekInferenceEngine:
             top_k=self.config.num_experts_per_tok,
             routed_scaling_factor=self.config.routed_scaling_factor,
         )
+
+    def _make_raw_entry_numa(self, data, scale, numa_node: int = -1):
+        """Like _make_raw_entry but binds thread to numa_node before pin_memory().
+
+        Ensures allocated pinned pages are local to the given NUMA node,
+        reducing cross-NUMA DMA latency when the target GPU reads them.
+        Non-FP4 paths (GPU-bound) are unaffected by the binding.
+        """
+        if numa_node < 0 or data is None or data.dtype != torch.int8:
+            return self._make_raw_entry(data, scale)
+        import os
+        from home_seek.topology_prober import bind_thread_to_numa
+        orig = os.sched_getaffinity(0)
+        try:
+            bind_thread_to_numa(numa_node)
+            return self._make_raw_entry(data, scale)
+        finally:
+            try:
+                os.sched_setaffinity(0, orig)
+            except Exception:
+                pass
 
     def _make_raw_entry(self, data, scale):
         if data is None:
@@ -1037,15 +1098,26 @@ class HomeSeekInferenceEngine:
         layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
         pin = layer_idx < self.config.num_hash_layers or eid in layer_hot
         self.expert_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
-        # P2: EP+numa_aware → 同时写入 per-GPU cache (NUMA-local 副本)
+        # P2: EP+numa_aware → per-GPU cache with NUMA-local pinned copies.
+        # Allocates pinned memory on the correct NUMA node during initial load
+        # from disk, avoiding cross-NUMA DMA when GPU1 reads it.
         if self._expert_caches:
             self._ensure_backend()
             if self._backend.strategy == "ep":
                 n = self._backend.n_gpu()
-                dev_idx = eid % n
-                gpu_cache = self._expert_caches.get(dev_idx)
+                gpu_cache = self._expert_caches.get(eid % n)
                 if gpu_cache is not None and gpu_cache.get(cache_key) is None:
-                    gpu_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
+                    if self.hw_config.ep_numa_aware:
+                        numa_map = getattr(self.hw_profile, 'numa_map', {})
+                        gpu_pci_idx = int(str(self._backend.devices[eid % n]).split(":")[1])
+                        numa_node = numa_map.get(str(gpu_pci_idx), numa_map.get(gpu_pci_idx, -1))
+                        w1_numa = self._make_raw_entry_numa(w1, s1, numa_node)
+                        w3_numa = self._make_raw_entry_numa(w3, s3, numa_node)
+                        w2_numa = self._make_raw_entry_numa(w2, s2, numa_node)
+                        if w1_numa is not None:
+                            gpu_cache.put(cache_key, w1_numa, w3_numa, w2_numa, pin=pin)
+                    else:
+                        gpu_cache.put(cache_key, w1_entry, w3_entry, w2_entry, pin=pin)
         return self.expert_cache.get(cache_key)
 
     def _load_expert_raw(self, layer_idx, eid):
@@ -1126,6 +1198,18 @@ class HomeSeekInferenceEngine:
         raw = self._load_expert_raw(layer_idx, eid)
         if raw is None:
             return None
+
+        # P2: NUMA-aware — prefer per-GPU cache entry (allocated on correct
+        # NUMA node during _load_expert_weights), fall back to shared cache.
+        if is_ep and self.hw_config.ep_numa_aware and self._expert_caches:
+            layer_dev_str = str(layer_dev)
+            target_gpu = int(layer_dev_str.split(":")[1]) if ":" in layer_dev_str else 0
+            gpu_cache = self._expert_caches.get(target_gpu)
+            if gpu_cache is not None:
+                gpu_raw = gpu_cache.get(f"{layer_idx}_{eid}")
+                if gpu_raw is not None:
+                    raw = gpu_raw
+
         w1_entry, w3_entry, w2_entry = raw
         if w1_entry is None:
             return None
@@ -1421,7 +1505,9 @@ class HomeSeekInferenceEngine:
             ffn_out = torch.zeros_like(hidden_states)
             shared_w = self._get_shared_expert(layer_idx)
             if shared_w is not None:
-                shared_out = self._shared_ffn.forward(hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype)
+                shared_out = self._shared_ffn.forward(
+                    hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype
+                )
                 ffn_out = ffn_out + shared_out
             return ffn_out, set()
 
@@ -1448,8 +1534,11 @@ class HomeSeekInferenceEngine:
 
         with record_function("ep_shared_expert"):
             shared_w = self._get_shared_expert(layer_idx)
-            shared_out = (self._shared_ffn.forward(hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype)
-                          if shared_w is not None else 0)
+            shared_out = (
+                self._shared_ffn.forward(
+                    hidden_states, shared_w[0], shared_w[1], shared_w[2], hidden_states.dtype
+                ) if shared_w is not None else 0
+            )
 
         # ── 启动 GPU1 工作线程 (惰性) ──
         self._backend.ep_start_worker(self)
@@ -1619,11 +1708,16 @@ class HomeSeekInferenceEngine:
                 if w1_fp8 is not None and w1_fp8.device.type != 'cuda':
                     layer_dev = torch.device(self._resolve_device(layer_idx))
                     w1_fp8 = w1_fp8.to(layer_dev)
-                    if w1_s is not None: w1_s = w1_s.to(layer_dev)
-                    if w3_fp8 is not None: w3_fp8 = w3_fp8.to(layer_dev)
-                    if w3_s is not None: w3_s = w3_s.to(layer_dev)
-                    if w2_fp8 is not None: w2_fp8 = w2_fp8.to(layer_dev)
-                    if w2_s is not None: w2_s = w2_s.to(layer_dev)
+                    if w1_s is not None:
+                        w1_s = w1_s.to(layer_dev)
+                    if w3_fp8 is not None:
+                        w3_fp8 = w3_fp8.to(layer_dev)
+                    if w3_s is not None:
+                        w3_s = w3_s.to(layer_dev)
+                    if w2_fp8 is not None:
+                        w2_fp8 = w2_fp8.to(layer_dev)
+                    if w2_s is not None:
+                        w2_s = w2_s.to(layer_dev)
                 w1_bf = load_fp8_weight(w1_fp8, w1_s) if w1_fp8 is not None else None
                 w3_bf = load_fp8_weight(w3_fp8, w3_s) if w3_fp8 is not None else None
                 w2_bf = load_fp8_weight(w2_fp8, w2_s) if w2_fp8 is not None else None
@@ -2578,8 +2672,11 @@ class HomeSeekInferenceEngine:
                             if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
                                 if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
                                     with torch.cuda.stream(self._kv_offload_stream):
-                                        self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
-                                        self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
+                                        st = self.layer_states[li]
+                                        kv = st.kv_latent_cache
+                                        st.archived_kv = kv[:, :-self.config.sliding_window].contiguous()
+                                        st.archived_kv = st.archived_kv.to("cpu", non_blocking=True)
+                                        st.kv_latent_cache = kv[:, -self.config.sliding_window:].contiguous()
                                 if self.layer_states[li].compressed_kv_data is not None:
                                     self.layer_states[li].compressed_kv_data = None
                                     self.layer_states[li].compressed_kv_idx = None
@@ -2643,8 +2740,11 @@ class HomeSeekInferenceEngine:
                             if li in self.layer_states and self.layer_states[li].kv_latent_cache is not None:
                                 if self.layer_states[li].kv_latent_cache.shape[1] > self.config.sliding_window * 2:
                                     with torch.cuda.stream(self._kv_offload_stream):
-                                        self.layer_states[li].archived_kv = self.layer_states[li].kv_latent_cache[:, :-self.config.sliding_window].contiguous().to("cpu", non_blocking=True)
-                                        self.layer_states[li].kv_latent_cache = self.layer_states[li].kv_latent_cache[:, -self.config.sliding_window:].contiguous()
+                                        st = self.layer_states[li]
+                                        kv = st.kv_latent_cache
+                                        st.archived_kv = kv[:, :-self.config.sliding_window].contiguous()
+                                        st.archived_kv = st.archived_kv.to("cpu", non_blocking=True)
+                                        st.kv_latent_cache = kv[:, -self.config.sliding_window:].contiguous()
 
             last_h_for_mtp = h
 

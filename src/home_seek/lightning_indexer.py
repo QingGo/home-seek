@@ -184,7 +184,8 @@ class LightningIndexer:
 
         if start_pos == 0:
             # Mask invalid positions (where causal mask would have -inf)
-            causal_mask_idx = topk_idxs >= torch.arange(1, T + 1, device=self.device).unsqueeze(1) // self.compress_ratio
+            idx_range = torch.arange(1, T + 1, device=self.device).unsqueeze(1)
+            causal_mask_idx = topk_idxs >= idx_range // self.compress_ratio
             topk_idxs = torch.where(causal_mask_idx, -1, topk_idxs + offset)
         else:
             topk_idxs = topk_idxs + offset

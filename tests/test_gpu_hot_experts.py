@@ -15,6 +15,7 @@ import pytest
 from collections import OrderedDict
 from unittest.mock import MagicMock
 from tests._engine_stub import make_engine
+from home_seek.model_config import DeepSeekV4FlashConfig
 
 _HS = 256
 _IM = 128
@@ -912,3 +913,141 @@ class TestEpAffinityScheduling:
         assert eid_to_dev[7] == 1  # cached on GPU1
         assert eid_to_dev[9] == 0  # uncached, round-robin: GPU0
         assert eid_to_dev[11] == 1  # uncached, round-robin: GPU1
+
+
+@pytest.mark.fast
+class TestNumaAwarePrefill:
+    """NUMA-aware prefill: per-GPU cache with NUMA-local pinned copies."""
+
+    def _make_numa_engine(self):
+        from home_seek.inference_engine.parallel import EPBackend
+        from home_seek.hardware_config import HardwareConfig
+        from collections import OrderedDict
+        eng = make_engine()
+        eng.config = DeepSeekV4FlashConfig()
+        eng.hw_config = HardwareConfig(
+            devices=("cuda:0", "cuda:1"),
+            device_map=(0, 0),
+            parallel_backend="ep",
+            ep_numa_aware=True,
+        )
+        eng.hw_profile = MagicMock()
+        eng.hw_profile.numa_map = {0: 0, 1: 1}
+        eng._backend = EPBackend(eng.hw_config, 43)
+        eng._is_multigpu = True
+        eng._ep_affinity_rr = 0
+        eng._hot_expert_set = set()
+        eng._hot_expert_set_by_layer = {}
+        eng._shared_expert_weights = {}
+        eng._shared_ffn = MagicMock()
+        eng._shared_ffn.forward.return_value = torch.zeros(
+            1, 1, eng.config.hidden_size, device="cpu", dtype=torch.float32)
+        eng._get_shared_expert = MagicMock(return_value=None)
+        eng._fused_moe = MagicMock()
+        eng._fused_moe.forward.return_value = torch.zeros(
+            1, eng.config.hidden_size, device="cpu", dtype=torch.float32)
+        eng._deq = MagicMock(return_value=torch.randn(
+            8, eng.config.hidden_size, device="cpu"))
+        eng._gpu_bf16_deq_cache = OrderedDict()
+        eng._max_gpu_bf16_deq = 48
+        eng._gpu_hot_experts = {}
+        eng._max_hot_experts = 16
+        eng._gpu_bf16_cache = OrderedDict()
+        eng._max_bf16_cache = 16
+        eng._deq_cache = OrderedDict()
+        eng._prefetch_worker = None
+        eng._prefetch_enabled = False
+        eng.predictor = MagicMock()
+        eng._warmed_up = True
+        # Set up per-GPU caches
+        eng._expert_caches = {}
+        return eng
+
+    def test_make_raw_entry_numa_preserves_entry_format(self):
+        """_make_raw_entry_numa should return same format as _make_raw_entry for FP4."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        eng = self._make_numa_engine()
+        data = torch.randint(-128, 127, (4096, 512), dtype=torch.int8, device="cpu")
+        scale = torch.zeros(128, dtype=torch.float8_e8m0fnu, device="cpu")
+        entry_numa = eng._make_raw_entry_numa(data, scale, numa_node=0)
+        entry_norm = eng._make_raw_entry(data, scale)
+        assert entry_numa is not None
+        assert len(entry_numa) == 3
+        assert entry_numa[2] == "fp4"
+        assert entry_norm is not None
+        assert entry_numa[2] == entry_norm[2]
+
+    def test_make_raw_entry_numa_non_fp4_passthrough(self):
+        """Non-FP4 data should pass through without NUMA binding."""
+        eng = self._make_numa_engine()
+        data = torch.randn(64, 512, dtype=torch.bfloat16, device="cpu")
+        entry = eng._make_raw_entry_numa(data, None, numa_node=0)
+        assert entry is not None
+        assert entry[2] == "bf16"
+
+    def test_load_expert_weights_stores_in_per_gpu_cache(self):
+        """_load_expert_weights with ep_numa_aware should store entries in per-GPU cache."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        eng = self._make_numa_engine()
+        # Populate per-GPU caches
+        from home_seek.inference_engine import ExpertWeightCache
+        for dev_idx in range(2):
+            eng._expert_caches[dev_idx] = ExpertWeightCache(
+                max_experts=64, device=f"cuda:{dev_idx}", hot_deq_size=0)
+        # Set up mock loader with int8 FP4 data
+        fake_data = torch.randint(-128, 127, (4096, 512), dtype=torch.int8, device="cpu")
+        fake_scale = torch.zeros(128, dtype=torch.float8_e8m0fnu, device="cpu")
+        prefix = "layers.0.ffn.experts.5"
+        eng.loader.get_weights.return_value = {
+            f"{prefix}.w1.weight": fake_data,
+            f"{prefix}.w1.scale": fake_scale,
+            f"{prefix}.w3.weight": fake_data,
+            f"{prefix}.w3.scale": fake_scale,
+            f"{prefix}.w2.weight": fake_data,
+            f"{prefix}.w2.scale": fake_scale,
+        }
+        # Call _load_expert_weights
+        result = eng._load_expert_weights(0, 5)
+        assert result is not None
+        # Verify per-GPU cache has NUMA-local entry
+        dev_idx = 5 % 2  # eid=5 → GPU1
+        gpu_cache = eng._expert_caches.get(dev_idx)
+        assert gpu_cache is not None
+        gpu_entry = gpu_cache.get("0_5")
+        assert gpu_entry is not None
+        assert gpu_entry[0][2] == "fp4"
+
+    def test_load_expert_fp4_raw_prefers_per_gpu_cache(self):
+        """_load_expert_fp4_raw should prefer per-GPU cache entry for NUMA-local DMA."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        eng = self._make_numa_engine()
+        from home_seek.inference_engine import ExpertWeightCache
+        for dev_idx in range(2):
+            eng._expert_caches[dev_idx] = ExpertWeightCache(
+                max_experts=64, device=f"cuda:{dev_idx}", hot_deq_size=0)
+        # Pre-populate GPU0's per-GPU cache with a real FP4 entry
+        fake_data = torch.randint(-128, 127, (4096, 512), dtype=torch.int8, device="cpu")
+        fake_scale = torch.zeros(128, dtype=torch.float8_e8m0fnu, device="cpu")
+        w1 = eng._make_raw_entry_numa(fake_data, fake_scale, numa_node=0)
+        w3 = eng._make_raw_entry_numa(fake_data, fake_scale, numa_node=0)
+        w2 = eng._make_raw_entry_numa(fake_data, fake_scale, numa_node=0)
+        eng._expert_caches[0].put("0_99", w1, w3, w2, pin=False)
+        # Set up mock loader to return different data (will NOT be used since
+        # per-GPU cache takes priority)
+        prefix = "layers.0.ffn.experts.99"
+        eng.loader.get_weights.return_value = {
+            f"{prefix}.w1.weight": fake_data,
+            f"{prefix}.w1.scale": fake_scale,
+            f"{prefix}.w3.weight": fake_data,
+            f"{prefix}.w3.scale": fake_scale,
+            f"{prefix}.w2.weight": fake_data,
+            f"{prefix}.w2.scale": fake_scale,
+        }
+        # Call _load_expert_fp4_raw from device 0 (GPU0 path)
+        with torch.cuda.device(0):
+            result = eng._load_expert_fp4_raw(0, 99)
+        assert result is not None
+        assert len(result) == 6  # fp4_six tuple

@@ -76,7 +76,9 @@ def _make_mock_engine():
         "mtp.0.attn.wq_a.weight": torch.randn(q_lora, _HS, device="cuda", dtype=torch.bfloat16),
         "mtp.0.attn.wq_b.weight": torch.randn(n_heads_head_dim, q_lora, device="cuda", dtype=torch.bfloat16),
         "mtp.0.attn.wkv.weight": torch.randn(eng.config.head_dim, _HS, device="cuda", dtype=torch.bfloat16),
-        "mtp.0.attn.wo_a.weight": torch.randn(o_dim, n_heads_head_dim // eng.config.o_groups, device="cuda", dtype=torch.bfloat16),
+        "mtp.0.attn.wo_a.weight": torch.randn(
+            o_dim, n_heads_head_dim // eng.config.o_groups, device="cuda", dtype=torch.bfloat16
+        ),
         "mtp.0.attn.wo_b.weight": torch.randn(_HS, o_dim, device="cuda", dtype=torch.bfloat16),
         "mtp.0.attn.q_norm.weight": torch.randn(q_lora, device="cuda", dtype=torch.bfloat16),
         "mtp.0.attn.kv_norm.weight": torch.randn(eng.config.head_dim, device="cuda", dtype=torch.bfloat16),

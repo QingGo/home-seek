@@ -76,6 +76,9 @@ ignore = [
 ]
 select = ["F", "E", "W"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/home_seek/encoding_dsv4.py" = ["E501"]
+
 [tool.pytest.ini_options]
 markers = [
     "fast: <1s unit tests",

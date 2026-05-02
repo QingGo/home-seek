@@ -273,7 +273,8 @@ class TestCSAIndexer:
                 device="cuda", dtype=torch.bfloat16),
         }
 
-        result = eng._compute_indexer(q_latent, torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16), lw, state, 0)
+        x = torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16)
+        result = eng._compute_indexer(q_latent, x, lw, state, 0)
         assert result is not None
         assert result.dim() == 4, f"Expected 4D, got {result.dim()}D"
         B_r, n_kv_r, seq_r, hd_r = result.shape
@@ -296,7 +297,8 @@ class TestCSAIndexer:
         state = LayerState(device="cuda")
         state.compressed_kv_data = torch.randn(2, config.kv_lora_rank, device="cuda", dtype=torch.bfloat16)
 
-        result = eng._compute_indexer(q_latent, torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16), {}, state, 0)
+        x = torch.randn(B, T, 4096, device="cuda", dtype=torch.bfloat16)
+        result = eng._compute_indexer(q_latent, x, {}, state, 0)
         assert result is None, "Should return None when no indexer weights"
 
     def test_csa_attn_dispatch(self):
@@ -725,11 +727,15 @@ class TestProfileSnapshotDelta:
     def test_cache_monitor_snapshot_delta(self):
         from home_seek.profiling_runner import CacheMonitor
         cm = CacheMonitor()
-        for _ in range(10): cm.record_cache(True)
-        for _ in range(3): cm.record_cache(False)
+        for _ in range(10):
+            cm.record_cache(True)
+        for _ in range(3):
+            cm.record_cache(False)
         s1 = cm.snapshot()
-        for _ in range(5): cm.record_cache(True)
-        for _ in range(2): cm.record_cache(False)
+        for _ in range(5):
+            cm.record_cache(True)
+        for _ in range(2):
+            cm.record_cache(False)
         s2 = cm.snapshot()
         d = CacheMonitor.delta(s1, s2)
         assert d['cache_hits'] == 5
@@ -758,7 +764,9 @@ class TestDownloadCli:
         import os
         from home_seek.__main__ import cmd_download
         tmp = tempfile.mkdtemp()
-        class Args: dir = tmp; source = "modelscope"
+        class Args:
+            dir = tmp
+            source = "modelscope"
         try:
             with pytest.raises(SystemExit):
                 cmd_download(Args())

@@ -113,7 +113,10 @@ class UtilMonitor:
         ]
         if gpu_vals:
             idle_pct = sum(1 for v in gpu_vals if v < 30) / len(gpu_vals) * 100
-            lines.append(f"  GPU Compute: avg={g_avg:.1f}%  min={g_min:.1f}%  max={g_max:.1f}%  idle_time={idle_pct:.0f}%")
+            lines.append(
+                f"  GPU Compute: avg={g_avg:.1f}%  min={g_min:.1f}%  "
+                f"max={g_max:.1f}%  idle_time={idle_pct:.0f}%"
+            )
             lines.append(f"  GPU Memory:  avg={gm_avg:.1f}%  min={gm_min:.1f}%  max={gm_max:.1f}%")
             lines.append(f"  GPU Temp:    avg={gt_avg:.0f}°C  max={gt_max:.0f}°C")
             if g_avg < 50:
@@ -240,8 +243,14 @@ class CacheMonitor:
             'cache_misses': after['cache_misses'] - before['cache_misses'],
             'gpu_store_hits': after['gpu_store_hits'] - before['gpu_store_hits'],
             'gpu_store_misses': after['gpu_store_misses'] - before['gpu_store_misses'],
-            'gpu_per_device_hits': _dict_diff(before.get('gpu_per_device_hits', {}), after.get('gpu_per_device_hits', {})),
-            'gpu_per_device_misses': _dict_diff(before.get('gpu_per_device_misses', {}), after.get('gpu_per_device_misses', {})),
+            'gpu_per_device_hits': _dict_diff(
+                before.get('gpu_per_device_hits', {}),
+                after.get('gpu_per_device_hits', {}),
+            ),
+            'gpu_per_device_misses': _dict_diff(
+                before.get('gpu_per_device_misses', {}),
+                after.get('gpu_per_device_misses', {}),
+            ),
             'file_loads': after['file_n'] - before['file_n'],
             'deq_n': after['deq_n'] - before['deq_n'],
             'deq_total': after['deq_total'] - before['deq_total'],
@@ -332,7 +341,10 @@ class CacheMonitor:
         ep_gpu1 = s.get('ep_gpu1_ms', 0)
         ep_copy = s.get('ep_copy_ms', 0)
         if ep_gpu0 > 0 or ep_gpu1 > 0:
-            lines.append(f"  EP timing (cumulative): GPU0={ep_gpu0:.0f}ms  GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms")
+            lines.append(
+                f"  EP timing (cumulative): GPU0={ep_gpu0:.0f}ms  "
+                f"GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms"
+            )
         if fl_n > 0:
             total_file_time = sum(self.file_load_times) / 1000
             lines.append(f"  Total file I/O time: {total_file_time:.2f}s")
@@ -372,7 +384,11 @@ class LayerTrace:
 
     def summary(self):
         lines = ["Per-Layer Breakdown:"]
-        header = f"{'Layer':<7} {'Attn(ms)':<10} {'FFN(ms)':<10} {'MHC_A(ms)':<10} {'MHC_F(ms)':<10} {'Post(ms)':<10} {'Total(ms)':<10} {'Experts'}"
+        header = (
+            f"{'Layer':<7} {'Attn(ms)':<10} {'FFN(ms)':<10} "
+            f"{'MHC_A(ms)':<10} {'MHC_F(ms)':<10} {'Post(ms)':<10} "
+            f"{'Total(ms)':<10} {'Experts'}"
+        )
         lines.append(header)
         lines.append("-" * (len(header) + 20))
         for i in range(self.num_layers):
@@ -430,11 +446,10 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_d
 
     def traced_forward_ffn(hidden_states, lw, layer_idx, input_ids=None):
         torch.cuda.synchronize()
-        is_ep = getattr(engine, '_is_multigpu', False) and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
-        ep_t0 = None
-        if is_ep:
-            torch.cuda.synchronize()
-            ep_t0 = time.perf_counter()
+        is_ep = (
+            getattr(engine, '_is_multigpu', False)
+            and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
+        )
         t0 = time.perf_counter()
         result, used = original_forward_ffn(hidden_states, lw, layer_idx, input_ids)
         torch.cuda.synchronize()
@@ -513,7 +528,10 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_d
 
     def traced_load_fp4_raw(layer_idx, eid):
         # EP: track per-GPU GPU cache hit/miss
-        is_ep = getattr(engine, '_is_multigpu', False) and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
+        is_ep = (
+            getattr(engine, '_is_multigpu', False)
+            and getattr(getattr(engine, '_backend', None), 'strategy', None) == 'ep'
+        )
         if is_ep:
             hot_key = (layer_idx, eid)
             hit_dev = -1
@@ -555,7 +573,8 @@ def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, n
     print(f"  {'Prefill':>12}  {'Decode':>12}  {'Total':>12}")
     print(f"  {'-'*40}")
     print(f"  {'time':>12}  {prefill_t:>10.2f}s  {decode_t:>10.2f}s  {total_t:>10.2f}s")
-    print(f"  {'t/s':>12}  {result.get('prefill_tokens_per_second',0):>10.1f}  {decode_tps:>10.2f}  {result['new_tokens_per_second']:>10.2f}")
+    n_tps = result.get('prefill_tokens_per_second', 0)
+    print(f"  {'t/s':>12}  {n_tps:>10.1f}  {decode_tps:>10.2f}  {result['new_tokens_per_second']:>10.2f}")
     print(f"  {'tokens':>12}  {prompt_tok:>10}  {decode_tok:>10}  {prompt_tok+decode_tok:>10}")
     print(f"  {'latency':>12}  {'':>10}  {decode_t / decode_tok * 1000:>9.1f}ms/tok")
     print(f"  {'Peak mem':>12}  {result['peak_memory_gb']:>9.1f}GB")
@@ -567,7 +586,10 @@ def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, n
     total_gpu_store = cache_mon_snap['gpu_store_hits'] + cache_mon_snap['gpu_store_misses']
     gpu_store_rate = cache_mon_snap['gpu_store_hits'] / total_gpu_store * 100 if total_gpu_store > 0 else 0
     print(f"\n  Cache: {cache_mon_snap['cache_hits']}h/{cache_mon_snap['cache_misses']}m ({hit_rate:.0f}%)")
-    print(f"  GPU store: {cache_mon_snap['gpu_store_hits']}h/{cache_mon_snap['gpu_store_misses']}m ({gpu_store_rate:.0f}%)")
+    print(
+        f"  GPU store: {cache_mon_snap['gpu_store_hits']}h/"
+        f"{cache_mon_snap['gpu_store_misses']}m ({gpu_store_rate:.0f}%)"
+    )
     per_gpu_hits = cache_mon_snap.get('gpu_per_device_hits', {})
     per_gpu_misses = cache_mon_snap.get('gpu_per_device_misses', {})
     gpu_parts = []
@@ -586,7 +608,10 @@ def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, n
     total_ffn = sum(layer_snap['ffn_ms'])
     total_misc = sum(layer_snap['mhc_attn_ms']) + sum(layer_snap['mhc_ffn_ms']) + sum(layer_snap['mhc_post_ms'])
     total_layer = total_attn + total_ffn + total_misc
-    print(f"\n  Layer:  Attn={total_attn:.0f}ms  FFN={total_ffn:.0f}ms  Misc={total_misc:.0f}ms  Total={total_layer:.0f}ms")
+    print(
+        f"\n  Layer:  Attn={total_attn:.0f}ms  FFN={total_ffn:.0f}ms  "
+        f"Misc={total_misc:.0f}ms  Total={total_layer:.0f}ms"
+    )
     print(f"  Per-tok layer: {total_layer/decode_tok:.0f}ms/tok  FFN: {total_ffn/decode_tok:.0f}ms/tok")
 
     # Decode-only layer breakdown
@@ -693,7 +718,6 @@ def run_profile(args):
         timer_before = timer.snapshot()
         layer_before = layer_trace.snapshot()
         decode_before = layer_trace_decode.snapshot()
-        mem_before = torch.cuda.memory_allocated()
 
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
@@ -763,7 +787,11 @@ def run_profile(args):
         print("=" * 70)
         print("Multi-Round Comparison")
         print("=" * 70)
-        header = f"{'Round':<15} {'t/s':>8} {'Decode':>8} {'File(s)':>9} {'Loads':>7} {'Hit%':>7} {'GPU_hit':>7} {'Attn':>7} {'FFN':>7} {'EP_G0':>7} {'EP_G1':>7} {'Mem':>7}"
+        header = (
+            f"{'Round':<15} {'t/s':>8} {'Decode':>8} {'File(s)':>9} "
+            f"{'Loads':>7} {'Hit%':>7} {'GPU_hit':>7} {'Attn':>7} "
+            f"{'FFN':>7} {'EP_G0':>7} {'EP_G1':>7} {'Mem':>7}"
+        )
         print(header)
         print("-" * len(header))
         for r in round_results:
@@ -789,7 +817,11 @@ def run_profile(args):
             'performance': {
                 'total_time_s': round_results[-1]['result'].get('total_time_s', 0),
                 'tokens_per_second': round_results[-1]['result'].get('new_tokens_per_second', 0),
-                'ms_per_token': round_results[-1]['result'].get('total_time_s', 0) / max(1, round_results[-1]['result'].get('num_generated_tokens', 1)) * 1000,
+                'ms_per_token': (
+                    round_results[-1]['result'].get('total_time_s', 0)
+                    / max(1, round_results[-1]['result'].get('num_generated_tokens', 1))
+                    * 1000
+                ),
                 'peak_memory_gb': round_results[-1]['result'].get('peak_memory_gb', 0),
                 'num_generated': round_results[-1]['result'].get('num_generated_tokens', 0),
             },
@@ -854,9 +886,11 @@ def run_profile(args):
                 print("  >> GPU大量时间空闲，瓶颈在CPU/PCIe/File I/O")
 
         total_file_io_ms = last['cache']['file_total']
-        print(f"  Total file I/O time: {total_file_io_ms/1000:.1f}s  ({total_file_io_ms/1000/result['total_time_s']*100:.0f}% of total)")
+        io_pct = total_file_io_ms / 1000 / result['total_time_s'] * 100
+        print(f"  Total file I/O time: {total_file_io_ms/1000:.1f}s  ({io_pct:.0f}% of total)")
         if total_file_io_ms / result['total_time_s'] > 0.2:
-            print(f"  >> File I/O占比过高({total_file_io_ms/1000/result['total_time_s']*100:.0f}%)，专家权重从文件读取是主要瓶颈")
+            io_pct = total_file_io_ms / 1000 / result['total_time_s'] * 100
+            print(f"  >> File I/O占比过高({io_pct:.0f}%)，专家权重从文件读取是主要瓶颈")
 
         if args.output:
             output_data = {

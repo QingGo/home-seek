@@ -272,7 +272,6 @@ async def build_stream_chunks(engine: InferenceEngine, messages: list[dict],
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
     # Final chunk with usage
-    full_content = engine.decode_tokens(generated)
     final = {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion.chunk",
@@ -432,8 +431,6 @@ def start_http_server(engine: InferenceEngine, host: str = "0.0.0.0", port: int 
                     self.send_header("X-Accel-Buffering", "no")  # disable nginx buffering
                     self.end_headers()
                     input_ids = engine.encode_messages(body_data.get("messages", []))
-                    gen_done = [False]
-                    gen_stats = [None]
 
                     def _write_chunk(txt: str):
                         if not txt:
@@ -528,7 +525,6 @@ def interactive_mode(engine: InferenceEngine, show_stats: bool = True):
     print("           /quit      exit")
     print(f"{'='*60}\n")
 
-    history = []
     total_stats = RequestStats()
     n_requests = 0
 
