@@ -529,6 +529,18 @@ class FusedMoEFFN:
         weighted = activated_3d * expert_weights.unsqueeze(-1)
         return weighted.reshape(B, num_e * I) @ w2.T
 
+    def forward_m1_fp4(
+        self,
+        hidden_states: torch.Tensor,
+        fp4_data: dict,
+        routing_w: dict,
+    ) -> torch.Tensor:
+        return _fused_moe_forward_m1_fp4(
+            hidden_states, fp4_data, routing_w,
+            swiglu_limit=self.swiglu_limit,
+            triton_blocks=(32, 32),
+        )
+
     def _swiglu(self, h, w1, w3):
         gate = h @ w1.t()
         up = h @ w3.t()
@@ -934,4 +946,261 @@ def _fused_fp4_expert_ffn_triton(
         BM=BM, BN=BN, BK=BK_FP4,
         num_stages=1,
     )
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# M=1 optimized fused FFN (1D dot-product, no Tensor Core, FP4 inline deq)
+# Roofline: AI=3.76 FLOP/B for M=1 → deeply memory-bound. TC MMA m16n8k16
+# wastes 15/16 M dim → 2D tiling yields 64 blocks on 68 SM → 0.94 blocks/SM.
+# 1D dot-product kernel maps N=16384 outputs → 512 warps → 7.5 warp/SM.
+# ──────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def _triton_m1_gate_up_kernel(
+    hidden_ptr,
+    w1_packed_ptr, w1_scale_ptr,
+    w3_packed_ptr, w3_scale_ptr,
+    gate_out_ptr, up_out_ptr,
+    I, D,
+    stride_hid_m, stride_hid_d,
+    stride_w1_n, stride_w1_k,
+    stride_s1_n, stride_s1_k,
+    stride_w3_n, stride_w3_k,
+    stride_s3_n, stride_s3_k,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    lut_ptr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """1D dot-product gate+up: M=1, no TC. FP4 dequantized inline via LUT+scale.
+    BK must be a multiple of 32 (one scale group = 32 weights)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+
+    gate_acc = tl.zeros([BN], dtype=tl.float32)
+    up_acc = tl.zeros([BN], dtype=tl.float32)
+
+    SG: tl.constexpr = 32
+    BK_HALF: tl.constexpr = SG // 2
+    NUM_SG: tl.constexpr = BK // SG
+
+    for k in range(0, D, BK):
+        for sg in tl.static_range(NUM_SG):
+            k_sg = k + sg * SG
+            offs_k = k_sg + tl.arange(0, SG)
+            mask_k = offs_k < D
+
+            h_ptrs = hidden_ptr + offs_k * stride_hid_d
+            h = tl.load(h_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+
+            k_half = k_sg // 2
+            offs_kh = k_half + tl.arange(0, BK_HALF)
+            mask_kh = offs_kh < D // 2
+
+            scale_k_idx = k_sg // 32
+
+            # w1: load packed FP4, dequantize inline
+            w1p_ptrs = w1_packed_ptr + offs_n[:, None] * stride_w1_n + offs_kh[None, :] * stride_w1_k
+            w1p = tl.load(w1p_ptrs, mask=(offs_n[:, None] < I) & mask_kh[None, :], other=0).to(tl.uint8)
+            w1_lo = (w1p & 0xF).to(tl.int32)
+            w1_hi = ((w1p >> 4) & 0xF).to(tl.int32)
+            w1_lo_f32 = tl.load(lut_ptr + w1_lo).to(tl.float32)
+            w1_hi_f32 = tl.load(lut_ptr + w1_hi).to(tl.float32)
+            w1s_ptrs = w1_scale_ptr + offs_n[:, None] * stride_s1_n + scale_k_idx * stride_s1_k
+            w1s = tl.load(w1s_ptrs, mask=offs_n[:, None] < I, other=1.0).to(tl.float32)
+            w1_lo_f32 *= w1s
+            w1_hi_f32 *= w1s
+            w1_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w1_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w1_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+
+            h_br = tl.reshape(h, (1, SG))
+            gate_acc += tl.sum(h_br * w1_deq.to(tl.float32), 1)
+
+            # w3: load packed FP4, dequantize inline
+            w3p_ptrs = w3_packed_ptr + offs_n[:, None] * stride_w3_n + offs_kh[None, :] * stride_w3_k
+            w3p = tl.load(w3p_ptrs, mask=(offs_n[:, None] < I) & mask_kh[None, :], other=0).to(tl.uint8)
+            w3_lo = (w3p & 0xF).to(tl.int32)
+            w3_hi = ((w3p >> 4) & 0xF).to(tl.int32)
+            w3_lo_f32 = tl.load(lut_ptr + w3_lo).to(tl.float32)
+            w3_hi_f32 = tl.load(lut_ptr + w3_hi).to(tl.float32)
+            w3s_ptrs = w3_scale_ptr + offs_n[:, None] * stride_s3_n + scale_k_idx * stride_s3_k
+            w3s = tl.load(w3s_ptrs, mask=offs_n[:, None] < I, other=1.0).to(tl.float32)
+            w3_lo_f32 *= w3s
+            w3_hi_f32 *= w3s
+            w3_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w3_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w3_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+            up_acc += tl.sum(h_br * w3_deq.to(tl.float32), 1)
+
+    mask_n = offs_n < I
+    gate_ptrs = gate_out_ptr + offs_n * stride_gn
+    up_ptrs = up_out_ptr + offs_n * stride_un
+    tl.store(gate_ptrs, gate_acc.to(tl.bfloat16), mask=mask_n)
+    tl.store(up_ptrs, up_acc.to(tl.bfloat16), mask=mask_n)
+
+
+@triton.jit
+def _triton_m1_down_accum_kernel(
+    gate_ptr, up_ptr,
+    w2_packed_ptr, w2_scale_ptr,
+    out_ptr,
+    routing_weight,
+    I, D, swiglu_limit,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    stride_w2_n, stride_w2_k,
+    stride_s2_n, stride_s2_k,
+    stride_om, stride_on,
+    lut_ptr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """1D dot-product SwiGLU + weighted down-projection with atomic add. M=1, no TC.
+    BK must be a multiple of 32 (one scale group = 32 weights)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+
+    out_acc = tl.zeros([BN], dtype=tl.float32)
+
+    SG: tl.constexpr = 32
+    BK_HALF: tl.constexpr = SG // 2
+    NUM_SG: tl.constexpr = BK // SG
+
+    for k in range(0, I, BK):
+        for sg in tl.static_range(NUM_SG):
+            k_sg = k + sg * SG
+            offs_k = k_sg + tl.arange(0, SG)
+            mask_k = offs_k < I
+
+            gate_ptrs_ = gate_ptr + offs_k * stride_gn
+            gate_chunk = tl.load(gate_ptrs_, mask=mask_k, other=0.0).to(tl.float32)
+            up_ptrs_ = up_ptr + offs_k * stride_un
+            up_chunk = tl.load(up_ptrs_, mask=mask_k, other=0.0).to(tl.float32)
+
+            gate_chunk = tl.minimum(gate_chunk, swiglu_limit)
+            up_chunk = tl.minimum(tl.maximum(up_chunk, -swiglu_limit), swiglu_limit)
+            activated = gate_chunk * tl.sigmoid(gate_chunk) * up_chunk
+
+            k_half = k_sg // 2
+            offs_kh = k_half + tl.arange(0, BK_HALF)
+
+            w2p_ptrs = w2_packed_ptr + offs_n[:, None] * stride_w2_n + offs_kh[None, :] * stride_w2_k
+            w2p = tl.load(w2p_ptrs, mask=(offs_n[:, None] < D) & (offs_kh[None, :] < I // 2), other=0).to(tl.uint8)
+            w2_lo = (w2p & 0xF).to(tl.int32)
+            w2_hi = ((w2p >> 4) & 0xF).to(tl.int32)
+            w2_lo_f32 = tl.load(lut_ptr + w2_lo).to(tl.float32)
+            w2_hi_f32 = tl.load(lut_ptr + w2_hi).to(tl.float32)
+            scale_k_idx = k_sg // 32
+            w2s_ptrs = w2_scale_ptr + offs_n[:, None] * stride_s2_n + scale_k_idx * stride_s2_k
+            w2s = tl.load(w2s_ptrs, mask=offs_n[:, None] < D, other=1.0).to(tl.float32)
+            w2_lo_f32 *= w2s
+            w2_hi_f32 *= w2s
+            w2_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w2_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w2_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+
+            activated_br = tl.reshape(activated, (1, SG))
+            contrib = tl.sum(activated_br * w2_deq.to(tl.float32), 1)
+            out_acc += routing_weight * contrib
+
+    mask_n = offs_n < D
+    out_ptrs = out_ptr + offs_n * stride_on
+    tl.atomic_add(out_ptrs, out_acc.to(tl.bfloat16), mask=mask_n)
+
+
+def _fused_moe_forward_m1_fp4(
+    hidden: torch.Tensor,
+    fp4_weights: dict,
+    routing_weights: dict,
+    swiglu_limit: float = 10.0,
+    triton_blocks: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """M=1 fused MoE FFN with FP4 inline dequantization.
+
+    Args:
+        hidden: [1, D] bfloat16 tensor on GPU.
+        fp4_weights: dict mapping eid → (w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale).
+                     All tensors must be on the same GPU device as hidden.
+        routing_weights: dict mapping eid → float (sum of routing weights for that expert).
+        swiglu_limit: clamp value for SwiGLU activation.
+        triton_blocks: (BN, BK) block sizes. Default (32, 32). BK must be a multiple of 32
+                       to align with one scale group (32 weights per scale).
+
+    Returns:
+        [1, D] bfloat16 output tensor.
+    """
+    if triton_blocks is None:
+        BN, BK = 32, 32
+    else:
+        BN, BK = triton_blocks
+        assert BK % 32 == 0, f"BK={BK} must be a multiple of 32 (scale group size)"
+
+    D = hidden.shape[1]
+    device = hidden.device
+    lut = _FP4_LUT.to(device)
+
+    out = torch.zeros(1, D, device=device, dtype=torch.bfloat16)
+
+    I_val = None
+    for eid, (w1_p, w1_s, w3_p, w3_s, w2_p, w2_s) in fp4_weights.items():
+        rw = routing_weights.get(eid, 0.0)
+        if rw == 0.0:
+            continue
+
+        if I_val is None:
+            I_val = w1_p.shape[0]
+
+        gate = torch.empty(1, I_val, device=device, dtype=torch.bfloat16)
+        up = torch.empty(1, I_val, device=device, dtype=torch.bfloat16)
+
+        grid_n = triton.cdiv(I_val, BN)
+
+        _triton_m1_gate_up_kernel[(grid_n,)](
+            hidden,
+            w1_p, w1_s, w3_p, w3_s,
+            gate, up,
+            I_val, D,
+            hidden.stride(0), hidden.stride(1),
+            w1_p.stride(0), w1_p.stride(1),
+            w1_s.stride(0), w1_s.stride(1),
+            w3_p.stride(0), w3_p.stride(1),
+            w3_s.stride(0), w3_s.stride(1),
+            gate.stride(0), gate.stride(1),
+            up.stride(0), up.stride(1),
+            lut,
+            BN=BN, BK=BK, num_stages=1,
+        )
+
+        grid_d = triton.cdiv(D, BN)
+
+        _triton_m1_down_accum_kernel[(grid_d,)](
+            gate, up,
+            w2_p, w2_s,
+            out,
+            float(rw),
+            I_val, D, swiglu_limit,
+            gate.stride(0), gate.stride(1),
+            up.stride(0), up.stride(1),
+            w2_p.stride(0), w2_p.stride(1),
+            w2_s.stride(0), w2_s.stride(1),
+            out.stride(0), out.stride(1),
+            lut,
+            BN=BN, BK=BK, num_stages=1,
+        )
+
     return out

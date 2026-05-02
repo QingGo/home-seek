@@ -915,6 +915,35 @@ class TestEpAffinityScheduling:
         assert eid_to_dev[11] == 1  # uncached, round-robin: GPU1
 
 
+    def test_batch_affinity_matches_per_eid(self):
+        """batch affinity method produces same results as per-eid."""
+        eng = self._make_ep_engine()
+        eng._backend.get_device_state("cuda:0").gpu_hot_experts[(0, 5)] = "dummy"
+        eng._backend.get_device_state("cuda:1").gpu_bf16_cache[(0, 7)] = "dummy"
+
+        all_eids = [5, 7, 9, 11]
+        batch_result = eng._check_expert_cache_affinity_batch(0, all_eids)
+
+        for eid in all_eids:
+            expected = eng._check_expert_cache_affinity(0, eid)
+            assert batch_result.get(eid, -1) == expected, \
+                f"eid={eid}: batch={batch_result.get(eid, -1)} expected={expected}"
+
+    def test_batch_affinity_all_cached_on_first_gpu(self):
+        """All experts cached on GPU0."""
+        eng = self._make_ep_engine()
+        for eid in [1, 2, 3]:
+            eng._backend.get_device_state("cuda:0").gpu_hot_experts[(0, eid)] = "dummy"
+        result = eng._check_expert_cache_affinity_batch(0, [1, 2, 3])
+        assert all(v == 0 for v in result.values())
+
+    def test_batch_affinity_none_cached(self):
+        """No experts cached — all return -1."""
+        eng = self._make_ep_engine()
+        result = eng._check_expert_cache_affinity_batch(0, [99, 100])
+        assert all(v == -1 for v in result.values())
+
+
 @pytest.mark.fast
 class TestNumaAwarePrefill:
     """NUMA-aware prefill: per-GPU cache with NUMA-local pinned copies."""

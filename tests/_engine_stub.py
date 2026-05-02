@@ -40,6 +40,7 @@ class EngineStub:
                                                             device=eng.device, dtype=torch.bfloat16)
         eng._get_shared_expert = MagicMock(return_value=None)
         eng._fused_moe = MagicMock()
+        eng._fused_moe.use_triton = False
         eng._log = lambda msg: None
         eng._deq_cache = OrderedDict()
         eng._prefetch_worker = None

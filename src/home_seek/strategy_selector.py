@@ -93,22 +93,20 @@ def _configure_pcie_p2p(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConfig)
 
 
 def _configure_numa_remote(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConfig) -> None:
-    """跨 NUMA 无 P2P：EP + NUMA 绑定，利用独立内存控制器并行加载。"""
-    vram = _vram_per_gpu(hw)
-    n = _n_gpu(hw)
-    per_exp = 12.75 / 1024  # V21.7: FP4 raw entry size
+    """跨 NUMA PCIe 无 P2P：PP 保守模式.
 
-    params["parallel_backend"] = "ep"
-    params["device_map"] = tuple([0] * cfg.num_hidden_layers)
-    # P2: EP 下每个 GPU 需缓存所有层的专家。
-    # VRAM 预算: total - 3GB(non-expert) - 2GB(KV) - 1GB(misc) = available
-    # FP4 缓存上限 50% 可用 VRAM, 留余量避免 OOM
-    _safe_vram = max(8, vram - 6)
-    params["gpu_hot_max"] = max(32, min(int(_safe_vram * 0.20 / per_exp), 512))
-    params["gpu_bf16_max"] = max(64, min(int(_safe_vram * 0.50 / per_exp), 1024))
+    V21.11 实测: EP on PCIe gen3 2080 Ti (no NVLink) 比单卡慢 2.25×.
+    PCIe copy (~200ms/tok) + NUMA penalty (+13%) + 线程同步开销 > 并行收益.
+    PP (Pipeline Parallel) 层均分更可靠, 虽无并行加速但无负收益.
+
+    适合 EP 的场景: NVLink 互联 (A100/H100), 或 PCIe gen4 ×16 + P2P.
+    """
+    n = _n_gpu(hw)
+    params["parallel_backend"] = "pp"
+    params["device_map"] = _auto_device_map(cfg.num_hidden_layers, params["devices"])
     params["prefetch_enabled"] = True
-    params["ep_numa_aware"] = True
-    _logger.info(f"  [Strategy] NUMA Remote ×{n}: EP backend + NUMA bind")
+    params["ep_numa_aware"] = False
+    _logger.info(f"  [Strategy] NUMA Remote ×{n}: PP backend (EP slower on PCIe gen3)")
 
 
 def _configure_pcie_numa(params: dict, hw: HWProfile, cfg: DeepSeekV4FlashConfig) -> None:
