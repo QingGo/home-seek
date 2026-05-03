@@ -175,7 +175,7 @@ def generate_calibration_corpus(tokenizer, num_tokens: int = 8192, seed: int = 4
 
 
 @torch.no_grad()
-def analyze_hot_experts(weight_dir: str, num_tokens: int = 8192, num_hot: int = 48,
+def analyze_hot_experts(weight_dir: str, num_tokens: int = 256, num_hot: int = 48,
                         output_path: str = "hot_experts.json"):
     print(f"[hot_expert] Loading model (calibration: {num_tokens} tok, top-{num_hot})...")
     eng = HomeSeekInferenceEngine(weight_dir, verbose=False)
@@ -187,7 +187,7 @@ def analyze_hot_experts(weight_dir: str, num_tokens: int = 8192, num_hot: int = 
     actual_tokens = min(num_tokens, all_input_ids.shape[1])
     all_input_ids = all_input_ids[:, :actual_tokens]
 
-    chunk_size = 512
+    chunk_size = 1
     hc_mult = getattr(eng.config, 'hc_mult', 1)
 
     expert_counts = Counter()
@@ -203,79 +203,41 @@ def analyze_hot_experts(weight_dir: str, num_tokens: int = 8192, num_hot: int = 
 
         for layer_idx in range(eng.config.num_hidden_layers):
             lw = eng._get_layer_weights(layer_idx)
+            h, used_experts = eng._forward_layer(h, lw, layer_idx, input_ids)
 
-            # === Attention block ===
-            residual_attn = h
-            h_pre_attn, post, comb = eng._process_mhc_layer(h, lw, "hc_attn")
-            if lw.get("attn_norm.weight") is not None:
-                h_norm = rms_norm(h_pre_attn, lw["attn_norm.weight"].to(torch.bfloat16),
-                                  eng.config.rms_norm_eps)
-            else:
-                h_norm = h_pre_attn
-            if h_norm.shape[1] > 0:
-                attn_out = eng._forward_attn(h_norm, lw, layer_idx)
-            else:
-                attn_out = torch.zeros_like(h_norm)
-            if post is not None and comb is not None:
-                h = eng._process_mhc_post(attn_out, residual_attn, post, comb)
-            else:
-                h = h + attn_out.unsqueeze(2).expand(-1, -1, hc_mult, -1)
+            if used_experts:
+                for eid in used_experts:
+                    expert_counts[eid] += 1
+                    layer_expert_trace[layer_idx].append(eid)
+            elif hasattr(eng, '_last_routed_eids'):
+                for eid in eng._last_routed_eids:
+                    if eid >= 0:
+                        expert_counts[eid] += 1
+                        layer_expert_trace[layer_idx].append(eid)
 
-            # === FFN block ===
-            residual_ffn = h
-            h_pre_ffn, ffn_post, ffn_comb = eng._process_mhc_layer(h, lw, "hc_ffn")
-            if lw.get("ffn_norm.weight") is not None:
-                h_ffn_norm = rms_norm(h_pre_ffn, lw["ffn_norm.weight"].to(torch.bfloat16),
-                                      eng.config.rms_norm_eps)
-            else:
-                h_ffn_norm = h_pre_ffn
-
-            gate_w = eng._deq("ffn.gate", lw.get("ffn.gate.weight"), lw.get("ffn.gate.scale"))
-            gate_bias = lw.get("ffn.gate.bias")
-
-            if layer_idx < eng.config.num_hash_layers:
-                tid2eid = lw.get("ffn.gate.tid2eid")
-                if tid2eid is not None:
-                    eids = tid2eid[input_ids]
-                    for b in range(eids.shape[0]):
-                        for t in range(eids.shape[1]):
-                            for k in range(eids.shape[2]):
-                                eid = eids[b, t, k].item()
-                                expert_counts[eid] += 1
-                                layer_expert_trace[layer_idx].append(eid)
-
-            if gate_w is not None:
-                scores = torch.matmul(h_ffn_norm.to(gate_w.dtype), gate_w.t())
-                if gate_bias is not None:
-                    scores = scores + gate_bias.to(scores.dtype)
-                scores = torch.nn.functional.softplus(scores).sqrt()
-                _, topk_idx = torch.topk(scores, eng.config.num_experts_per_tok, dim=-1)
-                for b in range(topk_idx.shape[0]):
-                    for t in range(topk_idx.shape[1]):
-                        for k in range(topk_idx.shape[2]):
-                            eid = topk_idx[b, t, k].item()
-                            expert_counts[eid] += 1
-                            layer_expert_trace[layer_idx].append(eid)
-
-            ffn_out, _ = eng._forward_ffn(h_ffn_norm, lw, layer_idx, input_ids)
-            if ffn_post is not None and ffn_comb is not None:
-                h = eng._process_mhc_post(ffn_out, residual_ffn, ffn_post, ffn_comb)
-            else:
-                h = h + ffn_out.unsqueeze(2).expand(-1, -1, hc_mult, -1)
-
-        # Clean up per-chunk state
         eng.layer_states = {}
         torch.cuda.empty_cache()
 
-        if (chunk_start // chunk_size + 1) % 4 == 0:
-            print(f"[hot_expert]  Chunk {chunk_start//chunk_size+1}/{(actual_tokens+chunk_size-1)//chunk_size} "
-                  f"(token {chunk_start}/{actual_tokens}) done")
+        if (chunk_start + 1) % 64 == 0:
+            print(f"[hot_expert]  Token {chunk_start+1}/{actual_tokens} done")
 
     total_calls = sum(expert_counts.values())
     top_hot = [eid for eid, _ in expert_counts.most_common(num_hot)]
     top_hot_coverage = sum(expert_counts[eid] for eid in top_hot) / total_calls if total_calls > 0 else 0
     top_16 = top_hot[:16]
     top_16_coverage = sum(expert_counts[eid] for eid in top_16) / total_calls if total_calls > 0 else 0
+
+    per_layer_hot_count = max(num_hot, 128)
+    top_hot_by_layer = {}
+    per_layer_coverage = {}
+    for layer_idx in sorted(layer_expert_trace.keys()):
+        layer_counter = Counter(layer_expert_trace[layer_idx])
+        layer_top = [eid for eid, _ in layer_counter.most_common(per_layer_hot_count)]
+        top_hot_by_layer[str(layer_idx)] = layer_top
+        layer_total = sum(layer_counter.values())
+        layer_cov = sum(layer_counter[eid] for eid in layer_top) / layer_total if layer_total > 0 else 0
+        per_layer_coverage[str(layer_idx)] = round(layer_cov, 4)
+    avg_per_layer_cov = sum(per_layer_coverage.values()) / len(per_layer_coverage) if per_layer_coverage else 0
 
     result = {
         "top_hot_experts": top_hot,
@@ -287,6 +249,10 @@ def analyze_hot_experts(weight_dir: str, num_tokens: int = 8192, num_hot: int = 
         "calibration_tokens": actual_tokens,
         "all_expert_counts": [(int(eid), int(cnt)) for eid, cnt in expert_counts.most_common(50)],
         "hash_layer_expert_ids": list(range(18)),
+        "top_hot_experts_by_layer": top_hot_by_layer,
+        "per_layer_coverage": per_layer_coverage,
+        "avg_per_layer_coverage": round(avg_per_layer_cov, 4),
+        "per_layer_hot_count": per_layer_hot_count,
         "config": {
             "num_layers": eng.config.num_hidden_layers,
             "num_experts": eng.config.n_routed_experts,
@@ -298,6 +264,7 @@ def analyze_hot_experts(weight_dir: str, num_tokens: int = 8192, num_hot: int = 
         json.dump(result, f, indent=2)
     print(f"[hot_expert] Top-{num_hot} experts: {top_hot}")
     print(f"[hot_expert] Top-{num_hot} coverage: {top_hot_coverage:.2%}")
+    print(f"[hot_expert] Per-layer top-{per_layer_hot_count}: avg coverage={avg_per_layer_cov:.2%}")
     print(f"[hot_expert] Top-16 coverage (legacy): {top_16_coverage:.2%}")
     print(f"[hot_expert] Saved to {output_path}")
     return result

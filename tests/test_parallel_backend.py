@@ -347,6 +347,94 @@ class TestEngineGetLayerWeightsDevice:
         lw = eng._get_layer_weights(0)
         assert eng._get_layer_weights(0) is lw
 
+    def test_layer_weight_cache_not_cleared_by_forward_layer(self):
+        """_forward_layer should never mutate _layer_weight_cache for other layers.
+
+        Regression: commit 1c901ff added per-layer cache cleanup in _forward_layer
+        that deleted _layer_weight_cache[layer_idx - 1], forcing every decode step
+        to reload all 43 layers from disk (~30× slowdown).
+        """
+        eng = _make_stub(4)
+        eng._backend = PPBackend(_hw(devices=("cuda:0",)), 4)
+        eng._is_multigpu = False
+        eng._layer_weight_cache = {0: {}, 1: {}}
+        eng.loader = MagicMock()
+        eng.loader.get_weights.return_value = {}
+
+        cache_len_before = len(eng._layer_weight_cache)
+        # _forward_layer needs these mocked to avoid real tensor ops
+        D = eng.config.hidden_size
+        h = torch.zeros(1, 1, eng.config.hc_mult, D,
+                        device=eng.device, dtype=torch.bfloat16)
+        eng._process_mhc_layer = lambda h, lw, prefix: (h.sum(dim=2), None, None)
+        eng._forward_attn = lambda h, lw, li: torch.zeros(
+            1, 1, D, device=h.device, dtype=h.dtype)
+        eng._forward_ffn = lambda h, lw, li, *a: (
+            torch.zeros(1, 1, D, device=h.device, dtype=h.dtype), set())
+        eng._process_mhc_post = lambda h, r, p, c: h
+
+        eng._forward_layer(h, eng._layer_weight_cache[0], 0)
+        eng._forward_layer(h, eng._layer_weight_cache[1], 1)
+
+        assert len(eng._layer_weight_cache) >= cache_len_before, (
+            f"_layer_weight_cache shrunk from {cache_len_before} "
+            f"to {len(eng._layer_weight_cache)} — _forward_layer "
+            f"must not delete cache entries"
+        )
+        assert 0 in eng._layer_weight_cache, "layer 0 should survive forward_layer"
+        assert 1 in eng._layer_weight_cache, "layer 1 should survive forward_layer"
+
+    def test_get_layer_weights_cached_across_forward_layer(self):
+        """After _forward_layer, subsequent _get_layer_weights must hit cache.
+
+        Regression: same as above — per-layer cleanup invalidated cache for every
+        layer, so the second decode step's _get_layer_weights was always a miss.
+        """
+        eng = _make_stub(4)
+        eng._backend = PPBackend(_hw(devices=("cuda:0",)), 4)
+        eng._is_multigpu = False
+        eng._layer_weight_cache = {}
+
+        call_count = [0]
+        mock_weights = {}
+        for li in (0, 1):
+            for t in ("attn_norm.weight", "ffn_norm.weight",
+                      "attn.wq_a.weight", "attn.wq_a.scale",
+                      "attn.wq_b.weight", "attn.wq_b.scale"):
+                mock_weights[f"layers.{li}.{t}"] = None
+        def counting_get_weights(*keys):
+            call_count[0] += 1
+            return mock_weights
+        eng.loader = MagicMock()
+        eng.loader.get_weights = counting_get_weights
+
+        D = eng.config.hidden_size
+        h = torch.zeros(1, 1, eng.config.hc_mult, D,
+                        device=eng.device, dtype=torch.bfloat16)
+        eng._process_mhc_layer = lambda h, lw, prefix: (h.sum(dim=2), None, None)
+        eng._forward_attn = lambda h, lw, li: torch.zeros(
+            1, 1, D, device=h.device, dtype=h.dtype)
+        eng._forward_ffn = lambda h, lw, li, *a: (
+            torch.zeros(1, 1, D, device=h.device, dtype=h.dtype), set())
+        eng._process_mhc_post = lambda h, r, p, c: h
+
+        # First decode step: cold load layers 0 and 1
+        lw0 = eng._get_layer_weights(0)
+        assert call_count[0] == 1, "first _get_layer_weights should hit loader"
+        eng._forward_layer(h, lw0, 0)
+        lw1 = eng._get_layer_weights(1)
+        assert call_count[0] == 2, "second _get_layer_weights should hit loader"
+        eng._forward_layer(h, lw1, 1)
+        # Regression: _forward_layer(1) deleted _layer_weight_cache[0]
+
+        # Second decode step for layer 0: must hit cache
+        lw0_2 = eng._get_layer_weights(0)
+        assert call_count[0] == 2, (
+            f"regression: second _get_layer_weights(0) went to loader "
+            f"({call_count[0]} calls expected 2)"
+        )
+        assert lw0 is lw0_2, "should return the same cached dict object"
+
 
 class TestEngineLoadSharedExpertsGPU:
     def test_shared_experts_on_correct_device(self):

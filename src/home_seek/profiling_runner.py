@@ -500,7 +500,7 @@ class LayerTrace:
         return "\n".join(lines)
 
 
-def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode=None):
+def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode=None, profile_mode="full"):
     original_forward_attn = engine._forward_attn
     original_forward_ffn = engine._forward_ffn
     original_process_mhc = engine._process_mhc_layer
@@ -731,31 +731,37 @@ def patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_d
             _last_layer_end[0] = time.perf_counter()
         return result
 
+    if profile_mode == "none":
+        return engine
+
+    # Always-install wrappers (master-equivalent + cache monitoring)
     engine._forward_attn = traced_forward_attn
     engine._forward_ffn = traced_forward_ffn
-    engine._compute_routing_experts = traced_compute_routing
-    engine._load_expert_fp4_raw = traced_load_fp4_raw
-    engine._forward_ffn_m1_triton = traced_forward_ffn_m1
-    engine._shared_ffn.forward = traced_shared_ffn_forward
     engine._process_mhc_layer = traced_process_mhc
     engine._process_mhc_post = traced_mhc_post
     engine._hc_head = traced_hc_head
     engine._load_expert_weights = traced_load_expert
     engine._load_expert_deq = traced_expert_deq
     engine.expert_cache.get = traced_cache_get
-    engine._forward_layer = traced_forward_layer
-    engine._get_layer_weights = traced_get_layer_weights
 
-    # Store step timer reference for external access
-    engine._profile_decode_step_times = _decode_step_times
-    engine._profile_decode_step_start = _decode_step_start
-    engine._profile_post_step_times = _post_step_times
+    if profile_mode == "full":
+        # Heavy wrappers: intra-FFN subdivision + decode-step tracking + per-step overhead
+        engine._compute_routing_experts = traced_compute_routing
+        engine._load_expert_fp4_raw = traced_load_fp4_raw
+        engine._forward_ffn_m1_triton = traced_forward_ffn_m1
+        engine._shared_ffn.forward = traced_shared_ffn_forward
+        engine._forward_layer = traced_forward_layer
+        engine._get_layer_weights = traced_get_layer_weights
+
+        engine._profile_decode_step_times = _decode_step_times
+        engine._profile_decode_step_start = _decode_step_start
+        engine._profile_post_step_times = _post_step_times
 
     return engine
 
 
 def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, num_layers, tokenizer,
-                         decode_layer_delta=None):
+                         decode_layer_delta=None, profile_mode="full"):
     """Print single round's performance summary."""
     out = tokenizer.decode(result["tokens"][0], skip_special_tokens=True)
     print(f"\n  >>> {label} <<<")
@@ -813,57 +819,55 @@ def _print_round_result(label, result, cache_mon_snap, layer_snap, timer_snap, n
     )
     print(f"  Per-tok layer: {total_layer/decode_tok:.0f}ms/tok  FFN: {total_ffn/decode_tok:.0f}ms/tok")
 
-    # Intra-FFN breakdown (from layer_snap)
-    # routing, load, m1, shared — load is a sub-component of M1 in decode path
-    total_routing = sum(layer_snap.get('ffn_routing_ms', []))
-    total_load = sum(layer_snap.get('ffn_load_ms', []))
-    total_m1 = sum(layer_snap.get('ffn_m1_ms', []))
-    total_shared = sum(layer_snap.get('ffn_shared_ms', []))
-    # Non-overlapping: routing + M1 + shared = core FFN path
-    ffn_core = total_routing + total_m1 + total_shared
-    if ffn_core > 0 and total_ffn > 0:
-        ffn_overhead = total_ffn - ffn_core
-        print(
-            f"  Intra-FFN: routing={total_routing:.0f}ms ({total_routing/total_ffn*100:.0f}%)  "
-            f"M1={total_m1:.0f}ms ({total_m1/total_ffn*100:.0f}%)  "
-            f"shared={total_shared:.0f}ms ({total_shared/total_ffn*100:.0f}%)  "
-            f"overhead={ffn_overhead:.0f}ms ({ffn_overhead/total_ffn*100:.0f}%)"
-        )
-        if total_load > 0:
-            print(f"    Expert load (within M1/legacy): {total_load:.0f}ms ({total_load/total_m1*100:.0f}% of M1)" if total_m1 > 0 else f"    Expert load: {total_load:.0f}ms")
-    elif total_load > 0 and total_ffn > 0:
-        print(f"  Intra-FFN: load={total_load:.0f}ms ({total_load/total_ffn*100:.0f}% of FFN)")
+    if profile_mode == "full":
+        # Intra-FFN breakdown (from layer_snap)
+        total_routing = sum(layer_snap.get('ffn_routing_ms', []))
+        total_load = sum(layer_snap.get('ffn_load_ms', []))
+        total_m1 = sum(layer_snap.get('ffn_m1_ms', []))
+        total_shared = sum(layer_snap.get('ffn_shared_ms', []))
+        ffn_core = total_routing + total_m1 + total_shared
+        if ffn_core > 0 and total_ffn > 0:
+            ffn_overhead = total_ffn - ffn_core
+            print(
+                f"  Intra-FFN: routing={total_routing:.0f}ms ({total_routing/total_ffn*100:.0f}%)  "
+                f"M1={total_m1:.0f}ms ({total_m1/total_ffn*100:.0f}%)  "
+                f"shared={total_shared:.0f}ms ({total_shared/total_ffn*100:.0f}%)  "
+                f"overhead={ffn_overhead:.0f}ms ({ffn_overhead/total_ffn*100:.0f}%)"
+            )
+            if total_load > 0:
+                print(f"    Expert load (within M1/legacy): {total_load:.0f}ms ({total_load/total_m1*100:.0f}% of M1)" if total_m1 > 0 else f"    Expert load: {total_load:.0f}ms")
+        elif total_load > 0 and total_ffn > 0:
+            print(f"  Intra-FFN: load={total_load:.0f}ms ({total_load/total_ffn*100:.0f}% of FFN)")
 
-    # Decode-only layer breakdown
-    if decode_layer_delta is not None:
-        dec_attn = sum(decode_layer_delta['attn_ms'])
-        dec_ffn = sum(decode_layer_delta['ffn_ms'])
-        dec_mhc_a = sum(decode_layer_delta.get('mhc_attn_ms', []))
-        dec_mhc_f = sum(decode_layer_delta.get('mhc_ffn_ms', []))
-        dec_mhc_p = sum(decode_layer_delta.get('mhc_post_ms', []))
-        dec_total = dec_attn + dec_ffn + dec_mhc_a + dec_mhc_f + dec_mhc_p
-        print(f"  [Decode-only] Attn={dec_attn:.0f}ms  FFN={dec_ffn:.0f}ms  MHC={dec_mhc_a+dec_mhc_f+dec_mhc_p:.0f}ms  Total={dec_total:.0f}ms")
-        if decode_tok > 0:
-            print(f"  [Decode-only] Per-tok: {dec_total/decode_tok:.0f}ms/tok  FFN: {dec_ffn/decode_tok:.0f}ms/tok")
-        # Decode-only intra-FFN
-        dec_routing = sum(decode_layer_delta.get('ffn_routing_ms', []))
-        dec_load = sum(decode_layer_delta.get('ffn_load_ms', []))
-        dec_m1 = sum(decode_layer_delta.get('ffn_m1_ms', []))
-        dec_shared = sum(decode_layer_delta.get('ffn_shared_ms', []))
-        dec_core = dec_routing + dec_m1 + dec_shared
-        if dec_core > 0 and dec_ffn > 0:
-            dec_overhead = dec_ffn - dec_core
-            print(f"  [Decode Intra-FFN] routing={dec_routing:.0f}ms  M1={dec_m1:.0f}ms  "
-                  f"shared={dec_shared:.0f}ms  overhead={dec_overhead:.0f}ms")
-            if dec_load > 0:
-                print(f"    Expert load: {dec_load:.0f}ms ({dec_load/dec_m1*100:.0f}% of M1)" if dec_m1 > 0 else f"    Expert load: {dec_load:.0f}ms")
+        # Decode-only layer breakdown
+        if decode_layer_delta is not None:
+            dec_attn = sum(decode_layer_delta['attn_ms'])
+            dec_ffn = sum(decode_layer_delta['ffn_ms'])
+            dec_mhc_a = sum(decode_layer_delta.get('mhc_attn_ms', []))
+            dec_mhc_f = sum(decode_layer_delta.get('mhc_ffn_ms', []))
+            dec_mhc_p = sum(decode_layer_delta.get('mhc_post_ms', []))
+            dec_total = dec_attn + dec_ffn + dec_mhc_a + dec_mhc_f + dec_mhc_p
+            print(f"  [Decode-only] Attn={dec_attn:.0f}ms  FFN={dec_ffn:.0f}ms  MHC={dec_mhc_a+dec_mhc_f+dec_mhc_p:.0f}ms  Total={dec_total:.0f}ms")
+            if decode_tok > 0:
+                print(f"  [Decode-only] Per-tok: {dec_total/decode_tok:.0f}ms/tok  FFN: {dec_ffn/decode_tok:.0f}ms/tok")
+            dec_routing = sum(decode_layer_delta.get('ffn_routing_ms', []))
+            dec_load = sum(decode_layer_delta.get('ffn_load_ms', []))
+            dec_m1 = sum(decode_layer_delta.get('ffn_m1_ms', []))
+            dec_shared = sum(decode_layer_delta.get('ffn_shared_ms', []))
+            dec_core = dec_routing + dec_m1 + dec_shared
+            if dec_core > 0 and dec_ffn > 0:
+                dec_overhead = dec_ffn - dec_core
+                print(f"  [Decode Intra-FFN] routing={dec_routing:.0f}ms  M1={dec_m1:.0f}ms  "
+                      f"shared={dec_shared:.0f}ms  overhead={dec_overhead:.0f}ms")
+                if dec_load > 0:
+                    print(f"    Expert load: {dec_load:.0f}ms ({dec_load/dec_m1*100:.0f}% of M1)" if dec_m1 > 0 else f"    Expert load: {dec_load:.0f}ms")
 
-    # EP timing breakdown
-    ep_gpu0 = cache_mon_snap.get('ep_gpu0_ms', 0)
-    ep_gpu1 = cache_mon_snap.get('ep_gpu1_ms', 0)
-    ep_copy = cache_mon_snap.get('ep_copy_ms', 0)
-    if ep_gpu0 > 0 or ep_gpu1 > 0:
-        print(f"  EP timing: GPU0={ep_gpu0:.0f}ms  GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms")
+        # EP timing breakdown
+        ep_gpu0 = cache_mon_snap.get('ep_gpu0_ms', 0)
+        ep_gpu1 = cache_mon_snap.get('ep_gpu1_ms', 0)
+        ep_copy = cache_mon_snap.get('ep_copy_ms', 0)
+        if ep_gpu0 > 0 or ep_gpu1 > 0:
+            print(f"  EP timing: GPU0={ep_gpu0:.0f}ms  GPU1={ep_gpu1:.0f}ms  PCIe_copy={ep_copy:.0f}ms")
 
 
 def run_profile(args):
@@ -947,7 +951,7 @@ def run_profile(args):
     mem_trace = []
     mem_trace.append(("init", -1, torch.cuda.memory_allocated()))
 
-    patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode)
+    patch_engine(engine, timer, cache_mon, layer_trace, mem_trace, layer_trace_decode, profile_mode=args.profile_mode)
     util_mon = UtilMonitor()
 
     print("\n[3/5] Running inference ...")
@@ -1022,29 +1026,31 @@ def run_profile(args):
         _print_round_result(label, result, cache_delta, layer_delta,
                            {'before': timer_before, 'after': timer_after},
                            engine.config.num_hidden_layers, tokenizer,
-                           decode_layer_delta=decode_delta)
+                           decode_layer_delta=decode_delta,
+                           profile_mode=args.profile_mode)
 
-        # Per-decode-step latency distribution
-        if step_times:
-            import statistics
-            sorted_times = sorted(step_times)
-            n = len(sorted_times)
-            print(f"  Decode step latency (n={n}): "
-                  f"min={min(sorted_times):.0f}ms  "
-                  f"median={statistics.median(sorted_times):.0f}ms  "
-                  f"p99={sorted_times[int(n*0.99)]:.0f}ms  "
-                  f"max={max(sorted_times):.0f}ms")
-            if n >= 2 and sorted_times[n-1] > sorted_times[0] * 1.5:
-                print("  >> Step latency varies >1.5× (cold page cache / bursty I/O)")
+        if args.profile_mode == "full":
+            # Per-decode-step latency distribution
+            if step_times:
+                import statistics
+                sorted_times = sorted(step_times)
+                n = len(sorted_times)
+                print(f"  Decode step latency (n={n}): "
+                      f"min={min(sorted_times):.0f}ms  "
+                      f"median={statistics.median(sorted_times):.0f}ms  "
+                      f"p99={sorted_times[int(n*0.99)]:.0f}ms  "
+                      f"max={max(sorted_times):.0f}ms")
+                if n >= 2 and sorted_times[n-1] > sorted_times[0] * 1.5:
+                    print("  >> Step latency varies >1.5× (cold page cache / bursty I/O)")
 
-        # Per-decode-step post-layer overhead (lm_head + sampling)
-        if post_step_times:
-            sorted_post = sorted(post_step_times)
-            n_post = len(sorted_post)
-            print(f"  Post-layer overhead (lm_head+sample+loop, n={n_post}): "
-                  f"avg={sum(post_step_times)/n_post:.0f}ms  "
-                  f"min={min(post_step_times):.0f}ms  "
-                  f"max={max(post_step_times):.0f}ms")
+            # Per-decode-step post-layer overhead (lm_head + sampling)
+            if post_step_times:
+                sorted_post = sorted(post_step_times)
+                n_post = len(sorted_post)
+                print(f"  Post-layer overhead (lm_head+sample+loop, n={n_post}): "
+                      f"avg={sum(post_step_times)/n_post:.0f}ms  "
+                      f"min={min(post_step_times):.0f}ms  "
+                      f"max={max(post_step_times):.0f}ms")
 
         print()
 
@@ -1125,84 +1131,85 @@ def run_profile(args):
     print(f"\n{'-' * 70}")
     print(util_mon.summary())
 
-    print(f"\n{'-' * 70}")
-    print(layer_trace.summary())
+    if args.profile_mode != "none":
+        print(f"\n{'-' * 70}")
+        print(layer_trace.summary())
+
+        print(f"\n{'-' * 70}")
+        print(timer.summary())
 
     print(f"\n{'-' * 70}")
-    print(timer.summary())
+    print(cache_mon.summary())
 
-    print(f"\n{'-' * 70}")
-    print('\n'.join(cache_mon.summary()))
+    if args.profile_mode == "full":
+        print(f"\n{'-' * 70}")
+        print(f"Bottleneck Analysis (last round: {last['label']}):")
+        # Use layer delta from last round only (not cumulative across all rounds)
+        layer_d = last['layer']
+        total_attn = sum(layer_d['attn_ms']) / 1000 if layer_d else 0
+        total_ffn = sum(layer_d['ffn_ms']) / 1000 if layer_d else 0
+        total_mhc = (
+            sum(layer_d.get('mhc_attn_ms', [])) + sum(layer_d.get('mhc_ffn_ms', []))
+            + sum(layer_d.get('mhc_post_ms', []))
+        ) / 1000 if layer_d else 0
+        total_layer = total_attn + total_ffn + total_mhc
 
-    print(f"\n{'-' * 70}")
-    print(f"Bottleneck Analysis (last round: {last['label']}):")
-    # Use layer delta from last round only (not cumulative across all rounds)
-    layer_d = last['layer']
-    total_attn = sum(layer_d['attn_ms']) / 1000 if layer_d else 0
-    total_ffn = sum(layer_d['ffn_ms']) / 1000 if layer_d else 0
-    total_mhc = (
-        sum(layer_d.get('mhc_attn_ms', [])) + sum(layer_d.get('mhc_ffn_ms', []))
-        + sum(layer_d.get('mhc_post_ms', []))
-    ) / 1000 if layer_d else 0
-    total_layer = total_attn + total_ffn + total_mhc
+        print(f"  Layer loop total:   {total_layer:.2f}s  ({total_layer/result['total_time_s']*100:.0f}% of total)")
+        print(f"  Attention:          {total_attn:.2f}s  ({total_attn/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  Attention:          {total_attn:.2f}s")
+        print(f"  FFN:                {total_ffn:.2f}s  ({total_ffn/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  FFN:                {total_ffn:.2f}s")
+        print(f"  MHC (attn+ffn+post):{total_mhc:.2f}s  ({total_mhc/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  MHC (attn+ffn+post):{total_mhc:.2f}s")
 
-    print(f"  Layer loop total:   {total_layer:.2f}s  ({total_layer/result['total_time_s']*100:.0f}% of total)")
-    print(f"  Attention:          {total_attn:.2f}s  ({total_attn/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  Attention:          {total_attn:.2f}s")
-    print(f"  FFN:                {total_ffn:.2f}s  ({total_ffn/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  FFN:                {total_ffn:.2f}s")
-    print(f"  MHC (attn+ffn+post):{total_mhc:.2f}s  ({total_mhc/total_layer*100:.1f}% of layer)" if total_layer > 0 else f"  MHC (attn+ffn+post):{total_mhc:.2f}s")
+        # Intra-FFN bottleneck analysis (decode-only for best signal)
+        dec_d = last.get('decode_layer', {})
+        dec_ffn_ms = sum(dec_d.get('ffn_ms', [])) if dec_d else 0
+        dec_ffn_s = dec_ffn_ms / 1000
+        total_routing = sum(dec_d.get('ffn_routing_ms', [])) / 1000 if dec_d else 0
+        total_load = sum(dec_d.get('ffn_load_ms', [])) / 1000 if dec_d else 0
+        total_m1 = sum(dec_d.get('ffn_m1_ms', [])) / 1000 if dec_d else 0
+        total_shared = sum(dec_d.get('ffn_shared_ms', [])) / 1000 if dec_d else 0
+        ffn_core = total_routing + total_m1 + total_shared
+        if ffn_core > 0 and dec_ffn_s > 0:
+            print("\n  Intra-FFN breakdown (decode-only):")
+            print(f"    Routing (softplus+topk):  {total_routing:.2f}s  ({total_routing/dec_ffn_s*100:.0f}% of FFN)")
+            print(f"    M1 kernel (incl loads):    {total_m1:.2f}s  ({total_m1/dec_ffn_s*100:.0f}% of FFN)")
+            print(f"    Shared expert:             {total_shared:.2f}s  ({total_shared/dec_ffn_s*100:.0f}% of FFN)")
+            ffn_overhead = dec_ffn_s - ffn_core
+            if ffn_overhead > 0:
+                print(f"    Python dispatch+sync:      {ffn_overhead:.2f}s  ({ffn_overhead/dec_ffn_s*100:.0f}% of FFN)  <- .item() calls, dict ops")
+            if total_load > 0:
+                load_pct_m1 = total_load / total_m1 * 100 if total_m1 > 0 else 0
+                print(f"    ── Expert loading (DMA):   {total_load:.2f}s  ({load_pct_m1:.0f}% of M1 kernel)")
+            if total_load > dec_ffn_s * 0.25:
+                print(f"  >> Expert loading is dominant ({total_load/dec_ffn_s*100:.0f}%). PCIe/DMA is the bottleneck.")
+            if ffn_overhead > dec_ffn_s * 0.15:
+                print(f"  >> Python dispatch+sync is significant ({ffn_overhead/dec_ffn_s*100:.0f}%).")
 
-    # Intra-FFN bottleneck analysis (decode-only for best signal)
-    dec_d = last.get('decode_layer', {})
-    dec_ffn_ms = sum(dec_d.get('ffn_ms', [])) if dec_d else 0
-    dec_ffn_s = dec_ffn_ms / 1000
-    total_routing = sum(dec_d.get('ffn_routing_ms', [])) / 1000 if dec_d else 0
-    total_load = sum(dec_d.get('ffn_load_ms', [])) / 1000 if dec_d else 0
-    total_m1 = sum(dec_d.get('ffn_m1_ms', [])) / 1000 if dec_d else 0
-    total_shared = sum(dec_d.get('ffn_shared_ms', [])) / 1000 if dec_d else 0
-    ffn_core = total_routing + total_m1 + total_shared
-    if ffn_core > 0 and dec_ffn_s > 0:
-        print("\n  Intra-FFN breakdown (decode-only):")
-        print(f"    Routing (softplus+topk):  {total_routing:.2f}s  ({total_routing/dec_ffn_s*100:.0f}% of FFN)")
-        print(f"    M1 kernel (incl loads):    {total_m1:.2f}s  ({total_m1/dec_ffn_s*100:.0f}% of FFN)")
-        print(f"    Shared expert:             {total_shared:.2f}s  ({total_shared/dec_ffn_s*100:.0f}% of FFN)")
-        ffn_overhead = dec_ffn_s - ffn_core
-        if ffn_overhead > 0:
-            print(f"    Python dispatch+sync:      {ffn_overhead:.2f}s  ({ffn_overhead/dec_ffn_s*100:.0f}% of FFN)  <- .item() calls, dict ops")
-        if total_load > 0:
-            load_pct_m1 = total_load / total_m1 * 100 if total_m1 > 0 else 0
-            print(f"    ── Expert loading (DMA):   {total_load:.2f}s  ({load_pct_m1:.0f}% of M1 kernel)")
-        if total_load > dec_ffn_s * 0.25:
-            print(f"  >> Expert loading is dominant ({total_load/dec_ffn_s*100:.0f}%). PCIe/DMA is the bottleneck.")
-        if ffn_overhead > dec_ffn_s * 0.15:
-            print(f"  >> Python dispatch+sync is significant ({ffn_overhead/dec_ffn_s*100:.0f}%).")
+        if total_layer > 0:
+            per_token_layer = total_layer / gen_tok * 1000
+            per_token_ffn = total_ffn / gen_tok * 1000
+            print(f"\n  Per-token layer loop: {per_token_layer:.0f} ms/token")
+            print(f"  Per-token FFN:        {per_token_ffn:.0f} ms/token")
 
-    if total_layer > 0:
-        per_token_layer = total_layer / gen_tok * 1000
-        per_token_ffn = total_ffn / gen_tok * 1000
-        print(f"\n  Per-token layer loop: {per_token_layer:.0f} ms/token")
-        print(f"  Per-token FFN:        {per_token_ffn:.0f} ms/token")
+        # Detailed "Other" overhead decomposition (last round)
+        other_s = result['total_time_s'] - total_layer
+        if other_s > 0:
+            gen_tok_r = result.get('num_generated_tokens', gen_tok)
+            n_round_steps = gen_tok_r - 1
+            recent_post = post_step_times[-n_round_steps:] if len(post_step_times) >= n_round_steps else post_step_times
+            post_step_total = sum(recent_post) / 1000 if recent_post else 0
 
-    # Detailed "Other" overhead decomposition (last round)
-    other_s = result['total_time_s'] - total_layer
-    if other_s > 0:
-        # post_step_times is cumulative across all rounds — take last N
-        gen_tok_r = result.get('num_generated_tokens', gen_tok)
-        n_round_steps = gen_tok_r - 1  # decode steps = tokens generated - 1
-        recent_post = post_step_times[-n_round_steps:] if len(post_step_times) >= n_round_steps else post_step_times
-        post_step_total = sum(recent_post) / 1000 if recent_post else 0
-
-        print("\n  'Other' overhead decomposition (outside 43-layer loop):")
-        print(f"  {'─' * 60}")
-        print(f"  Total 'Other':          {other_s:.2f}s  ({other_s/result['total_time_s']*100:.0f}% of total)")
-        print(f"  post_step (lm_head+sample+loop): {post_step_total:.2f}s")
-        residual = other_s - post_step_total
-        print(f"  Residual unknown:      {residual:.2f}s  ({residual/other_s*100:.0f}% of Other)" if other_s > 0 else f"  Residual unknown:      {residual:.2f}s")
-        print(f"  Per-token residual:    {residual/gen_tok*1000:.0f}ms/tok")
-        print("  (includes: embed, lm_head matmul, rms_norm, _get_layer_weights,")
-        print("   hc_head, .argmax(), .item() syncs, profiling overhead)")
-        prefill_est = result.get('prefill_time_s', 0) / max(gen_tok, 1)
-        if prefill_est > 0:
-            print(f"  (prefill amortized:    ~{prefill_est*1000:.0f}ms/tok)")
+            print("\n  'Other' overhead decomposition (outside 43-layer loop):")
+            print(f"  {'─' * 60}")
+            print(f"  Total 'Other':          {other_s:.2f}s  ({other_s/result['total_time_s']*100:.0f}% of total)")
+            print(f"  post_step (lm_head+sample+loop): {post_step_total:.2f}s")
+            residual = other_s - post_step_total
+            print(f"  Residual unknown:      {residual:.2f}s  ({residual/other_s*100:.0f}% of Other)" if other_s > 0 else f"  Residual unknown:      {residual:.2f}s")
+            print(f"  Per-token residual:    {residual/gen_tok*1000:.0f}ms/tok")
+            print("  (includes: embed, lm_head matmul, rms_norm, _get_layer_weights,")
+            print("   hc_head, .argmax(), .item() syncs, profiling overhead)")
+            prefill_est = result.get('prefill_time_s', 0) / max(gen_tok, 1)
+            if prefill_est > 0:
+                print(f"  (prefill amortized:    ~{prefill_est*1000:.0f}ms/tok)")
 
     hot_rate = cache_mon.hot_hits / max(cache_mon.hot_hits + cache_mon.hot_misses, 1) * 100
     print(f"\n  Hot cache hit rate: {hot_rate:.1f}%")
@@ -1298,6 +1305,9 @@ def main():
     parser.add_argument("--no-triton", action="store_true",
                         help="Disable Triton kernels (use PyTorch fallbacks)")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--profile-mode", choices=["full", "light", "none"], default="full",
+                        help="Profiling detail level: full=intra-FFN+decode-step+post-step+bottleneck, "
+                             "light=per-layer only (master-equivalent, low overhead), none=no profiling")
     parser.add_argument("--profiler", choices=["chrome", "none"], default="none",
                         help="Enable torch.profiler. 'chrome' exports Chrome trace JSON")
     parser.add_argument("--profiler-warmup", type=int, default=1,

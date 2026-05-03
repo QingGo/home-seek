@@ -1378,10 +1378,12 @@ class HomeSeekInferenceEngine:
 
     def _forward_ffn_m1_triton(self, hidden_states, flat_hidden, flat_topk_idx, flat_topk_w, layer_idx):
         eids = {}
+        idx_row = flat_topk_idx[0].tolist()
+        w_row = flat_topk_w[0].tolist()
         for k in range(flat_topk_idx.shape[1]):
-            eid = int(flat_topk_idx[0, k].item())
+            eid = int(idx_row[k])
             if eid >= 0:
-                eids[eid] = eids.get(eid, 0.0) + float(flat_topk_w[0, k].item())
+                eids[eid] = eids.get(eid, 0.0) + float(w_row[k])
         if not eids:
             return None
 
@@ -2615,14 +2617,8 @@ class HomeSeekInferenceEngine:
                 target = self._resolve_device(layer_idx)
                 prev_dev = h.device
                 if prev_dev.type == 'cuda' and prev_dev.index != torch.device(target).index:
-                    with record_function("clear_caches"):
-                        from home_seek.fused_moe import clear_deq_cache
-                        clear_deq_cache()
-                        self._deq_cache.clear()
-                        torch.cuda.empty_cache()
-                with record_function("transfer_hidden"):
                     h = self._backend.transfer_hidden(h, target)
-                    torch.cuda.set_device(torch.device(target).index)
+                torch.cuda.set_device(torch.device(target).index)
             residual_attn = h
             with record_function("mhc_attn"):
                 h_pre, post, comb = self._process_mhc_layer(h, lw, "hc_attn")
@@ -2646,14 +2642,10 @@ class HomeSeekInferenceEngine:
                 h = self._process_mhc_post(ffn_out, residual, post, comb)
             else:
                 h = h + ffn_out.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-            # 逐层清理: 上一层的权重不再需要
-            if layer_idx > 0 and layer_idx - 1 in self._layer_weight_cache:
-                del self._layer_weight_cache[layer_idx - 1]
-            if layer_idx > 0 and hasattr(self, '_ffn_weight_cache'):
-                for k in list(getattr(self, '_ffn_weight_cache', {}).keys()):
-                    li, _ = k if isinstance(k, tuple) else (k, None)
-                    if li == layer_idx - 1:
-                        self._ffn_weight_cache.pop(k, None)
+            # Per-request cache: keep all layers cached during a generate() call.
+            # Non-expert weights (~4.7GB GPU) are pinned across decode steps and
+            # only cleaned at generate() entry.  Removing this was a 30× regression
+            # (each decode step re-reads all 43 layers from mmap).
         return h, used_experts
 
     @torch.no_grad()
@@ -2666,12 +2658,6 @@ class HomeSeekInferenceEngine:
         skip_prefill = resume and session_id is not None
 
         if not skip_prefill:
-            cache_total = len(self.expert_cache) + sum(len(c) for c in self._expert_caches.values())
-            cache_max = self.expert_cache.max_experts + sum(c.max_experts for c in self._expert_caches.values())
-            self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}, "
-                      f"cache={cache_total}/{cache_max}, "
-                      f"gpu_hot={sum(len(s.gpu_hot_experts) for s in self._backend.all_device_states())}, "
-                      f"gpu_bf16={sum(len(s.gpu_bf16_cache) for s in self._backend.all_device_states())}")
             self.layer_states = {}
             self._deq_cache.clear()
             self.expert_cache.clear()
@@ -2695,6 +2681,12 @@ class HomeSeekInferenceEngine:
                 compressor.reset()
             for indexer in self._indexers.values():
                 indexer.reset()
+            cache_total = len(self.expert_cache) + sum(len(c) for c in self._expert_caches.values())
+            cache_max = self.expert_cache.max_experts + sum(c.max_experts for c in self._expert_caches.values())
+            self._log(f"Generate: {T} prompt tokens, max_new={max_new_tokens}, "
+                       f"cache={cache_total}/{cache_max}, "
+                       f"gpu_hot={sum(len(s.gpu_hot_experts) for s in self._backend.all_device_states())}, "
+                       f"gpu_bf16={sum(len(s.gpu_bf16_cache) for s in self._backend.all_device_states())}")
             for hybrid in self._hybrid_kv.values():
                 hybrid.reset()
             self._global_pos = 0

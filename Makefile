@@ -1,4 +1,4 @@
-.PHONY: install lint test-unit test-integration profile profile-compare smoke clean
+.PHONY: install lint test-unit test-integration profile profile-light profile-compare smoke clean
 
 SHELL := /bin/bash
 UV := uv run
@@ -21,7 +21,13 @@ test-integration:
 profile: $(PROFILE_DIR)
 	$(UV) python -m home_seek.profiling_runner \
 		--rounds 5 --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" --max-tokens 30 --temperature 0 \
-		--output $(LAST_PROFILE)
+		--output $(LAST_PROFILE) --profile-mode full
+	@$(UV) python3 scripts/profile_show.py $(LAST_PROFILE)
+
+profile-light: $(PROFILE_DIR)
+	$(UV) python -m home_seek.profiling_runner \
+		--rounds 5 --prompts "Hello" "What is AI?" "Write a poem" "How are you?" "Hi" --max-tokens 30 --temperature 0 \
+		--output $(LAST_PROFILE) --profile-mode light
 	@$(UV) python3 scripts/profile_show.py $(LAST_PROFILE)
 
 profile-compare: $(PROFILE_DIR)

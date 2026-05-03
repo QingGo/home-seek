@@ -171,8 +171,8 @@ class HardwareConfig:
         # 拓扑参数 (devices, parallel_backend) 由 strategy_selector 根据
         # interconnect_tier 自动选择，不再硬编码。
         "2080": {
-            "gpu_hot_cap": 320,
-            "gpu_bf16_cap": 400,
+            "gpu_hot_cap": 128,
+            "gpu_bf16_cap": 128,
             "cpu_cache_max": 6144,
             "kv_offload_gb": 6,
             "cublas_max_tokens": 4,

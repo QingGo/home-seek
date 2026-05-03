@@ -70,10 +70,10 @@ def test_2080_ti_dual():
     cfg = HardwareConfig.auto(hw, _test_config())
     # 与真实硬件拓扑探测不同，测试 HWProfile 的 tier=single(默认)。
     # 策略选择器走保守 PP 路径: _configure_pcie_numa
-    # V21.7 FP4: (10-4)*0.20/(12.75/1024)=96, cap 320 → 96
+    # V21.11: (10-4)*0.20/(12.75/1024)=96, cap 128 → 96
     assert cfg.gpu_hot_max == 96
-    # (10-3)*0.80/(12.75/1024)=449, cap 400 → 400
-    assert cfg.gpu_bf16_max == 400
+    # (10-3)*0.80/(12.75/1024)=449, cap 128 → 128 (2080 Ti tight VRAM)
+    assert cfg.gpu_bf16_max == 128
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert len(cfg.device_map) == 43
     # 未知拓扑 → 保守 PP (非旧硬编码 EP)
@@ -249,9 +249,9 @@ def test_auto_multi_gpu_explicit_strategy_still_works():
     assert cfg.parallel_backend == "pp"
     assert cfg.device_map[:22] == (0,) * 22
     assert cfg.device_map[22:] == (1,) * 21
-    # V21.7 FP4 baseline preserved
+    # V21.11: 2080 Ti tight VRAM → bf16 cap 128
     assert cfg.gpu_hot_max == 96
-    assert cfg.gpu_bf16_max == 400
+    assert cfg.gpu_bf16_max == 128
 
 
 def test_auto_multi_gpu_n_gpu_high_but_single_available():

@@ -153,7 +153,7 @@ TileKernels/
 weights/
 weights
 artifacts/
-hot_experts.json
+hot_experts.json*
 .agent_memory.md
 hw_profile.json
 profile_round1_chrome.json

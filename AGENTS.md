@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.14 — Profiling overhaul + 瓶颈重新定位。
+DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.15 — 性能回归修复 + 轻量监控测试。
 
 ## 纪律
 
@@ -13,9 +13,10 @@ DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.14 — Profiling overhaul
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (304 pass, 2 skip)
+make test-unit         # 单元测试 (306 pass, 2 skip)
 make test-integration  # 集成测试 (需 weights/)
-make profile           # 标准 profile (5 prompts, 30 tokens). 现在包含: intra-FFN细分, decode step分布, post_step overhead
+make profile           # 标准 profile (5 prompts, 30 tokens, --profile-mode full). 包含: intra-FFN细分, decode step分布, post_step overhead
+make profile-light     # 轻量 profile (同参数, --profile-mode light). 仅 per-layer Attn/FFN/MHC, 低开销
 make profile-compare   # 对比 prev/last profile (现在 per-layer + cache + intra-FFN + BW 全部对比)
 make profile-nsys      # Nsight Systems: CUDA stream 时间线 + PCIe 传输 (现在单GPU路径有 NVTX: ffn_routing, decode_embed, ...)
 make profile-ncu       # Nsight Compute: 单个 kernel 深度分析
@@ -192,6 +193,9 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 
 ## 已知陷阱 (gotchas)
 
+- **_layer_weight_cache 不得在 _forward_layer 中删除**: V21.14 的逐层删除导致 30× 性能回归 (每个 decode step 重新 mmap 全部 43 层权重). 缓存只在 `generate()` 入口处清空. 测试: `test_layer_weight_cache_not_cleared_by_forward_layer`.
+- **_get_layer_weights 调用计数是回归哨兵**: 如果 `loader.get_weights` 在第二个 decode step 仍被调用, 说明缓存被不当清理. 测试: `test_get_layer_weights_cached_across_forward_layer`.
+- **大重构后必须对照 master 做 A/B profile**: V21.14→V21.15 的 0.58→0.93 t/s 修复证明了这一点. 用 `make profile-light` 做快速对比 (profiling 开销 <3%).
 - **模型真正的结束标记是 token 1 (`</｜end▁of▁sentence｜>`)**, 不是 EOS 128000. `_load_stop_token_ids()` 从 `weights/tokenizer.json` 读取. 找不到文件直接报错.
 - **FusedMoEFFN cuBLAS 小 M**: `fused_expert_ffn_triton` 在 M<=8 时走 cuBLAS, 避免 Triton 15/16 SM 空转. `fused_moe.py:297`.
 - `ExpertWeightCache.clear()` 保留 pinned 条目; `ExpertCacheManager.clear()` 清空全部
