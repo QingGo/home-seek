@@ -1,6 +1,6 @@
 # Home-Seek
 
-DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.15 — 性能回归修复 + 轻量监控测试。
+DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.20 — GPU bf16 cache 扩容 + 时序预取分析 + bench 基础设施。
 
 ## 纪律
 
@@ -13,7 +13,7 @@ DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.15 — 性能回归修复
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (306 pass, 2 skip)
+make test-unit         # 单元测试 (316 pass, 2 skip, bench skip)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 标准 profile (5 prompts, 30 tokens, --profile-mode full). 包含: intra-FFN细分, decode step分布, post_step overhead
 make profile-light     # 轻量 profile (同参数, --profile-mode light). 仅 per-layer Attn/FFN/MHC, 低开销
@@ -108,6 +108,12 @@ tests/                             # 测试
 ├── test_quantization.py
 ├── test_tile_ops.py
 ├── test_weight_loading_bug.py     # +契约测试 (TestExpertCacheContract)
+├── bench/                         # Bench 测试 (V21.20 新增)
+│   ├── test_bench_dma_prefetch.py     # DMA 预取可行性 (cross-layer)
+│   ├── test_bench_m1_batched.py       # M1 batched kernel GPU time
+│   ├── test_bench_temporal_prefetch.py  # 时序路由持久性 + DMA 窗口 + Amdahl
+│   ├── test_bench_attention.py        # Attention 分解 + GQA kernel 对比 + BW 缩放
+│   └── test_bench_tp.py               # TP PCIe all-reduce + head-split + 投影
 └── integration/
     ├── conftest.py
     └── test_inference_e2e.py      # +回归哈希测试
@@ -209,6 +215,9 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 - **MTP eager 输出漂移**: 无验证直接接受 draft → trajectory 偏离基线
 - **MTP 验证状态回滚必须完整**: `compressed_kv_data`, `compressed_kv_idx` 也需保存/恢复, 仅 `kv_latent_cache` 不够
 - **MTP 批验证 causal mask**: `_forward_attn` 在 T>1 时添加 triu mask 在 k_sw 末尾 T 个位置. 无 T=1 开销
+- **MTP 接受率 ~18%**: 单层 shared MTP 模块的固有上限. 验证开销 (43层主干前向) > 节省. 不值得投入
+- **MTP dynamic chaining**: step 0 用主干 hidden, step 1+ 用 `h_proj(rms_norm(h_mtp_out_prev))`. V4/V3.2 一致
+- **GPU hot cache pop(1) 不缩容**: 迁移膨胀后 `pop(1)+add(1)` 永远保留大容量, 必须 `while pop` 缩回 cap
 - **KV session 文件**: `sessions/{session_id}/` 存所有层状态, 恢复时自动 map_location 到 GPU
 - **温度 0 对比必须**: 消除路由噪声
 - **MHC_post Triton kernel 始终失败** (AssertionError): 直走 PyTorch fallback
@@ -221,6 +230,15 @@ Server: `home-seek server` / `home-seek cli` / `home-seek download`
 - **GPU store 命中率可能为 0%**: `hot_experts.json` 与真实路由可能完全不重合. 检查 `make profile` 输出中的 `GPU store: 0h/0m`. 如果为 0, 所有 expert 都走 CPU→GPU DMA, 重新生成 hot_experts.json 可能改善.
 - **Bottleneck analysis 数字使用最后一段的 delta**: 多轮 profile 时 bottleneck 分析使用 `round_results[-1]` 的 per-round delta, 不是 `layer_trace` (累积所有轮).
 - **post_step = ~22ms 是真实值**: lm_head matmul 不是瓶颈. 不要花时间优化它.
+
+## 已知陷阱 (V21.20 新增)
+
+- **时序预取不 work**: CPU ExpertWeightCache 已包含前一步的 routed expert, 时序预取加载冗余数据. 不要在这个方向花时间.
+- **GPU cache 命中率 profiling bug**: `make profile-light` 显示 `GPU store hits: 0%`, 但直接 monkey-patch `_load_expert_fp4_raw` 测到 8-50% 真实命中率. profiling 的 CacheMonitor 有 bug — 不可信的指标.
+- **`gpu_bf16_max` 不要超过 320 (2080 Ti)**: 384+ 会 OOM (512 OOM, 384 达到 20.7 GB).
+- **`_temporal_prefetch_all` 保留但默认禁用**: 方法已实现, `eng._temporal_prefetch_enabled=True` 可启用. 当前无收益但基础设施保留供未来多 GPU PP 使用.
+- **Bench 测试需要 `-m bench`**: `pytest tests/bench/ -m bench -v`. `make test-unit` 自动跳过.
+
 
 ## Triton Kernel 铁律
 

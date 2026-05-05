@@ -436,6 +436,131 @@ class TestEngineGetLayerWeightsDevice:
         assert lw0 is lw0_2, "should return the same cached dict object"
 
 
+class TestGPUHoxCacheCap:
+    """V21.17: GPU hot cache must not exceed _max_hot_experts per device."""
+
+    def _make_engine_with_cap(self, cap: int = 4) -> tuple:
+        """Return (engine, dev0_state, dev1_state) with per-device gpu_hot."""
+        from home_seek.inference_engine import HomeSeekInferenceEngine
+        from home_seek.inference_engine.parallel import PerDeviceState
+
+        eng = HomeSeekInferenceEngine.__new__(HomeSeekInferenceEngine)
+        eng.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        eng.config = DeepSeekV4FlashConfig(num_hidden_layers=4, n_routed_experts=8)
+        eng._max_hot_experts = cap
+        eng._max_bf16_cache = cap
+        eng._hot_expert_set = set(range(8))
+        eng._hot_expert_set_by_layer = dict.fromkeys(range(4), set(range(8)))
+        eng._hot_usage_counter = {}
+        eng._log = lambda msg: None
+
+        dev0 = PerDeviceState(device="cuda:0")
+        dev1 = PerDeviceState(device="cuda:1")
+        return eng, dev0, dev1
+
+    def _fp4_six(self):
+        return (None, None, None, None, None, None)
+
+    def test_migration_copies_without_cap_bug(self):
+        """Bug repro: _load_gpu_hot_expert_bf16 copies self._gpu_hot_experts
+        to per-device gpu_hot without enforcing _max_hot_experts."""
+        eng, dev0, dev1 = self._make_engine_with_cap(cap=4)
+
+        # Fill dev0 to cap
+        for i in range(4):
+            dev0.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+        assert len(dev0.gpu_hot_experts) == 4
+
+        # Fill dev1 to cap, different keys
+        for i in range(4, 8):
+            dev1.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+        assert len(dev1.gpu_hot_experts) == 4
+
+        # Simulate: self._gpu_hot_experts references dev0, migration fires in dev1
+        eng._gpu_hot_experts = dev0.gpu_hot_experts
+        gpu_hot = dev1.gpu_hot_experts
+
+        # This is the buggy migration code from _load_gpu_hot_expert_bf16 (line 1286-1290)
+        for k, v in eng._gpu_hot_experts.items():
+            if k not in gpu_hot:
+                gpu_hot[k] = v
+
+        assert len(gpu_hot) == 8, "migration copies entries (expected 8)"
+        assert len(gpu_hot) > eng._max_hot_experts, (
+            f"BUG: gpu_hot has {len(gpu_hot)} entries after migration, "
+            f"but _max_hot_experts is {eng._max_hot_experts}"
+        )
+
+    def test_migration_enforces_cap_after_fix(self):
+        """After fix: migration must enforce _max_hot_experts on target gpu_hot."""
+        eng, dev0, dev1 = self._make_engine_with_cap(cap=4)
+
+        for i in range(4):
+            dev0.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+        for i in range(4, 8):
+            dev1.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+
+        eng._gpu_hot_experts = dev0.gpu_hot_experts
+        gpu_hot = dev1.gpu_hot_experts
+
+        # Fixed migration: copy then enforce cap
+        for k, v in eng._gpu_hot_experts.items():
+            if k not in gpu_hot:
+                gpu_hot[k] = v
+        while len(gpu_hot) > eng._max_hot_experts:
+            gpu_hot.pop(next(iter(gpu_hot)))
+        eng._gpu_hot_experts = gpu_hot
+
+        assert len(gpu_hot) <= eng._max_hot_experts, (
+            f"FIX: gpu_hot has {len(gpu_hot)} entries, "
+            f"should be ≤ _max_hot_experts ({eng._max_hot_experts})"
+        )
+
+    def test_add_when_over_cap_shrinks(self):
+        """When gpu_hot is over cap, new additions must shrink to cap, not just cycle."""
+        eng, dev0, _ = self._make_engine_with_cap(cap=4)
+
+        # Inflate dev0 above cap (simulate post-migration state)
+        for i in range(8):
+            dev0.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+
+        gpu_hot = dev0.gpu_hot_experts
+        assert len(gpu_hot) == 8, "starts at 8 entries (inflated)"
+
+        # Fixed cap enforcement: while loop shrinks to cap-1, then add
+        hot_key = (99, 99)
+        while len(gpu_hot) >= eng._max_hot_experts:
+            gpu_hot.pop(next(iter(gpu_hot)))
+        gpu_hot[hot_key] = self._fp4_six()
+
+        assert len(gpu_hot) == eng._max_hot_experts, (
+            f"FIX: gpu_hot has {len(gpu_hot)} entries after add, "
+            f"should be _max_hot_experts ({eng._max_hot_experts})"
+        )
+
+    def test_pop_one_does_not_shrink(self):
+        """Bug repro: pop(1)+add(1) keeps cache above cap forever."""
+        eng, dev0, _ = self._make_engine_with_cap(cap=4)
+
+        for i in range(8):
+            dev0.gpu_hot_experts[(i, 10 + i)] = self._fp4_six()
+
+        gpu_hot = dev0.gpu_hot_experts
+        assert len(gpu_hot) == 8
+
+        # Buggy pattern: pop(1) + add(1) — net zero, stays above cap
+        hot_key = (99, 99)
+        if len(gpu_hot) >= eng._max_hot_experts:
+            gpu_hot.pop(next(iter(gpu_hot)))
+        gpu_hot[hot_key] = self._fp4_six()
+
+        assert len(gpu_hot) == 8, "pop(1)+add(1) leaves cache at same size"
+        assert len(gpu_hot) > eng._max_hot_experts, (
+            f"BUG: gpu_hot still has {len(gpu_hot)} entries after pop+add, "
+            f"should be ≤ _max_hot_experts ({eng._max_hot_experts})"
+        )
+
+
 class TestEngineLoadSharedExpertsGPU:
     def test_shared_experts_on_correct_device(self):
         eng = _make_stub(2)

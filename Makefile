@@ -13,7 +13,7 @@ lint:
 	$(UV) ruff check src/home_seek/ tests/
 
 test-unit:
-	$(UV) python -m pytest tests/ --ignore=tests/integration -m "not slow" -q
+	$(UV) python -m pytest tests/ --ignore=tests/integration -m "not slow and not bench" -q
 
 test-integration:
 	$(UV) python -m pytest tests/integration/ -q

@@ -199,6 +199,8 @@ class HomeSeekInferenceEngine:
         self._compress_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._prefetch_enabled = self.hw_config.prefetch_enabled
+        self._temporal_prefetch_enabled = False  # V21.20: disabled — CPU cache priming redundant
+        self._temporal_routing: dict[int, list[int]] = {}
         self._prefetch_prev_layer_eids: dict[int, list[int]] = {}
         self._prefetch_current_eids: dict[int, list[int]] = {}
 
@@ -1153,6 +1155,8 @@ class HomeSeekInferenceEngine:
                     for k, v in self._gpu_hot_experts.items():
                         if k not in gpu_hot:
                             gpu_hot[k] = v
+                    while len(gpu_hot) > self._max_hot_experts:
+                        gpu_hot.pop(next(iter(gpu_hot)))
                     self._gpu_hot_experts = gpu_hot
         if not getattr(self, '_gpu_bf16_migrated', False):
             self._gpu_bf16_migrated = True
@@ -1269,7 +1273,7 @@ class HomeSeekInferenceEngine:
 
             layer_hot = self._hot_expert_set_by_layer.get(layer_idx, self._hot_expert_set)
             if eid in layer_hot:
-                if len(gpu_hot) >= self._max_hot_experts:
+                while len(gpu_hot) >= self._max_hot_experts:
                     gpu_hot.pop(next(iter(gpu_hot)))
                 gpu_hot[hot_key] = fp4_six
             else:
@@ -1287,6 +1291,8 @@ class HomeSeekInferenceEngine:
             for k, v in self._gpu_hot_experts.items():
                 if k not in gpu_hot:
                     gpu_hot[k] = v
+            while len(gpu_hot) > self._max_hot_experts:
+                gpu_hot.pop(next(iter(gpu_hot)))
             self._gpu_hot_experts = gpu_hot
         if key in gpu_hot:
             val = gpu_hot[key]
@@ -2204,6 +2210,33 @@ class HomeSeekInferenceEngine:
             for eid in predicted_eids:
                 self._load_expert_fp4_raw(next_layer, eid)
 
+    def _temporal_prefetch_all(self):
+        """Temporal DMA prefetch: use current step's routing to preload next step's experts.
+
+        Called after layer loop, before lm_head.  Uses _load_expert_raw to prime
+        the ExpertWeightCache (CPU memory, pinned) and kernel page cache.
+        This saves disk I/O on the critical path.  The GPU DMA still happens
+        during the critical path but reads from pinned/warm memory.
+
+        Why not GPU DMA preload: 43 layers × 6 experts × 12.75 MB = 3.3 GB
+        over PCIe gen3 ×8 (3.5 GB/s) ≈ 940ms, far exceeding the 200ms Other window.
+        CPU cache priming takes ~0.1ms/expert (Python CPU time, parallel with lm_head).
+
+        Critical path benefit: ~39.5% of experts already in ExpertWeightCache →
+        _load_expert_fp4_raw skips safetensors mmap read and FP4 processing.
+        """
+        if not self._temporal_prefetch_enabled:
+            return
+        if self._prefetch_stream is None:
+            return
+        if not self._temporal_routing:
+            return
+
+        with torch.cuda.stream(self._prefetch_stream):
+            for layer_idx, eids in self._temporal_routing.items():
+                for eid in eids:
+                    self._load_expert_raw(layer_idx, eid)
+
     def _warmup(self) -> bool:
         if self._warmed_up:
             return True
@@ -2257,6 +2290,7 @@ class HomeSeekInferenceEngine:
 
         draft_tokens: list[torch.Tensor] = []
         self._mtp_kv_cache = []
+        h_mtp_out = None
         try:
             for step in range(num_draft):
                 if step == 0 and last_token_id is not None:
@@ -2276,7 +2310,13 @@ class HomeSeekInferenceEngine:
                 emb_proj_2d = tok_emb.to(e_proj_bf16.dtype) @ e_proj_bf16.t()
                 emb_proj_4d = emb_proj_2d.unsqueeze(2)
 
-                h_combined_4d = h_main_proj_4d + emb_proj_4d
+                if step == 0:
+                    h_combined_4d = h_main_proj_4d + emb_proj_4d
+                else:
+                    prev_normed = (rms_norm(h_mtp_out, hnorm_w, self.config.rms_norm_eps)
+                                   if hnorm_w is not None else h_mtp_out)
+                    prev_proj_4d = F.linear(prev_normed.to(h_proj_bf16.dtype), h_proj_bf16)
+                    h_combined_4d = prev_proj_4d + emb_proj_4d
 
                 mtp_pos = getattr(self, '_global_pos', 0) + step + 1
                 h_mtp_out = self._mtp_forward_draft(h_combined_4d, start_pos=mtp_pos)
@@ -2675,6 +2715,7 @@ class HomeSeekInferenceEngine:
             # Clear persistent per-layer state that accumulates VRAM between generate() calls
             self._compressors.clear()
             self._indexers.clear()
+            self._temporal_routing.clear()
             self._hybrid_kv.clear()
             torch.cuda.empty_cache()
             for compressor in self._compressors.values():

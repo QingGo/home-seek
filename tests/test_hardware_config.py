@@ -72,8 +72,8 @@ def test_2080_ti_dual():
     # 策略选择器走保守 PP 路径: _configure_pcie_numa
     # V21.11: (10-4)*0.20/(12.75/1024)=96, cap 128 → 96
     assert cfg.gpu_hot_max == 96
-    # (10-3)*0.80/(12.75/1024)=449, cap 128 → 128 (2080 Ti tight VRAM)
-    assert cfg.gpu_bf16_max == 128
+    # (10-3)*0.80/(12.75/1024)=449, cap 320 → 320 (V21.20: increased from 128)
+    assert cfg.gpu_bf16_max == 320
     assert cfg.devices == ("cuda:0", "cuda:1")
     assert len(cfg.device_map) == 43
     # 未知拓扑 → 保守 PP (非旧硬编码 EP)
@@ -249,9 +249,9 @@ def test_auto_multi_gpu_explicit_strategy_still_works():
     assert cfg.parallel_backend == "pp"
     assert cfg.device_map[:22] == (0,) * 22
     assert cfg.device_map[22:] == (1,) * 21
-    # V21.11: 2080 Ti tight VRAM → bf16 cap 128
+    # V21.20: bf16 cap increased from 128 → 320 for GPU DMA hit rate
     assert cfg.gpu_hot_max == 96
-    assert cfg.gpu_bf16_max == 128
+    assert cfg.gpu_bf16_max == 320
 
 
 def test_auto_multi_gpu_n_gpu_high_but_single_available():

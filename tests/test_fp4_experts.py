@@ -808,3 +808,118 @@ class TestPCIeBARFix:
         assert result.device.type == "cpu"
         assert result.shape == (I, D)
         assert result.dtype == torch.bfloat16
+
+
+@pytest.mark.fast
+class TestM1BatchedKernel:
+    """L1: batched M1 kernel output matches original per-expert M1 kernel."""
+
+    _I = 64
+    _D = 128
+    _NUM_EXPERTS = [1, 2, 4, 8]
+
+    def _make_fp4_weights(self, seed: int = 42):
+        torch.manual_seed(seed)
+        I, D = self._I, self._D
+        w1_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w3_bf16 = torch.randn(I, D, device="cuda", dtype=torch.bfloat16)
+        w2_bf16 = torch.randn(D, I, device="cuda", dtype=torch.bfloat16)
+
+        from home_seek._fp4 import cast
+        w1_packed, w1_scale = cast(w1_bf16, fmt="e2m1", block_size=(1, 32))
+        w3_packed, w3_scale = cast(w3_bf16, fmt="e2m1", block_size=(1, 32))
+        w2_packed, w2_scale = cast(w2_bf16, fmt="e2m1", block_size=(1, 32))
+
+        return (w1_bf16, w3_bf16, w2_bf16,
+                w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale)
+
+    @pytest.mark.parametrize("num_experts", _NUM_EXPERTS)
+    def test_batched_matches_unbatched(self, num_experts):
+        """Batched M1 kernel output ≈ unbatched per-expert loop, all expert counts."""
+        from home_seek.fused_moe import (
+            _fused_moe_forward_m1_fp4,
+            _fused_moe_forward_m1_fp4_batched,
+        )
+        import torch.nn.functional as F
+        import copy
+
+        D = self._D
+        torch.manual_seed(42)
+        hidden = torch.randn(1, D, device="cuda", dtype=torch.bfloat16)
+
+        fp4_data = {}
+        routing_w = {}
+        for exp_idx in range(num_experts):
+            (_, _, _,
+             w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights(seed=42 + exp_idx)
+            fp4_data[exp_idx] = (w1p, w1s, w3p, w3s, w2p, w2s)
+            routing_w[exp_idx] = round(1.0 / num_experts, 6)
+
+        # Unbatched reference
+        out_ref = _fused_moe_forward_m1_fp4(
+            hidden, copy.deepcopy(fp4_data), routing_w,
+            swiglu_limit=10.0, triton_blocks=(32, 32),
+        )
+
+        # Batched
+        out_batched = _fused_moe_forward_m1_fp4_batched(
+            hidden, copy.deepcopy(fp4_data), routing_w,
+            swiglu_limit=10.0, triton_blocks=(32, 32),
+        )
+
+        assert out_ref.shape == out_batched.shape == (1, D)
+        assert torch.isfinite(out_batched).all(), "batched output has NaN/Inf"
+
+        cos_sim = F.cosine_similarity(
+            out_ref.float().flatten(), out_batched.float().flatten(), dim=0)
+        assert cos_sim.item() > 0.999, \
+            f"batched vs unbatched cosine={cos_sim.item():.6f} (num_experts={num_experts})"
+
+    def test_batched_output_finite(self):
+        """Batched kernel never produces NaN/Inf regardless of expert count."""
+        from home_seek.fused_moe import _fused_moe_forward_m1_fp4_batched
+
+        D = self._D
+        for num_experts in [1, 4, 8]:
+            torch.manual_seed(99 + num_experts)
+            hidden = torch.randn(1, D, device="cuda", dtype=torch.bfloat16)
+
+            fp4_data = {}
+            routing_w = {}
+            for exp_idx in range(num_experts):
+                (_, _, _,
+                 w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights(seed=99 + exp_idx * 7)
+                fp4_data[exp_idx] = (w1p, w1s, w3p, w3s, w2p, w2s)
+                routing_w[exp_idx] = 1.0 / num_experts
+
+            out = _fused_moe_forward_m1_fp4_batched(
+                hidden, fp4_data, routing_w,
+                swiglu_limit=10.0, triton_blocks=(32, 32),
+            )
+            assert out.shape == (1, D)
+            assert torch.isfinite(out).all(), \
+                f"batched non-finite with {num_experts} experts"
+
+    def test_batched_single_expert_matches_original(self):
+        """Batched with 1 expert is identical to original single-expert path."""
+        from home_seek.fused_moe import (
+            _fused_moe_forward_m1_fp4,
+            _fused_moe_forward_m1_fp4_batched,
+        )
+
+        D = self._D
+        hidden = torch.randn(1, D, device="cuda", dtype=torch.bfloat16)
+
+        (_, _, _,
+         w1p, w1s, w3p, w3s, w2p, w2s) = self._make_fp4_weights(seed=42)
+        fp4_data = {0: (w1p, w1s, w3p, w3s, w2p, w2s)}
+        routing_w = {0: 1.0}
+
+        out_ref = _fused_moe_forward_m1_fp4(
+            hidden, fp4_data, routing_w, swiglu_limit=10.0, triton_blocks=(32, 32))
+
+        out_bat = _fused_moe_forward_m1_fp4_batched(
+            hidden, fp4_data, routing_w, swiglu_limit=10.0, triton_blocks=(32, 32))
+
+        diff = (out_ref.float() - out_bat.float()).abs().max().item()
+        assert diff < 0.1, f"single-expert batched diverges: max diff={diff:.6f}"

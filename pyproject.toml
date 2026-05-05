@@ -86,8 +86,9 @@ select = ["F", "E", "W"]
 markers = [
     "fast: <1s unit tests",
     "slow: >1s tests",
+    "bench: standalone performance benchmarks (not for routine test runs)",
     "integration: end-to-end tests",
     "cuda: requires CUDA GPU (auto-skipped if not available)",
 ]
 testpaths = ["tests"]
-addopts = "-m 'not slow'"
+addopts = "-m 'not slow and not bench'"

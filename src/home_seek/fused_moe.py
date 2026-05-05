@@ -417,6 +417,27 @@ class FusedMoEFFN:
         self.use_triton = use_triton and torch.cuda.is_available()
         self._triton_blocks = triton_blocks
         self._cublas_max_tokens = cublas_max_tokens
+        self._batch_bufs = None  # lazy-init: pre-allocated reusable buffers
+
+    def _ensure_batch_buffers(self, num_experts: int):
+        """Lazily allocate reusable batch buffers for M1 batched path.
+        Avoids per-layer torch.cat allocation churn."""
+        I = self.intermediate_size
+        D = self.hidden_size
+        N = num_experts
+        if self._batch_bufs is not None and self._batch_bufs[0].shape[0] >= N:
+            return
+        device = "cuda"
+        self._batch_bufs = (
+            torch.empty(N, I, D // 2, dtype=torch.uint8, device=device),
+            torch.empty(N, I, D // 32, dtype=torch.float32, device=device),
+            torch.empty(N, I, D // 2, dtype=torch.uint8, device=device),
+            torch.empty(N, I, D // 32, dtype=torch.float32, device=device),
+            torch.empty(N, D, I // 2, dtype=torch.uint8, device=device),
+            torch.empty(N, D, I // 32, dtype=torch.float32, device=device),
+            torch.empty(N, I, dtype=torch.bfloat16, device=device),
+            torch.empty(N, I, dtype=torch.bfloat16, device=device),
+        )
 
     def _get_expert_fn(self):
         if self.use_triton:
@@ -1202,5 +1223,333 @@ def _fused_moe_forward_m1_fp4(
             lut,
             BN=BN, BK=BK, num_stages=1,
         )
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# M=1 batched fused FFN (all experts in single kernel launch pair)
+# Higher occupancy: gate_up grid cdiv(I,BN)×N_exp, down_accum cdiv(D,BN)×N_exp
+# Eliminates per-expert Python loop + intermediate buffer alloc churn.
+# ──────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def _triton_m1_gate_up_batched_kernel(
+    hidden_ptr,
+    w1_packed_ptr, w1_scale_ptr,
+    w3_packed_ptr, w3_scale_ptr,
+    gate_out_ptr, up_out_ptr,
+    I, D,
+    stride_hid_d,
+    stride_w1_n, stride_w1_k,
+    stride_s1_n, stride_s1_k,
+    stride_exp_w1, stride_exp_w1s,
+    stride_w3_n, stride_w3_k,
+    stride_s3_n, stride_s3_k,
+    stride_exp_w3, stride_exp_w3s,
+    stride_gate_exp, stride_gn,
+    stride_up_exp, stride_un,
+    lut_ptr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Batched 1D gate+up: M=1, 2D grid (cdiv(I,BN), num_experts)."""
+    pid_i = tl.program_id(0)
+    pid_exp = tl.program_id(1)
+
+    offs_n = pid_i * BN + tl.arange(0, BN)
+    mask_n = offs_n < I
+
+    exp_w1 = w1_packed_ptr + pid_exp * stride_exp_w1
+    exp_w1s = w1_scale_ptr + pid_exp * stride_exp_w1s
+    exp_w3 = w3_packed_ptr + pid_exp * stride_exp_w3
+    exp_w3s = w3_scale_ptr + pid_exp * stride_exp_w3s
+
+    gate_exp = gate_out_ptr + pid_exp * stride_gate_exp
+    up_exp = up_out_ptr + pid_exp * stride_up_exp
+
+    gate_acc = tl.zeros([BN], dtype=tl.float32)
+    up_acc = tl.zeros([BN], dtype=tl.float32)
+
+    SG: tl.constexpr = 32
+    BK_HALF: tl.constexpr = SG // 2
+    NUM_SG: tl.constexpr = BK // SG
+
+    for k in range(0, D, BK):
+        for sg in tl.static_range(NUM_SG):
+            k_sg = k + sg * SG
+            offs_k = k_sg + tl.arange(0, SG)
+            mask_k = offs_k < D
+
+            h_ptrs = hidden_ptr + offs_k * stride_hid_d
+            h = tl.load(h_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+
+            k_half = k_sg // 2
+            offs_kh = k_half + tl.arange(0, BK_HALF)
+            mask_kh = offs_kh < D // 2
+
+            scale_k_idx = k_sg // 32
+
+            # w1
+            w1p_ptrs = exp_w1 + offs_n[:, None] * stride_w1_n + offs_kh[None, :] * stride_w1_k
+            w1p = tl.load(w1p_ptrs, mask=(mask_n[:, None]) & mask_kh[None, :], other=0).to(tl.uint8)
+            w1_lo = (w1p & 0xF).to(tl.int32)
+            w1_hi = ((w1p >> 4) & 0xF).to(tl.int32)
+            w1_lo_f32 = tl.load(lut_ptr + w1_lo).to(tl.float32)
+            w1_hi_f32 = tl.load(lut_ptr + w1_hi).to(tl.float32)
+            w1s_ptrs = exp_w1s + offs_n[:, None] * stride_s1_n + scale_k_idx * stride_s1_k
+            w1s = tl.load(w1s_ptrs, mask=mask_n[:, None], other=1.0).to(tl.float32)
+            w1_lo_f32 *= w1s
+            w1_hi_f32 *= w1s
+            w1_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w1_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w1_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+
+            h_br = tl.reshape(h, (1, SG))
+            gate_acc += tl.sum(h_br * w1_deq.to(tl.float32), 1)
+
+            # w3
+            w3p_ptrs = exp_w3 + offs_n[:, None] * stride_w3_n + offs_kh[None, :] * stride_w3_k
+            w3p = tl.load(w3p_ptrs, mask=(mask_n[:, None]) & mask_kh[None, :], other=0).to(tl.uint8)
+            w3_lo = (w3p & 0xF).to(tl.int32)
+            w3_hi = ((w3p >> 4) & 0xF).to(tl.int32)
+            w3_lo_f32 = tl.load(lut_ptr + w3_lo).to(tl.float32)
+            w3_hi_f32 = tl.load(lut_ptr + w3_hi).to(tl.float32)
+            w3s_ptrs = exp_w3s + offs_n[:, None] * stride_s3_n + scale_k_idx * stride_s3_k
+            w3s = tl.load(w3s_ptrs, mask=mask_n[:, None], other=1.0).to(tl.float32)
+            w3_lo_f32 *= w3s
+            w3_hi_f32 *= w3s
+            w3_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w3_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w3_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+            up_acc += tl.sum(h_br * w3_deq.to(tl.float32), 1)
+
+    gate_ptrs = gate_exp + offs_n * stride_gn
+    up_ptrs = up_exp + offs_n * stride_un
+    tl.store(gate_ptrs, gate_acc.to(tl.bfloat16), mask=mask_n)
+    tl.store(up_ptrs, up_acc.to(tl.bfloat16), mask=mask_n)
+
+
+@triton.jit
+def _triton_m1_down_accum_batched_kernel(
+    gate_ptr, up_ptr,
+    w2_packed_ptr, w2_scale_ptr,
+    out_ptr,
+    routing_weights_ptr,
+    I, D, swiglu_limit,
+    stride_gate_exp, stride_gm, stride_gn,
+    stride_up_exp, stride_um, stride_un,
+    stride_w2_n, stride_w2_k,
+    stride_s2_n, stride_s2_k,
+    stride_exp_w2, stride_exp_w2s,
+    stride_om, stride_on,
+    lut_ptr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Batched 1D SwiGLU + weighted down-projection with atomic add.
+    2D grid: (cdiv(D, BN), num_experts). Each block handles one D-chunk
+    for one expert, accumulated via atomic_add into shared output."""
+    pid_d = tl.program_id(0)
+    pid_exp = tl.program_id(1)
+
+    offs_n = pid_d * BN + tl.arange(0, BN)
+    mask_n = offs_n < D
+
+    rw = tl.load(routing_weights_ptr + pid_exp).to(tl.float32)
+
+    gate_exp = gate_ptr + pid_exp * stride_gate_exp
+    up_exp = up_ptr + pid_exp * stride_up_exp
+    w2_exp = w2_packed_ptr + pid_exp * stride_exp_w2
+    w2s_exp = w2_scale_ptr + pid_exp * stride_exp_w2s
+
+    out_acc = tl.zeros([BN], dtype=tl.float32)
+
+    SG: tl.constexpr = 32
+    BK_HALF: tl.constexpr = SG // 2
+    NUM_SG: tl.constexpr = BK // SG
+
+    for k in range(0, I, BK):
+        for sg in tl.static_range(NUM_SG):
+            k_sg = k + sg * SG
+            offs_k = k_sg + tl.arange(0, SG)
+            mask_k = offs_k < I
+
+            gate_ptrs_ = gate_exp + offs_k * stride_gn
+            gate_chunk = tl.load(gate_ptrs_, mask=mask_k, other=0.0).to(tl.float32)
+            up_ptrs_ = up_exp + offs_k * stride_un
+            up_chunk = tl.load(up_ptrs_, mask=mask_k, other=0.0).to(tl.float32)
+
+            gate_chunk = tl.minimum(gate_chunk, swiglu_limit)
+            up_chunk = tl.minimum(tl.maximum(up_chunk, -swiglu_limit), swiglu_limit)
+            activated = gate_chunk * tl.sigmoid(gate_chunk) * up_chunk
+
+            k_half = k_sg // 2
+            offs_kh = k_half + tl.arange(0, BK_HALF)
+
+            w2p_ptrs = w2_exp + offs_n[:, None] * stride_w2_n + offs_kh[None, :] * stride_w2_k
+            w2p = tl.load(w2p_ptrs, mask=(mask_n[:, None]) & (offs_kh[None, :] < I // 2), other=0).to(tl.uint8)
+            w2_lo = (w2p & 0xF).to(tl.int32)
+            w2_hi = ((w2p >> 4) & 0xF).to(tl.int32)
+            w2_lo_f32 = tl.load(lut_ptr + w2_lo).to(tl.float32)
+            w2_hi_f32 = tl.load(lut_ptr + w2_hi).to(tl.float32)
+            scale_k_idx = k_sg // 32
+            w2s_ptrs = w2s_exp + offs_n[:, None] * stride_s2_n + scale_k_idx * stride_s2_k
+            w2s = tl.load(w2s_ptrs, mask=mask_n[:, None], other=1.0).to(tl.float32)
+            w2_lo_f32 *= w2s
+            w2_hi_f32 *= w2s
+            w2_deq = tl.reshape(
+                tl.join(
+                    tl.reshape(w2_lo_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                    tl.reshape(w2_hi_f32.to(tl.bfloat16), (BN, BK_HALF, 1)),
+                ),
+                (BN, SG),
+            )
+
+            activated_br = tl.reshape(activated, (1, SG))
+            contrib = tl.sum(activated_br * w2_deq.to(tl.float32), 1)
+            out_acc += rw * contrib
+
+    out_ptrs = out_ptr + offs_n * stride_on
+    tl.atomic_add(out_ptrs, out_acc.to(tl.bfloat16), mask=mask_n)
+
+
+def _fused_moe_forward_m1_fp4_batched(
+    hidden: torch.Tensor,
+    fp4_weights: dict,
+    routing_weights: dict,
+    swiglu_limit: float = 10.0,
+    triton_blocks: tuple[int, int] | None = None,
+    batch_bufs: tuple | None = None,
+) -> torch.Tensor:
+    """M=1 batched MoE FFN: all experts in single kernel launch pair.
+
+    Uses pre-allocated batch_bufs (no per-layer torch.cat allocation).
+    Higher occupancy: gate_up grid = cdiv(I,BN)×N_exp, down_accum = cdiv(D,BN)×N_exp.
+
+    batch_bufs layout (8-tuple):
+      0: w1_packed  [N, I, D//2] uint8
+      1: w1_scale   [N, I, D//32] float32
+      2: w3_packed  [N, I, D//2] uint8
+      3: w3_scale   [N, I, D//32] float32
+      4: w2_packed  [N, D, I//2] uint8
+      5: w2_scale   [N, D, I//32] float32
+      6: gate       [N, I] bfloat16
+      7: up         [N, I] bfloat16
+    """
+    if triton_blocks is None:
+        BN, BK = 32, 32
+    else:
+        BN, BK = triton_blocks
+        assert BK % 32 == 0, f"BK={BK} must be a multiple of 32 (scale group size)"
+
+    D = hidden.shape[1]
+    device = hidden.device
+    lut = _FP4_LUT.to(device)
+
+    eids = [eid for eid in fp4_weights.keys()
+            if routing_weights.get(eid, 0.0) != 0.0]
+    if not eids:
+        return torch.zeros(1, D, device=device, dtype=torch.bfloat16)
+
+    num_exp = len(eids)
+    first_exp = fp4_weights[eids[0]]
+    I_val = first_exp[0].shape[0]
+
+    if batch_bufs is not None and batch_bufs[0].shape[0] >= num_exp:
+        # Pre-allocated buffers: copy expert data into slots (GPU→GPU copy)
+        for i, eid in enumerate(eids):
+            w1p, w1s, w3p, w3s, w2p, w2s = fp4_weights[eid]
+            batch_bufs[0][i].copy_(w1p)
+            batch_bufs[1][i].copy_(w1s)
+            batch_bufs[2][i].copy_(w3p)
+            batch_bufs[3][i].copy_(w3s)
+            batch_bufs[4][i].copy_(w2p)
+            batch_bufs[5][i].copy_(w2s)
+
+        # Flatten to 2D views (zero-copy)
+        w1_p_all = batch_bufs[0][:num_exp].reshape(num_exp * I_val, D // 2)
+        w1_s_all = batch_bufs[1][:num_exp].reshape(num_exp * I_val, D // 32)
+        w3_p_all = batch_bufs[2][:num_exp].reshape(num_exp * I_val, D // 2)
+        w3_s_all = batch_bufs[3][:num_exp].reshape(num_exp * I_val, D // 32)
+        w2_p_all = batch_bufs[4][:num_exp].reshape(num_exp * D, I_val // 2)
+        w2_s_all = batch_bufs[5][:num_exp].reshape(num_exp * D, I_val // 32)
+        gate_all = batch_bufs[6][:num_exp].reshape(1, num_exp * I_val)
+        up_all = batch_bufs[7][:num_exp].reshape(1, num_exp * I_val)
+        # gate/up buffers are pre-filled — zero the used region
+        gate_all.zero_()
+        up_all.zero_()
+    else:
+        # Fallback: torch.cat (for test compatibility with small shapes)
+        w1_p_all = torch.cat([fp4_weights[eid][0] for eid in eids], dim=0)
+        w1_s_all = torch.cat([fp4_weights[eid][1] for eid in eids], dim=0)
+        w3_p_all = torch.cat([fp4_weights[eid][2] for eid in eids], dim=0)
+        w3_s_all = torch.cat([fp4_weights[eid][3] for eid in eids], dim=0)
+        w2_p_all = torch.cat([fp4_weights[eid][4] for eid in eids], dim=0)
+        w2_s_all = torch.cat([fp4_weights[eid][5] for eid in eids], dim=0)
+        gate_all = torch.empty(1, num_exp * I_val, device=device, dtype=torch.bfloat16)
+        up_all = torch.empty(1, num_exp * I_val, device=device, dtype=torch.bfloat16)
+
+    rw_tensor = torch.tensor(
+        [float(routing_weights.get(eid, 0.0)) for eid in eids],
+        dtype=torch.float32, device=device,
+    )
+
+    out = torch.zeros(1, D, device=device, dtype=torch.bfloat16)
+
+    stride_gate_exp = I_val
+    stride_up_exp = I_val
+
+    exp_stride_w1 = I_val * w1_p_all.stride(0)
+    exp_stride_w1s = I_val * w1_s_all.stride(0)
+    exp_stride_w3 = I_val * w3_p_all.stride(0)
+    exp_stride_w3s = I_val * w3_s_all.stride(0)
+    exp_stride_w2 = D * w2_p_all.stride(0)
+    exp_stride_w2s = D * w2_s_all.stride(0)
+
+    grid_ni = triton.cdiv(I_val, BN)
+    _triton_m1_gate_up_batched_kernel[(grid_ni, num_exp)](
+        hidden,
+        w1_p_all, w1_s_all,
+        w3_p_all, w3_s_all,
+        gate_all, up_all,
+        I_val, D,
+        hidden.stride(1),
+        w1_p_all.stride(0), w1_p_all.stride(1),
+        w1_s_all.stride(0), w1_s_all.stride(1),
+        exp_stride_w1, exp_stride_w1s,
+        w3_p_all.stride(0), w3_p_all.stride(1),
+        w3_s_all.stride(0), w3_s_all.stride(1),
+        exp_stride_w3, exp_stride_w3s,
+        stride_gate_exp, gate_all.stride(1),
+        stride_up_exp, up_all.stride(1),
+        lut,
+        BN=BN, BK=BK, num_stages=1,
+    )
+
+    grid_dn = triton.cdiv(D, BN)
+    _triton_m1_down_accum_batched_kernel[(grid_dn, num_exp)](
+        gate_all, up_all,
+        w2_p_all, w2_s_all,
+        out,
+        rw_tensor,
+        I_val, D, swiglu_limit,
+        stride_gate_exp, gate_all.stride(0), gate_all.stride(1),
+        stride_up_exp, up_all.stride(0), up_all.stride(1),
+        w2_p_all.stride(0), w2_p_all.stride(1),
+        w2_s_all.stride(0), w2_s_all.stride(1),
+        exp_stride_w2, exp_stride_w2s,
+        out.stride(0), out.stride(1),
+        lut,
+        BN=BN, BK=BK, num_stages=1,
+    )
 
     return out
