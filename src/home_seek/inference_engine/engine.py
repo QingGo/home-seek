@@ -200,6 +200,7 @@ class HomeSeekInferenceEngine:
         self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self._prefetch_enabled = self.hw_config.prefetch_enabled
         self._temporal_prefetch_enabled = False  # V21.20: disabled — CPU cache priming redundant
+        self._compiled_attn_enabled = True  # V21.21: torch.compile attention for decode
         self._temporal_routing: dict[int, list[int]] = {}
         self._prefetch_prev_layer_eids: dict[int, list[int]] = {}
         self._prefetch_current_eids: dict[int, list[int]] = {}
