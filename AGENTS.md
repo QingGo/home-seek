@@ -13,14 +13,14 @@ DeepSeek-V4-Flash 单卡/多卡 RTX 推理引擎。V21.20 — GPU bf16 cache 扩
 ```bash
 make install           # 首次或依赖变更后
 make lint              # ruff 静态检查
-make test-unit         # 单元测试 (316 pass, 2 skip, bench skip)
+make test-unit         # 单元测试 (bench 自动跳过；数量以 pytest 输出为准)
 make test-integration  # 集成测试 (需 weights/)
 make profile           # 标准 profile (5 prompts, 30 tokens, --profile-mode full). 包含: intra-FFN细分, decode step分布, post_step overhead
 make profile-light     # 轻量 profile (同参数, --profile-mode light). 仅 per-layer Attn/FFN/MHC, 低开销
 make profile-compare   # 对比 prev/last profile (现在 per-layer + cache + intra-FFN + BW 全部对比)
 make profile-nsys      # Nsight Systems: CUDA stream 时间线 + PCIe 传输 (现在单GPU路径有 NVTX: ffn_routing, decode_embed, ...)
 make profile-ncu       # Nsight Compute: 单个 kernel 深度分析
-make profile-deep      # nsys + torch.profiler 双重 trace
+make profile-chrome    # torch.profiler Chrome trace (低开销)
 make server            # 启动 API 服务器
 make cli               # 交互式客户端
 
